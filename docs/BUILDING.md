@@ -45,11 +45,9 @@ folder) and `scripts\package_release.ps1` (after `build.ps1`; it bundles the Vis
   CUDA 13.2; it links the CUDA runtime statically, so at run time only the driver is needed.
 - **OS:** Linux, WSL2, or Windows 10 / 11 x64.
 - **RAM to compile:** most of the build is ptxas on the megakernel, one thread with a large heap. For the served
-  configuration it peaked at 21.2 GB on Linux / WSL2 in a 13-minute build (2026-10-28) and at 20.2 GB natively on
-  Windows in a 14-minute build (2026-10-29), after the code that no served setting reaches was dropped and lm_head's
-  variants were merged. Before that change: 37.7 GB and 28.5 minutes on Linux (2026-10-28); natively 27-30 GB
-  (2026-10-18) and up to 30 minutes (2026-10-28). The lean build (`MKFLAGS=`, up to 4 drafts) needed about 19 GB
-  (2026-10-17).
+  configuration it peaked at 18.8 GiB both on Linux / WSL2, in a 10.5-minute `make -j2`, and natively on Windows, in
+  a 12-minute `build.ps1` (2026-10-30, 6f3b257). The lean build (`MKFLAGS=`, up to 4 drafts) was last measured at
+  about 19 GB (2026-10-17), before the served build was trimmed.
 - **RAM at run time:** parked conversations and side requests use page-locked host memory, up to `--park-mib` /
   `MK_PARK_MIB` (default 8192 MiB; 1024 MiB for side requests alone when parking is off), allocated as it is needed and
   kept until the server exits. The token embedding table also stays in page-locked host memory instead of VRAM.
@@ -82,8 +80,8 @@ What `make` builds:
 Build settings:
 - **The served configuration** is the default: `MKFLAGS=-DMK_WV=1 -DMK_MAXT=8 -DMK_WV_Q6F=1 -DMK_K5=1` (wide verify on
   int8 tensor cores, up to 7 drafts, the fragment-ordered Q6_K layout, the split barrier before the DeltaNet core).
-- **The lean engine:** `make MKFLAGS=`. It verifies at most 5 rows (4 drafts) with dp4a GEMVs and needs less RAM to
-  compile; run it with `MK_DRAFT=4` (the launchers default to 7).
+- **The lean engine:** `make MKFLAGS=`. It verifies at most 5 rows (4 drafts) with dp4a GEMVs; run it with
+  `MK_DRAFT=4` (the launchers default to 7).
 - **Architecture:** `make` asks `nvidia-smi` for the first GPU's compute capability (sm_86 if it is missing); override
   it with `ARCH=sm_89` or similar.
 - **Huge pages:** the Makefile sets `GLIBC_TUNABLES=glibc.malloc.hugetlb=1`, which lets ptxas's heap use transparent

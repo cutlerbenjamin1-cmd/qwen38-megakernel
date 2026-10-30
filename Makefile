@@ -4,10 +4,10 @@ NVCC ?= /usr/local/cuda/bin/nvcc
 ARCH ?= $(or $(shell nvidia-smi --query-gpu=compute_cap --format=csv,noheader 2>/dev/null | head -n1 | tr -d '. '),86)
 ARCH := sm_$(patsubst sm_%,%,$(ARCH))
 # engine configuration: wide tensor-core verify, up to 7 drafts (-d 7), fragment-ordered Q6_K = the served build.
-# ptxas peaks at ~21 GB of RAM with it (Linux, 2026-10-28); `make MKFLAGS=` builds the lean engine (up to 4 drafts: -d 4).
+# ptxas peaks at ~19 GiB of RAM with it (2026-10-30); `make MKFLAGS=` builds the lean engine (up to 4 drafts: -d 4).
 MKFLAGS ?= -DMK_WV=1 -DMK_MAXT=8 -DMK_WV_Q6F=1 -DMK_K5=1
 NVFLAGS = -O3 -std=c++17 -arch=$(ARCH) -lineinfo -Xptxas -dlcm=cg -Xptxas -v -Xcompiler -fPIC $(MKFLAGS)
-# Most of the build is ptxas on the megakernel (one thread, ~21 GB of heap). It runs ~20% faster when glibc's malloc asks
+# Most of the build is ptxas on the megakernel (one thread, ~19 GiB heap). It runs ~20% faster when glibc's malloc asks
 # for transparent huge pages, which this tunable does (glibc 2.35+; nothing changes where THP is off). Same machine code.
 export GLIBC_TUNABLES ?= glibc.malloc.hugetlb=1
 

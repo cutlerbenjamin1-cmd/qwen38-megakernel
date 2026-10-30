@@ -90,12 +90,8 @@ resampling numbers by its position, a sampled draft's by the position it drafts.
 position drafted again after a rejection before it draws the same number, but that number is independent of
 everything that decided the tokens before it, so the output stays exact (2026-10-17: a CPU replica of the loop,
 `tests/spec_rng_sim.py`, 396k re-drafted positions; the PIT test on 13,401 re-drafted rows of the engine at 7
-drafts). Two opt-in `MK_POLICY` settings were not: `blk=1` (block verification, removed on 2026-10-28: within noise),
-which read every row's number and left the rows after its cut to the next cycle, needed the acceptance numbers and the
-drafts keyed by the cycle's start position as well (position-only keys made the next cycle reuse numbers conditioned on
-the last one: biased in the replica; with those keys 72k rows of the engine passed the PIT test); and `chain=2` with
-sampled drafts runs without drop gates (dropping a draft on its own probability selects which drafts get verified:
-biased).
+drafts). One opt-in `MK_POLICY` setting needs a restriction: `chain=2` with sampled drafts runs without drop gates
+(dropping a draft on its own probability selects which drafts get verified: biased).
 
 **unsloth UD-Q4_K_XL** (`Qwen3.8-27B-UD-Q4_K_XL.gguf`, 17.6 GB: Q4_K / Q5_K / Q6_K / Q8_0 / IQ4_XS per tensor plus a
 few Q3_K, IQ3_S and IQ4_NL) puts its extra bits where the decode spends its time: its FFN gate / up average 5.1 bits
@@ -170,9 +166,9 @@ verified by the unchanged main model, so greedy output and the sampled output di
 (2026-10-12, before wide verify) it saved 107 MiB of VRAM on UD-Q4_K_XL, sped greedy decode up 1.5% and moved
 acceptance by under a point. On the lean build `MK_MTP_Q4=0` keeps the stored types (Q4_0 repacked to Q8_0 exactly;
 `MK_MTP_Q4=ab` loads both and the policy key `mtpq=0|1` switches between them, for A/B tests). Builds with more than 4
-drafts refuse both since 2026-10-28: there every main-layer matrix of those types is in the tensor-core layout, so only
-the MTP block reached their dp4a kernels, which the build no longer compiles (less compile time and memory); a matrix
-of a type those kernels do not read is refused at load.
+drafts refuse both: there every main-layer matrix of those types is in the tensor-core layout, so only the MTP block
+would reach dp4a kernels for them, and those builds do not compile them; a matrix of a type their dp4a kernels do not
+read is refused at load.
 
 The MTP layer can come from another file (`--mtp FILE`, `MK_MTP=FILE`; C API `mk_new_mtp`), e.g. the separate
 `mtp-*.gguf` files published for conversions that dropped it: its `blk.64.*` tensors replace the model file's (the

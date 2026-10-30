@@ -46,9 +46,10 @@ Evidence and the tests behind each line: [docs/BENCHMARKS.md](docs/BENCHMARKS.md
 ## Speed
 
 One RTX 3090 and a Ryzen 9 5900XT, unsloth's UD-Q4_K_XL, the server at 120k context, q8_0 KV cache, 7 drafts, greedy
-unless noted. This engine: one session on 2026-10-20 at 7322fbd (Linux / WSL2); the current release ef4a6dd runs the
-same GPU code. llama.cpp: b11548's `llama-server`, tuned (q8_0 KV, 4 MTP drafts), the same client, prompts and model
-file, the best value of each row over three sessions on 2026-10-12 and 10-13.
+unless noted. This engine: one session on 2026-10-20 at 7322fbd (Linux / WSL2); the GPU code has changed since, and
+what each change measured is in [docs/BENCHMARKS.md](docs/BENCHMARKS.md#since-the-last-full-run). llama.cpp: b11548's
+`llama-server`, tuned (q8_0 KV, 4 MTP drafts), the same client, prompts and model file, the best value of each row over
+three sessions on 2026-10-12 and 10-13.
 
 | | llama.cpp | this engine |
 |---|---|---|
@@ -86,8 +87,8 @@ same request sent fresh would:
 - **Title, tag and summary requests** run beside the session (side requests) instead of throwing its cache away.
 
 Replaying the requests that 9 clients sent during their 2026-10-21 test drives (native Windows, preset D, 230k
-context), the current release (ef4a6dd) spent 800 s reading prompts where the server before its pinned checkpoints and
-new side-request rules (538d441, same engine) spent 885 s, and the first turns of new agent sessions took 120 s
+context), the server with pinned checkpoints and the new side-request rules (ef4a6dd) spent 800 s reading prompts where
+the server before them (538d441, same engine) spent 885 s, and the first turns of new agent sessions took 120 s
 instead of 173 s. How it works and how to size it: [docs/SERVER.md](docs/SERVER.md).
 
 ## Works with your coding agent
@@ -167,7 +168,7 @@ library):
 git clone https://github.com/ggml-org/llama.cpp ../llama.cpp && git -C ../llama.cpp checkout b10246
 cmake -S ../llama.cpp -B ../llama.cpp/build -DCMAKE_BUILD_TYPE=Release -DBUILD_SHARED_LIBS=ON -DGGML_CUDA=ON
 cmake --build ../llama.cpp/build -j
-make -j2                          # the served configuration: about 13 minutes, up to ~21 GB of RAM in ptxas
+make -j2                          # the served configuration: about 11 minutes, up to ~19 GiB of RAM in ptxas
 pip install -r requirements.txt
 hf download unsloth/Qwen3.8-27B-GGUF Qwen3.8-27B-UD-Q4_K_XL.gguf mmproj-BF16.gguf --local-dir ~/models
 scripts/serve.sh                  # http://127.0.0.1:8080: 120k context, 7 drafts, exact reuse, images on
@@ -207,7 +208,7 @@ environment variables (`MK_HOST=0.0.0.0` for the LAN, `MK_KV` / `MK_KV_WIN` for 
 - **GPU:** NVIDIA Ampere or newer with 24 GB and at least 80 SMs for more than 4 drafts (50 for up to 4). Tuned and
   tested on an RTX 3090 (sm_86); other architectures build but are untested.
 - **CUDA 13.2** (older 12.x versions are untested), Linux, WSL2 or Windows 10 / 11 x64.
-- **RAM:** ~34 GB free to compile the served configuration; at run time, page-locked host memory for parked
+- **RAM:** ~20 GiB free to compile the served configuration; at run time, page-locked host memory for parked
   conversations up to `MK_PARK_MIB` (8 GiB by default, allocated as needed).
 - **llama.cpp b10246** next to this repository, **Python 3.10+** with jinja2, an x86-64 CPU with AVX2 + FMA for the
   fast image encoder, and ffmpeg for video (optional).
@@ -241,9 +242,11 @@ This repository is open-jet's `megakernel/` directory, split out with its histor
 development continues here. Since upstream's version it gained UD-Q4_K_XL support, draft-depth-independent greedy
 output, wide verification on int8 tensor cores with up to 7 drafts, the low-bit KV presets, exact reuse, parked
 conversations, side requests and pinned checkpoints, the CPU vision encoder and video input, the Anthropic and
-Responses APIs, and the native Windows build. Two changes went back upstream and were merged on 2026-10-12: UD-Q4_K_XL
-support (PR #19) and `token_embd` in host memory with a configurable prefill chunk (PR #20); image input (PR #23) is
-open.
+Responses APIs, and the native Windows build. Changes that went back upstream include UD-Q4_K_XL support (PR #19) and
+`token_embd` in host memory with a configurable prefill chunk (PR #20), merged on 2026-10-12, and
+draft-depth-independent greedy output, the pipelined decode attention, the int8 prefill attention and the low-bit KV
+presets (PRs #24 to #27), merged on 2026-10-29. All of them, merged and open:
+[our pull requests to open-jet](https://github.com/L-Forster/open-jet/pulls?q=is%3Apr+author%3Acutlerbenjamin1-cmd).
 
 It also stands on [llama.cpp](https://github.com/ggml-org/llama.cpp): its tokenizer (libllama), its image library
 (libmtmd: the fallback encoder and the reference tools), its GGUF quantization formats, whose dequantization the

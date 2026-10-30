@@ -15,20 +15,26 @@ How to read them:
 - **Comparisons with other engines** are limited to what we ran ourselves on this machine: llama.cpp b11548 (tuned) and
   upstream open-jet (2993f47, and its master 72ba4a7 on 2026-10-25).
 
-Contents: [the current release](#the-current-release) - [full run 2026-10-20](#full-run-2026-10-20) -
+Contents: [since the last full run](#since-the-last-full-run) - [full run 2026-10-20](#full-run-2026-10-20) -
 [exactness](#exactness) - [KV cache presets](#kv-cache-presets) - [the conversation cache](#the-conversation-cache) -
 [keep-warm](#keep-warm) - [Q4_K_M and upstream's scripts](#q4_k_m-and-upstreams-scripts) - [parallel agents](#parallel-agents) - [images and
 video](#images-and-video) - [earlier full runs](#earlier-full-runs) - [reproducing](#reproducing).
 
-## The current release
+## Since the last full run
 
-The current release is ef4a6dd (2026-10-21). Its GPU code is that of 7322fbd, the build of the last full run: ptxas
-reports the same 740 functions, none changed. What changed since are the server and the engine's host code (the
-`/v1/responses` API, pinned prefix checkpoints, the side-request and parking rules), measured with recorded client
-traffic under [the conversation cache](#the-conversation-cache). The release checks of ef4a6dd (native Windows,
-2026-10-21) gave the same token ids at 7 and 0 drafts, the same accuracy report and the same server replies as the Linux
-references, and the same results as the 7322fbd Linux build in the side-request, parking and title scenarios under q8_0
-and preset D.
+The full run below was measured on 7322fbd (2026-10-20). Each change to the GPU code since was measured against the
+build before it, the two builds alternating in one hold, on the CLI under Linux / WSL2 (UD-Q4_K_XL, q8_0 KV cache, 7
+drafts unless noted). As above, these deltas are not added onto the full run's numbers.
+
+| change | effect | measured |
+|---|---|---|
+| preset F's own 5-bit prefill kernels (fad007f) | F's prompt time -3.4% at 101.6k (exact mode), its KL report byte-identical; the other caches' kernels unchanged | 2026-10-25 |
+| parallel slots (`--agents`, f09ef59) | one conversation decodes 0.6% slower (UD-Q4_K_XL), 1.3% (Q4_K_M) | 2026-10-28 |
+| compile trim (752368c): code no served setting reaches dropped; lm_head's penalties and output type as runtime switches | ms per cycle -0.28% on short prompts, unchanged at 38k and with 4 slots, ~+0.2% with a presence / frequency penalty (estimated); ptxas peak ~36 -> 20.2 GiB, build 28.5 -> 13 minutes | 2026-10-29 |
+| the megakernel's stack frame 2,016 -> 816 bytes (df0d418) | 144 MiB less local memory reserved; speed unchanged at 38k | 2026-10-30 |
+| local memory and spills, frame 816 -> 752 bytes (6f3b257) | ms per cycle -1.55% at 0 drafts, -0.91% at 38k, -1.19% at 101.6k; 4 slots +7.4% tok/s | 2026-10-30 |
+
+Greedy token ids and the accuracy report are unchanged by all of them.
 
 ## Full run 2026-10-20
 
@@ -416,9 +422,9 @@ including the park of the long conversation and ~2.5-3.5 s of first-use host-mem
 ### Replayed client traffic
 
 The requests 9 clients sent during their test drives on 2026-10-21 were replayed request by request against a native
-Windows server (preset D, 230k context): the release (ef4a6dd) against the server before its pinned checkpoints and
-side-request rules (538d441, the same engine). The replay sends the recorded requests back to back; the server samples
-its own replies, so reply lengths differ slightly from the live runs. 2026-10-21, 23:01-00:31.
+Windows server (preset D, 230k context): ef4a6dd (the 2026-10-21 release) against the server before its pinned
+checkpoints and side-request rules (538d441, the same engine). The replay sends the recorded requests back to back; the
+server samples its own replies, so reply lengths differ slightly from the live runs. 2026-10-21, 23:01-00:31.
 
 | | before (538d441) | ef4a6dd |
 |---|---|---|
