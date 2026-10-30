@@ -15,89 +15,84 @@ How to read them:
 - **Comparisons with other engines** are limited to what we ran ourselves on this machine: llama.cpp b11548 (tuned) and
   upstream open-jet (2993f47, and its master 72ba4a7 on 2026-10-25).
 
-Contents: [since the last full run](#since-the-last-full-run) - [full run 2026-10-20](#full-run-2026-10-20) -
+Contents: [full run 2026-10-30](#full-run-2026-10-30) -
 [exactness](#exactness) - [KV cache presets](#kv-cache-presets) - [the conversation cache](#the-conversation-cache) -
 [keep-warm](#keep-warm) - [Q4_K_M and upstream's scripts](#q4_k_m-and-upstreams-scripts) - [parallel agents](#parallel-agents) - [images and
 video](#images-and-video) - [earlier full runs](#earlier-full-runs) - [reproducing](#reproducing).
 
-## Since the last full run
+## Full run 2026-10-30
 
-The full run below was measured on 7322fbd (2026-10-20). Each change to the GPU code since was measured against the
-build before it, the two builds alternating in one hold, on the CLI under Linux / WSL2 (UD-Q4_K_XL, q8_0 KV cache, 7
-drafts unless noted). As above, these deltas are not added onto the full run's numbers.
+The release v2026.10.30 (6f3b257), its Linux build on WSL2: the server at 120,000 tokens of context as
+`scripts/serve.sh` starts it (wide verify, 7 drafts, exact reuse, side requests and parked conversations on, prefill
+chunk 1024), driven by [bench/suite](../bench/suite/README.md), one session from 13:03 to 14:47 with the GPU fans at
+98%. The llama.cpp column is b11548's `llama-server`, tuned (q8_0 KV, 4 MTP drafts), driven by the same client with the
+same prompts and model file: the best value of each row over three sessions (2026-10-12 and 10-13; the questions on
+10-13).
 
-| change | effect | measured |
-|---|---|---|
-| preset F's own 5-bit prefill kernels (fad007f) | F's prompt time -3.4% at 101.6k (exact mode), its KL report byte-identical; the other caches' kernels unchanged | 2026-10-25 |
-| parallel slots (`--agents`, f09ef59) | one conversation decodes 0.6% slower (UD-Q4_K_XL), 1.3% (Q4_K_M) | 2026-10-28 |
-| compile trim (752368c): code no served setting reaches dropped; lm_head's penalties and output type as runtime switches | ms per cycle -0.28% on short prompts, unchanged at 38k and with 4 slots, ~+0.2% with a presence / frequency penalty (estimated); ptxas peak ~36 -> 20.2 GiB, build 28.5 -> 13 minutes | 2026-10-29 |
-| the megakernel's stack frame 2,016 -> 816 bytes (df0d418) | 144 MiB less local memory reserved; speed unchanged at 38k | 2026-10-30 |
-| local memory and spills, frame 816 -> 752 bytes (6f3b257) | ms per cycle -1.55% at 0 drafts, -0.91% at 38k, -1.19% at 101.6k; 4 slots +7.4% tok/s | 2026-10-30 |
-
-Greedy token ids and the accuracy report are unchanged by all of them.
-
-## Full run 2026-10-20
-
-7322fbd on Linux (WSL2), the server at 120,000 tokens of context in the configuration served that day (wide verify, 7
-drafts, exact reuse, side requests and parked conversations on, prefill chunk 1024), one session from 19:17 to 21:18
-with the GPU fans at 100%, after the card had new thermal paste and pads that afternoon. The llama.cpp column is
-b11548's `llama-server`, tuned (q8_0 KV, 4 MTP drafts), driven by the same client with the same prompts and model file:
-the best value of each row over three sessions (2026-10-12 and 10-13; the questions on 10-13).
-
-| | llama.cpp (10-12 / 10-13) | this, q8_0 KV | this, preset D |
-|---|---|---|---|
-| greedy decode, short prompts (4 x 512 tokens), mean of request rates | 82.7 tok/s | 155.1 | **155.5** |
-| the same, token-weighted | 76.2 | 131.7 | **132.1** |
-| sampled decode, thinking on (8 runs), mean of request rates | 65.8 tok/s | 136.5 | **136.8** |
-| the same, token-weighted | 63.9 | 130.4 | **130.8** |
-| decode at 11.6k context (200 tokens) | 69.3 tok/s | **137.3** | 136.1 |
-| decode at 38k context (256 tokens) | 62.3 tok/s | **117.9** | 101.9 |
-| decode at 101.6k context (256 tokens) | 53.4 tok/s | **108.7** | 98.6 |
-| read an 11.6k-token prompt | 8.24 s | **5.98 s** | 6.09 s |
-| read a 38k-token prompt | 29.6 s | **23.2 s** | 24.1 s |
-| read a 101.6k-token prompt from scratch | 101.0 s | **74.5 s** | 77.6 s |
-| first token, short prompt | 124 ms | 66 ms | **65 ms** |
-| follow-up turn in an 11.8k-token chat, prompt time | 323 ms | **178 ms** | 185 ms |
-| edit an earlier message in an 11.7k-token chat, prompt time | 329 ms | **76 ms** | 76 ms |
-| edit the end of a 9.1k-token system prompt, prompt time | 956 ms | **89 ms** | 97 ms |
-| VRAM, whole card, server idle | 22.8 GB | 21.1 GB | **20.0 GB** |
-| 282 benchmark questions: right, total time | 229, 2,727 s | 230, **1,681 s** | 230, 1,722 s |
+| | llama.cpp (10-12 / 10-13) | this, q8_0 KV | this, preset D | this, preset F |
+|---|---|---|---|---|
+| greedy decode, short prompts (4 x 512 tokens), mean of request rates | 82.7 tok/s | 156.7 | **156.8** | 150.2 |
+| the same, token-weighted | 76.2 | 133.2 | **133.4** | 127.3 |
+| sampled decode, thinking on (8 runs), mean of request rates | 65.8 tok/s | 138.2 | 138.2 | **138.3** |
+| the same, token-weighted | 63.9 | **132.0** | **132.0** | 130.6 |
+| decode at 11.6k context (200 tokens) | 69.3 tok/s | **138.7** | 137.5 | 124.0 |
+| decode at 38k context (256 tokens) | 62.3 tok/s | **119.8** | 102.8 | 101.8 |
+| decode at 101.6k context (256 tokens) | 53.4 tok/s | 109.4 | 99.0 | **109.9** |
+| read an 11.6k-token prompt | 8.24 s | **5.95 s** | 6.06 s | 6.11 s |
+| read a 38k-token prompt | 29.6 s | **23.1 s** | 24.0 s | 24.2 s |
+| read a 101.6k-token prompt from scratch | 101.0 s | **75.2 s** | 78.1 s | 77.9 s |
+| first token, short prompt | 124 ms | 66 ms | **65 ms** | 66 ms |
+| follow-up turn in an 11.8k-token chat, prompt time | 323 ms | **176 ms** | 184 ms | 185 ms |
+| edit an earlier message in an 11.7k-token chat, prompt time | 329 ms | 77 ms | **76 ms** | 77 ms |
+| edit the end of a 9.1k-token system prompt, prompt time | 956 ms | **89 ms** | 99 ms | 100 ms |
+| VRAM, whole card, server idle | 22.8 GB | 21.3 GB | 20.1 GB | **20.0 GB** |
+| 282 benchmark questions: right, total time | 229, 2,727 s | 230, **1,676 s** | 230, 1,716 s | 229, 1,714 s |
 
 Notes:
 - **The follow-up turn** re-reads the previous reply, because exact reuse is on (`MK_EXACT_REUSE=0`: faster
   follow-ups, not bit-identical to a fresh request; on 2026-10-14 the same row took ~80 ms without exact reuse).
-- **The 101.6k-token prompt from scratch** was read on a server started with `--side-max 0 --park-mib 0` (21:15 and
-  21:17). With those features on, the short request the client sends to clear the cache runs beside the cached
-  conversation and keeps it, so the client's own "from scratch" request was served from the cache.
-- **Preset D's long-context decode rows** are not like-for-like: from 2,048 tokens on, the replies differ from q8_0's,
-  and with them the share of accepted drafts. The server's console lines give tokens per engine cycle for each reply,
-  so the time per cycle can be compared (reply time / (reply tokens / tokens per cycle)):
+- **The 101.6k-token prompt from scratch** was read on a server started with side requests and parking off
+  (`MK_SIDE_MAX=0 MK_PARK_MIB=0`), after each configuration's other rows. With those features on, the short request the
+  client sends to clear the cache runs beside the cached conversation and keeps it, so the client's own "from scratch"
+  request is served from the cache.
+- **The presets' decode rows** are not like-for-like with q8_0's: preset D's replies differ from q8_0's from 2,048
+  tokens on, preset F's from the start (its rotated K changes the window's rows too), and with them the share of
+  accepted drafts. The server's console lines give tokens per engine cycle for each reply, so the time per cycle can be
+  compared (reply time / (reply tokens / tokens per cycle)):
 
-  | context | q8_0: tokens per cycle, ms per cycle | preset D: tokens per cycle, ms per cycle | D per cycle |
-  |---|---|---|---|
-  | 11.6k (200 tokens) | 3.75, 27.4 | 3.83, 28.2 | +2.8% |
-  | 38k (256 tokens) | 3.53, 29.9 | 2.98, 29.2 | -2.4% |
-  | 101.6k (256 tokens) | 3.61, 33.3 | 3.40, 34.5 | +3.8% |
+  | context | q8_0: tokens per cycle, ms per cycle | preset D | preset F | D / F per cycle |
+  |---|---|---|---|---|
+  | 11.6k (200 tokens) | 3.75, 27.0 | 3.83, 27.8 | 3.37, 27.1 | +2.8% / +0.5% |
+  | 38k (256 tokens) | 3.53, 29.5 | 2.98, 29.0 | 3.06, 30.1 | -1.8% / +2.1% |
+  | 101.6k (256 tokens) | 3.61, 33.0 | 3.40, 34.4 | 3.81, 34.7 | +4.2% / +5.1% |
 
-  One reply each; the console prints seconds to 0.01 s, so each derived value is good to about 0.5%.
-- **Preset D's edit rows** come from a re-run at 21:06: a browser opened by accident during the first pass overlapped
-  them. The same applies to the timing of its GSM8K and MMLU-Pro sets (1,723 s in total with the affected timings);
-  answers are greedy and did not change.
-- **The questions**, per set, were answered the same way by q8_0 and preset D: GSM8K 50 / 50, MMLU-Pro 47 / 70, ARC-C
-  47 / 50, MATH-500 29 / 40 (and 9 / 10 with thinking on), HumanEval 37 / 41, NIAH 9 / 9, LongBench v2 2 / 12. The
-  question client gives LongBench v2 answers 128 tokens, which cut 8 of its 12 answers in both engines on 2026-10-14;
-  the 262k runs below give them 1,024. The total time includes the side requests and parks the questions cause beside
-  the cached long conversation (the 2026-10-15 run had no host store).
-- **GPU state** (nvidia-smi at the start / end of each pass): q8_0 51 / 68 C, SM 2040 / 1950 MHz; preset D 59 / 72 C,
-  1995 / 1950 MHz; memory 9851 MHz and fans 99-100% throughout.
-- **Against the previous full run** (2026-10-15, 7d67c5d): decode +1.2% to +4.8%, the 101.6k prompt from scratch 77.7 ->
-  74.5 s, the questions 1,739 -> 1,681 s. The engine changes in between were measured one by one (A-B-A, see below);
-  the repaste lowered the memory junction from 103.7 to 91.0 C under the same decode load and raised the SM clock by
-  ~36 MHz, so part of the session-to-session difference is thermal.
+  One reply each; the console prints seconds to 0.01 s, so each derived value is good to about 0.5%. On the short
+  prompts preset D's replies and cycles were q8_0's; preset F's cycles took 0.1% to 2.6% longer, and most of its lower
+  greedy rate there comes from accepting fewer drafts (3.80 instead of 4.16 tokens per cycle on one of the four
+  prompts).
+- **The questions**, per set: q8_0 and preset D answered as on 2026-10-20: GSM8K 50 / 50, MMLU-Pro 47 / 70, ARC-C
+  47 / 50, MATH-500 29 / 40 (and 9 / 10 with thinking on), HumanEval 37 / 41, NIAH 9 / 9, LongBench v2 2 / 12. Preset F
+  differs in the same three sets as on 2026-10-25 ([preset F](#preset-f)): MMLU-Pro 46, MATH-500 30, HumanEval 36. The
+  question client gives LongBench v2 answers 128 tokens, which cut 8 of its 12 answers on 2026-10-14; the 262k runs
+  below give them 1,024. The total time includes the side requests and parks the questions cause beside the cached
+  long conversation.
+- **VRAM** is the whole card's, and the Windows desktop held 733 MiB of it that day (about 0.5 GB on 2026-10-20, after a
+  restart of its window manager). The engine's own memory, measured right after the run against the desktop alone (the
+  q8_0 server at 120k, idle, one build after another): 21,041 MiB for this release, 21,091 MiB for 7322fbd's GPU code
+  (the v2026.10.25 build) and 21,193 MiB for v2026.10.29 (parallel slots, before the stack-frame fix).
+- **GPU state** (nvidia-smi at the start / end of each pass): q8_0 46 / 64 C, SM 2025 / 1980 MHz; preset D 58 / 67 C,
+  2010 / 1950 MHz; preset F 59 / 68 C, 1995 / 1950 MHz; memory 9851 MHz and fans 98% throughout.
+- **A browser** was open for a few seconds at 14:02:52, during one of preset D's LongBench v2 items (45k tokens): that
+  item took 1.023 times q8_0's time, against 1.025 for the item of the same length before it, so nothing was re-run.
+- **Against the previous full run** (2026-10-20, 7322fbd): decode +0.4% to +1.6% for q8_0 and preset D, q8_0's time per
+  cycle on the long-context replies 0.9% to 1.5% lower (27.4 / 29.9 / 33.3 ms then, with the same tokens per cycle),
+  the prompt rows within 1.5% either way (none of the changes in between touched prefill), and the questions 1,681 ->
+  1,676 s and 1,722 -> 1,716 s with the same answers. The changes in between were measured one by one
+  ([below](#changes-between-the-2026-10-20-and-2026-10-30-runs)).
 
 ### Preset D at the full context
 
-The same session, a server at 262,144 tokens with preset D (20:21-21:05):
+Not re-run on 2026-10-30. On 2026-10-20 (7322fbd), a server at 262,144 tokens with preset D (20:21-21:05):
 
 | | |
 |---|---|
@@ -251,16 +246,16 @@ The MTP layer's cache only feeds the drafts, so D and D' score the same wherever
 reference itself was generated with a q8_0 cache). The values of the short set moved by up to 0.00006 between builds as
 the kernels changed, which is why each cell carries its date.
 
-Memory and speed, preset D against q8_0:
+Memory and speed, presets D and F against q8_0 (the full run above unless dated):
 
-| | q8_0 | preset D | measured |
+| | q8_0 | preset D | preset F |
 |---|---|---|---|
-| VRAM, idle server at 120k context | 21.1 GB | 20.0 GB | 2026-10-20, 7322fbd |
-| KV cache at 120k context | | 1,132 MiB less | 2026-10-13 |
-| the full 262,144-token context | | 23.5 GB | 2026-10-20, 7322fbd |
-| reading an 11.6k / 38k / 101.6k-token prompt | 5.98 / 23.2 / 74.5 s | 6.09 / 24.1 / 77.6 s | 2026-10-20, 7322fbd |
-| decode time per engine cycle, 11.6k / 38k / 101.6k | | +2.8% / -2.4% / +3.8% | 2026-10-20, 7322fbd (derived, above) |
-| 282 questions | 230 right | 230 right, the same per set | 2026-10-20, 7322fbd |
+| VRAM, idle server at 120k context (whole card) | 21.3 GB | 20.1 GB | 20.0 GB |
+| KV cache at 120k context | | 1,132 MiB less (2026-10-13) | 3.25 GB for D, 2.99 for F (2026-10-25) |
+| the full 262,144-token context, whole card | | 23.5 GB (2026-10-20) | 23,650 MiB (2026-10-25) |
+| reading an 11.6k / 38k / 101.6k-token prompt | 5.95 / 23.1 / 75.2 s | 6.06 / 24.0 / 78.1 s | 6.11 / 24.2 / 77.9 s |
+| decode time per engine cycle, 11.6k / 38k / 101.6k | | +2.8% / -1.8% / +4.2% | +0.5% / +2.1% / +5.1% |
+| 282 questions | 230 right | 230 right, the same per set | 229 right |
 
 Other presets (2026-10-13, measured as KV memory saved at 120k context against q8_0, KL relative to q8_0 on the short /
 32k / 64k sets, decode time per cycle and prefill rate at 38k / 101.6k context):
@@ -273,7 +268,7 @@ Other presets (2026-10-13, measured as KV memory saved at 120k context against q
 
 Later the same day a decode attention that serves 6-8 verified rows in one pass cut preset D's time per cycle at
 101.6k context from 44.0 to 39.4 ms (q8_0: 41.2 to 38.0 ms), and on 2026-10-14 compile-time 6-bit K / 5-bit V prefill
-kernels cut the prefill time of D' by 2.5% / 1.3% at 101.6k / 38k; the 2026-10-20 numbers above include both. D' (the
+kernels cut the prefill time of D' by 2.5% / 1.3% at 101.6k / 38k; the numbers above include both. D' (the
 MTP layer at 8 bits, 70 MB more) decoded 1.2% / 2.9% faster than D at 101.6k / 38k on 2026-10-13. Other formats tried
 in the emulator (3-bit, codebooks, per-row scales, random signs, angle coding) scored worse than the plain
 per-32-value grid.
@@ -306,6 +301,7 @@ kernels, 2026-10-25 (7322fbd, and fad007f for the prompt times):
   its 1,024-token cap before it named a choice, and one HumanEval task wrong. F's answers match D's word for word on 167
   of the 282 (all of ARC-C and the needles, 36 of 41 HumanEval tasks): with rotated K even a short prompt's rows differ
   from q8_0's, so longer answers take other words on the way.
+  The 2026-10-30 full run gave preset F the same 229, set for set.
 - **A larger window did not help:** at 32k, F read 0.00242 / 0.00239 / 0.00245 / 0.00240 with `MK_KV_WIN` 2048 / 2688 /
   3328 / 4608 (rings of 114 / 137 / 159 / 204 MiB), all within the set's noise. Its excess over q8_0 sits in the older
   5-bit rows.
@@ -511,24 +507,27 @@ mode, where its sampled drafts (open-jet #21) raised its acceptance.
 `--agents N` serves up to four requests at once, each in a parallel slot of the engine with its own context; every slot
 that is decoding runs in the same batched launch ([SERVER.md](SERVER.md#several-agents-at-once---agents)). Measured
 with [bench/suite/parallel_client.py](../bench/suite/README.md) (the prompts, sampling, context text and measurements
-of open-jet's `bench/parallel_bench.py`) on unsloth's plain `Qwen3.8-27B-Q4_K_M.gguf`, one session on 2026-10-28
-(WSL2), this server at d823dca (`--agents 4 -d 7`: q8_0 KV cache, exact mode).
+of open-jet's `bench/parallel_bench.py`) on unsloth's plain `Qwen3.8-27B-Q4_K_M.gguf`, right after the full run on
+2026-10-30 (WSL2, v2026.10.30, `--agents 4 -d 7`: q8_0 KV cache, exact mode), and on 2026-10-28 (d823dca) before the
+spill and local-memory changes:
 
-| test | result |
-|---|---|
-| 4 agents, short coding prompts: total decode (better of 2 runs) | 353.3 tok/s |
-| 4 agents, each with its own ~23k-token context: total decode | 295.7 tok/s |
-| the same: the slowest first token | 0.54 s |
-| a ~20k-token prompt sent while another request decodes: its first token | 13.8 s |
-| the other request meanwhile | 10.8 tok/s |
-| 1 agent, short prompts | 190.3 tok/s |
-| 1 agent, ~23k-token context | 178.1 tok/s |
-| VRAM at ready, whole card | 22.7 GB |
+| test | 2026-10-30 | 2026-10-28 |
+|---|---|---|
+| 4 agents, short coding prompts: total decode (better of 2 runs) | 380.1 tok/s | 353.3 tok/s |
+| 4 agents, each with its own ~23k-token context: total decode | 318.8 tok/s | 295.7 tok/s |
+| the same: the slowest first token | 0.51 s | 0.54 s |
+| a ~20k-token prompt sent while another request decodes: its first token | 13.7 s | 13.8 s |
+| the other request meanwhile | 11.2 tok/s | 10.8 tok/s |
+| 1 agent, short prompts (better of 2 runs) | 181.0 tok/s | 190.3 tok/s |
+| 1 agent, ~23k-token context | 183.4 tok/s | 178.1 tok/s |
+| VRAM at ready, whole card | 22,727 MiB (733 MiB of it the desktop's) | 22.7 GB (raw value not kept) |
 
-A total adds the requests' decode rates (512 tokens each, temperature 0.6). The "other request" row counts that
-request's streamed chunks while the long prompt is read; it moved between sessions that day (10.8-12.9 tok/s). Each
-slot's greedy reply is the one the request gets alone, also when its prompt arrives while others decode; seeded sampling
-keeps its distribution beside other slots, not its tokens ([SERVER.md](SERVER.md#several-agents-at-once---agents)).
+A total adds the requests' decode rates (512 tokens each, temperature 0.6). One agent's short-prompt rate follows how
+many sampled drafts are accepted: twelve passes that day ran 167 to 204 tok/s (median 187) at the same 26.2 to 26.9 ms
+per engine cycle, with 4.4 to 5.5 tokens per cycle. The "other request" row counts that request's streamed chunks while
+the long prompt is read; it moved between sessions on 2026-10-28 (10.8-12.9 tok/s). Each slot's greedy reply is the one
+the request gets alone, also when its prompt arrives while others decode; seeded sampling keeps its distribution beside
+other slots, not its tokens ([SERVER.md](SERVER.md#several-agents-at-once---agents)).
 
 ## Images and video
 
@@ -552,6 +551,28 @@ VRAM at 120k context did not grow (2026-10-16).
 The 2026-10-14 run with charts and raw data, and the gates behind each change up to 2026-10-16, are in the open-jet
 fork's [perf docs](https://github.com/cutlerbenjamin1-cmd/open-jet/tree/qwen38-perf/perf), where this engine was
 developed until it moved here.
+
+### 2026-10-20 (7322fbd)
+
+The same client and settings as 2026-10-30, q8_0 and preset D, one session (19:17-21:18) after the card's new thermal
+paste and pads, fans at 100%. The llama.cpp column is the one above.
+
+| | this, q8_0 KV | this, preset D |
+|---|---|---|
+| greedy decode, short prompts (mean / token-weighted) | 155.1 / 131.7 tok/s | 155.5 / 132.1 |
+| sampled decode, thinking on (mean / token-weighted) | 136.5 / 130.4 tok/s | 136.8 / 130.8 |
+| decode at 11.6k / 38k / 101.6k context | 137.3 / 117.9 / 108.7 tok/s | 136.1 / 101.9 / 98.6 |
+| read an 11.6k / 38k / 101.6k-token prompt | 5.98 / 23.2 / 74.5 s | 6.09 / 24.1 / 77.6 s |
+| first token, short prompt | 66 ms | 65 ms |
+| follow-up turn (11.8k chat) / edit a message / edit the system prompt, prompt time | 178 / 76 / 89 ms | 185 / 76 / 97 ms |
+| VRAM, whole card, server idle | 21.1 GB | 20.0 GB |
+| 282 questions | 230 right, 1,681 s | 230 right, 1,722 s |
+
+Preset D's edit rows and the timing of its GSM8K and MMLU-Pro sets come from a re-run that evening: a browser opened
+during the first pass. Time per cycle, q8_0 / D: 27.4 / 28.2 ms at 11.6k, 29.9 / 29.2 at 38k, 33.3 / 34.5 at 101.6k.
+Against the 2026-10-15 run: decode +1.2% to +4.8%, the 101.6k prompt from scratch 77.7 -> 74.5 s, the questions 1,739
+-> 1,681 s; the repaste lowered the memory junction from 103.7 to 91.0 C under the same decode load and raised the SM
+clock by ~36 MHz, so part of that difference is thermal.
 
 ### 2026-10-15 (7d67c5d)
 
@@ -591,6 +612,21 @@ Preset D' gave the same answer as the 8-bit cache on all 282 questions with both
 261k-token prompt took 337 s, decode ran at 62 tok/s and a follow-up turn started in 2.2 s; needle retrieval was 8 of 8
 at 190k and 261k on both files.
 
+### Changes between the 2026-10-20 and 2026-10-30 runs
+
+Each change to the GPU code was measured against the build before it, the two builds alternating in one hold, on the
+CLI under Linux / WSL2 (UD-Q4_K_XL, q8_0 KV cache, 7 drafts unless noted):
+
+| change | effect | measured |
+|---|---|---|
+| preset F's own 5-bit prefill kernels (fad007f) | F's prompt time -3.4% at 101.6k (exact mode), its KL report byte-identical; the other caches' kernels unchanged | 2026-10-25 |
+| parallel slots (`--agents`, f09ef59) | one conversation decodes 0.6% slower (UD-Q4_K_XL), 1.3% (Q4_K_M) | 2026-10-28 |
+| compile trim (752368c): code no served setting reaches dropped; lm_head's penalties and output type as runtime switches | ms per cycle -0.28% on short prompts, unchanged at 38k and with 4 slots, ~+0.2% with a presence / frequency penalty (estimated); ptxas peak ~36 -> 20.2 GiB, build 28.5 -> 13 minutes | 2026-10-29 |
+| the megakernel's stack frame 2,016 -> 816 bytes (df0d418) | 144 MiB less local memory reserved; speed unchanged at 38k | 2026-10-30 |
+| local memory and spills, frame 816 -> 752 bytes (6f3b257) | ms per cycle -1.55% at 0 drafts, -0.91% at 38k, -1.19% at 101.6k; 4 slots +7.4% tok/s | 2026-10-30 |
+
+Greedy token ids and the accuracy report are unchanged by all of them.
+
 ### Changes between the 2026-10-15 and 2026-10-20 runs
 
 Each measured A-B-A in one hold against the build before it:
@@ -612,8 +648,9 @@ proposed, so a sampled reply with a fixed seed can differ from the one before it
   282 questions, the from-scratch prefill, the 262,144-token run), the scorer and the summary script. The datasets are
   not in this repository: `python -I bench/suite/fetch.py` downloads them and checks every item against the hashes of
   the items these runs used (`bench/suite/items.json`). HumanEval answers are executed only with `score.py
-  --exec-humaneval`. Re-scoring the saved 2026-10-20 answers with the suite's scorer gives the same 230 right answers
-  for q8_0 and preset D, item for item, and its summary script gives the same table.
+  --exec-humaneval`. The 2026-10-30 run is the suite as published, and its summary script made the table above;
+  re-scoring the saved 2026-10-20 answers with the suite's scorer gives the same 230 right answers for q8_0 and
+  preset D, item for item.
 - **Parallel agents:** the parallel step of [bench/suite](../bench/suite/README.md) (`parallel_client.py`, its context
   fetched by `fetch.py`); without a server, `python3 bench/slots_bench.py <gguf> all` checks the engine's slots against
   each conversation alone and times them.

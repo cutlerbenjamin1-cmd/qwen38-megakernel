@@ -46,27 +46,27 @@ Evidence and the tests behind each line: [docs/BENCHMARKS.md](docs/BENCHMARKS.md
 ## Speed
 
 One RTX 3090 and a Ryzen 9 5900XT, unsloth's UD-Q4_K_XL, the server at 120k context, q8_0 KV cache, 7 drafts, greedy
-unless noted. This engine: one session on 2026-10-20 at 7322fbd (Linux / WSL2); the GPU code has changed since, and
-what each change measured is in [docs/BENCHMARKS.md](docs/BENCHMARKS.md#since-the-last-full-run). llama.cpp: b11548's
-`llama-server`, tuned (q8_0 KV, 4 MTP drafts), the same client, prompts and model file, the best value of each row over
-three sessions on 2026-10-12 and 10-13.
+unless noted. This engine: the release v2026.10.30 (6f3b257), one session on 2026-10-30 (Linux / WSL2). llama.cpp:
+b11548's `llama-server`, tuned (q8_0 KV, 4 MTP drafts), the same client, prompts and model file, the best value of each
+row over three sessions on 2026-10-12 and 10-13.
 
 | | llama.cpp | this engine |
 |---|---|---|
-| greedy decode, short prompts (4 x 512 tokens) | 82.7 tok/s | **155.1 tok/s** |
-| sampled decode, thinking on (8 runs) | 65.8 tok/s | **136.5 tok/s** |
-| decode at 38k tokens of context | 62.3 tok/s | **117.9 tok/s** |
-| decode at 101.6k tokens of context | 53.4 tok/s | **108.7 tok/s** |
-| read a 101.6k-token prompt | 101.0 s | **74.5 s** |
+| greedy decode, short prompts (4 x 512 tokens) | 82.7 tok/s | **156.7 tok/s** |
+| sampled decode, thinking on (8 runs) | 65.8 tok/s | **138.2 tok/s** |
+| decode at 38k tokens of context | 62.3 tok/s | **119.8 tok/s** |
+| decode at 101.6k tokens of context | 53.4 tok/s | **109.4 tok/s** |
+| read a 101.6k-token prompt | 101.0 s | **75.2 s** |
 | first token, short prompt | 124 ms | **66 ms** |
-| edit an earlier message in an 11.7k-token chat | 329 ms | **76 ms** |
-| 282 benchmark questions (GSM8K, MMLU-Pro, ARC-C, MATH-500, HumanEval, NIAH, LongBench v2) | 229 right, 2,727 s | **230 right, 1,681 s** |
+| edit an earlier message in an 11.7k-token chat | 329 ms | **77 ms** |
+| 282 benchmark questions (GSM8K, MMLU-Pro, ARC-C, MATH-500, HumanEval, NIAH, LongBench v2) | 229 right, 2,727 s | **230 right, 1,676 s** |
 
 The short-prompt rows are means of per-request rates, as the client reports them; the full table, token-weighted
-rates, preset D's column and earlier runs are in [docs/BENCHMARKS.md](docs/BENCHMARKS.md).
+rates, the preset D and F columns and earlier runs are in [docs/BENCHMARKS.md](docs/BENCHMARKS.md).
 
-Several agents at once (`--agents 4`, Q4_K_M, 2026-10-28): 353 tok/s in total on short prompts and 296 with a
-~23k-token context each; one agent alone 190 and 178 tok/s ([docs/BENCHMARKS.md](docs/BENCHMARKS.md#parallel-agents)).
+Several agents at once (`--agents 4`, Q4_K_M, 2026-10-30): 380 tok/s in total on short prompts and 319 with a
+~23k-token context each; one agent alone 183 tok/s with that context and 167-204 on short prompts, depending on how
+many sampled drafts it accepts ([docs/BENCHMARKS.md](docs/BENCHMARKS.md#parallel-agents)).
 
 ## Picks up where you left off
 
@@ -74,9 +74,9 @@ The server keeps more than the conversation in front of it, and with exact reuse
 same request sent fresh would:
 
 - **Follow-ups and edits** resume from DeltaNet checkpoints (one at every message start and every 4,096 tokens). A
-  follow-up turn in an 11.8k-token chat cost 178 ms of prompt time (the previous reply is read again, for exactness),
-  editing an earlier message in an 11.7k-token chat 76 ms, editing the end of a 9.1k-token system prompt 89 ms
-  (llama.cpp: 323, 329 and 956 ms; 2026-10-20).
+  follow-up turn in an 11.8k-token chat cost 176 ms of prompt time (the previous reply is read again, for exactness),
+  editing an earlier message in an 11.7k-token chat 77 ms, editing the end of a 9.1k-token system prompt 89 ms
+  (llama.cpp: 323, 329 and 956 ms; 2026-10-30).
 - **New sessions** of the same client resume after its system prompt and tools: that checkpoint is pinned, so the
   checkpoint pool never evicts it, and it is parked with its conversation. A new Claude Code session reused 8,288 of
   its 11,850 prompt tokens and a new Codex CLI session 8,672 of 8,847, where the server before reused none
@@ -115,33 +115,35 @@ the context window or image support set by hand. Per-client settings and quirks:
 
 ## The full 262k context on 24 GB
 
-Qwen3.8-27B reads up to 262,144 tokens. With the default q8_0 KV cache the server holds 21.1 GB of the card at 120k
-context; **preset D** fits the whole 262,144 on 24 GB. It stores K at 6 bits and V at 5 bits, and keeps the most
-recent 2,048 positions in an 8-bit ring, because that is where low-bit storage costs accuracy. It is opt-in:
+Qwen3.8-27B reads up to 262,144 tokens. With the default q8_0 KV cache, an idle server at 120k context and the desktop
+took 21.3 GB of the card; **preset D** fits the whole 262,144 on 24 GB. It stores K at 6 bits and V at 5 bits, and
+keeps the most recent 2,048 positions in an 8-bit ring, because that is where low-bit storage costs accuracy. It is
+opt-in:
 
 ```sh
 MK_KV='K*=6,V*=5' MK_KV_WIN=2048 scripts/serve.sh 8080 262144
 ```
 
-What it costs, from the 2026-10-20 run at 7322fbd (KL: mean KL divergence against llama.cpp, as above):
+What it costs, from the 2026-10-30 run (v2026.10.30), with preset F beside it (KL: mean KL divergence against
+llama.cpp, as above, measured on 2026-10-20 and 10-25):
 
-| | q8_0 | preset D |
-|---|---|---|
-| card memory, idle server at 120k context | 21.1 GB | **20.0 GB** |
-| KL at 32k context (an fp16 cache, 2026-10-12: 0.00226) | 0.00219 | 0.00236 |
-| the 282 questions | 230 right | 230 right |
-| read a 101.6k-token prompt | 74.5 s | 77.6 s |
-| decode time per engine cycle, 11.6k to 101.6k context | | -2% to +4% |
+| | q8_0 | preset D | preset F |
+|---|---|---|---|
+| card memory, idle server at 120k context | 21.3 GB | **20.1 GB** | **20.0 GB** |
+| KL at 32k context (an fp16 cache, 2026-10-12: 0.00226) | 0.00219 | 0.00236 | 0.00242 |
+| the 282 questions | 230 right | 230 right | 229 right |
+| read a 101.6k-token prompt | 75.2 s | 78.1 s | 77.9 s |
+| decode time per engine cycle, 11.6k to 101.6k context | | -2% to +4% | +0.5% to +5% |
 
-At 262,144 tokens of context the card held 23.5 GB; a 260,896-token prompt was read in 326 s, decode at that depth
-ran at 66 tok/s, a follow-up turn took 1.3 s, and 4 of 4 needle-in-a-haystack and 4 of 6 LongBench v2 questions at that
-length were right. Natively on Windows, with the desktop on the same card, D at the full context leaves the engine just
-past what the driver keeps resident, so above 240k `scripts\serve.bat` uses preset F instead: K at 5 bits, rotated,
-0.58 GB smaller than D at 262k, KL equal to q8_0's at 64k and 100k and 10% above it at 32k (D: 8%). There the prompt
-took 340 s and decode at that depth ran at 66 tok/s (2026-10-25). At 64k context the measured KL of D with an 8-bit MTP
-layer (preset D') was 0.00161, against q8_0's 0.00163 and the fp16 cache's 0.00161 (2026-10-13 / 10-15); at 100k, q8_0,
-D and F read 0.00217, 0.00226 and 0.00218, and on 160k tokens of prose 0.00467, 0.00468 and 0.00472 (2026-10-25;
-[100k and 160k context](docs/BENCHMARKS.md#100k-and-160k-context)).
+At 262,144 tokens of context (2026-10-20) the card held 23.5 GB; a 260,896-token prompt was read in 326 s, decode at
+that depth ran at 66 tok/s, a follow-up turn took 1.3 s, and 4 of 4 needle-in-a-haystack and 4 of 6 LongBench v2
+questions at that length were right. Natively on Windows, with the desktop on the same card, D at the full context
+leaves the engine just past what the driver keeps resident, so above 240k `scripts\serve.bat` uses preset F instead: K
+at 5 bits, rotated, 0.58 GB smaller than D at 262k, KL equal to q8_0's at 64k and 100k and 10% above it at 32k (D: 8%).
+There the prompt took 340 s and decode at that depth ran at 66 tok/s (2026-10-25). At 64k context the measured KL of D
+with an 8-bit MTP layer (preset D') was 0.00161, against q8_0's 0.00163 and the fp16 cache's 0.00161 (2026-10-13 /
+10-15); at 100k, q8_0, D and F read 0.00217, 0.00226 and 0.00218, and on 160k tokens of prose 0.00467, 0.00468 and
+0.00472 (2026-10-25; [100k and 160k context](docs/BENCHMARKS.md#100k-and-160k-context)).
 
 While a conversation is shorter than the window, preset D keeps all of it at 8 bits and its output is q8_0's. Past
 the window, its KL at 32k is 8% above q8_0's (an fp16 cache, more precise than both, scores 3% above q8_0 on the same

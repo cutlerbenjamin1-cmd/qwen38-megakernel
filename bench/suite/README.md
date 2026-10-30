@@ -1,10 +1,10 @@
 # Benchmark suite
 
-The clients, items and scoring behind the server tables in [docs/BENCHMARKS.md](../../docs/BENCHMARKS.md) (the full
-run of 2026-10-20 and the 262,144-token run) and the README: the same prompts, request parameters, item selection,
-warm-up requests, timing fields and scoring rules. Point them at this engine's server or at llama.cpp's `llama-server`
-(the comparison column) and the numbers are comparable with the published ones, within the session-to-session spread
-described there.
+The clients, items and scoring behind the server tables in [docs/BENCHMARKS.md](../../docs/BENCHMARKS.md) (the full run
+of 2026-10-30 and the 262,144-token run of 2026-10-20) and the README: the same prompts, request parameters, item
+selection, warm-up requests, timing fields and scoring rules. Point them at this engine's server or at llama.cpp's
+`llama-server` (the comparison column) and the numbers are comparable with the published ones, within the
+session-to-session spread described there.
 
 No dataset is part of this repository. `fetch.py` downloads them on your machine, picks the items listed in
 `items.json` and checks each one against the hash recorded there.
@@ -77,6 +77,7 @@ context). The VRAM rows are for the whole card, so nothing else should run on it
 |---|---|---|
 | q8_0, 120k context | `scripts/serve.sh 8080 120000` | `scripts\serve.bat 8080 120000` |
 | preset D, 120k context | `MK_KV='K*=6,V*=5' MK_KV_WIN=2048 scripts/serve.sh 8080 120000` | `set MK_KV=K*=6,V*=5` and `set MK_KV_WIN=2048`, then `scripts\serve.bat 8080 120000` |
+| preset F, 120k context | `MK_KV='K*=5r,V*=5' MK_KV_WIN=2048 scripts/serve.sh 8080 120000` | `set MK_KV=K*=5r,V*=5` and `set MK_KV_WIN=2048`, then `scripts\serve.bat 8080 120000` |
 | preset D, 262,144 tokens | `MK_KV='K*=6,V*=5' MK_KV_WIN=2048 scripts/serve.sh 8080 262144` | as above with `262144` |
 | from-scratch prefill | add `MK_SIDE_MAX=0 MK_PARK_MIB=0` to the line of the configuration | `set MK_SIDE_MAX=0` and `set MK_PARK_MIB=0` as well |
 
@@ -104,8 +105,9 @@ server driving this engine. llama-server: `--parallel 4`, with the context it ne
 
 ## 3. Run the steps
 
-All clients take `--url` (default `http://127.0.0.1:8080`), `--label` (a name for the configuration, written into
-every record) and `--out` (a JSON-lines file; records are appended). Times are for an RTX 3090 on 2026-10-20.
+All clients take `--url` (default `http://127.0.0.1:8080`), `--label` (a name for the configuration, written into every
+record) and `--out` (a JSON-lines file; records are appended). Times are for an RTX 3090 on 2026-10-30 (the full-context
+step: 2026-10-20).
 
 | Step | Server | Command | Time |
 |---|---|---|---|
@@ -117,17 +119,17 @@ every record) and `--out` (a JSON-lines file; records are appended). Times are f
 | scores | none | `python -I bench/suite/score.py qa.jsonl max.jsonl --exec-humaneval --out scores.json` | seconds |
 | tables | none | `python bench/suite/summarize.py speed.jsonl scratch.jsonl max.jsonl parallel.jsonl --scores scores.json` | seconds |
 
-Repeat the speed, questions and from-scratch steps for each configuration with its own label (the published table:
-q8_0 and preset D). Use the same label for a configuration's speed and from-scratch runs: the summary takes the
+Repeat the speed, questions and from-scratch steps for each configuration with its own label (the published table: q8_0,
+preset D and preset F). Use the same label for a configuration's speed and from-scratch runs: the summary takes the
 from-scratch row from `scratch_client.py`'s record of that label. `qa_client.py` resumes an interrupted run (it skips
-items already answered under the label), and takes set names to run only some sets. `--limit N` on `qa_client.py`
-and `maxctx_client.py` asks only the first N items of each set: a quick check of a setup, not comparable with the
-published totals. `speed_client.py --mode edit`
-repeats only the warm-up and the prompt-edit requests, for re-running those rows.
+items already answered under the label), and takes set names to run only some sets. `--limit N` on `qa_client.py` and
+`maxctx_client.py` asks only the first N items of each set: a quick check of a setup, not comparable with the published
+totals. `speed_client.py --mode edit` repeats only the warm-up and the prompt-edit requests, for re-running those rows.
 
-Each 120k server needs a 24 GB card (whole-card VRAM at idle on the reference machine: 21.1 GB with q8_0, 20.0 GB with
-preset D); the 262,144-token server reached 23.5 GB. `maxctx_client.py --ctx` must be the server's context: it decides
-which items fit (the smallest needle item needs 190,191 tokens).
+Each 120k server needs a 24 GB card (whole-card VRAM at idle on the reference machine on 2026-10-30: 21.3 GB with q8_0,
+20.1 GB with preset D, 20.0 GB with preset F, 0.7 GB of it the desktop's); the 262,144-token server reached 23.5 GB.
+`maxctx_client.py --ctx` must be the server's context: it decides which items fit (the smallest needle item needs
+190,191 tokens).
 
 ### HumanEval executes model-written code
 
@@ -148,8 +150,9 @@ the question totals and the full-context table, and writes them as JSON with `--
   sessions); give each run its own label unless that is what you want.
 - **Re-runs.** `--sub LABEL:KEY[,KEY]=OTHER` takes some rows of a column from another label, e.g. a step re-run after
   something disturbed it. Keys: the row keys listed in `summarize.py`'s usage, `qa` (all question sets) or `qa.SET`.
-  The published table was made with `--sub D:edit_msg,edit_sys,qa.gsm8k,qa.mmlu_pro=D_rerun` (a browser opened during
-  the first pass) and its from-scratch rows came from separate labels (`--sub q8:pf101k=q8_scratch`).
+  The 2026-10-30 table needed none; the 2026-10-20 one was made with
+  `--sub D:edit_msg,edit_sys,qa.gsm8k,qa.mmlu_pro=D_rerun` (a browser opened during the first pass) and its from-scratch
+  rows came from separate labels (`--sub q8:pf101k=q8_scratch`).
 - **Question time** includes, on this engine, the side requests and parks the questions cause beside the cached long
   conversation of the speed step.
 - **Preset D's long-context decode rows** are not like-for-like with q8_0's: the replies differ from 2,048 tokens on,
