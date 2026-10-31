@@ -505,8 +505,8 @@ meanwhile.
 | `GET /metrics` | Prometheus text, always on |
 
 The model is the GGUF the server loaded; its id in `/v1/models` is the file name. The `model` field of a request is
-not checked (it shows on the console), so a client may send any name. API keys are not checked either (a local server):
-clients that insist on one can send any value.
+not checked (it shows on the console), so a client may send any name. API keys are checked only when the server has one
+(`--api-key`, [Security](#security)); without it, clients that insist on a key can send any value.
 
 llama-server's other routes (`/completion`, `/v1/completions`, `/v1/embeddings`, `/infill`, `/v1/rerank`, audio,
 LoRA adapters, `POST /slots` for slot save / restore, `POST /props`) and OpenAI's `/v1/responses/compact` answer 501

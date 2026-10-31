@@ -4,7 +4,9 @@ A CUDA engine and server for **Qwen3.8-27B on one 24 GB NVIDIA GPU**, built and 
 the model's own multi-token-prediction (MTP) head drafting up to 7 tokens per step, speaks the OpenAI, Anthropic and
 OpenAI Responses APIs, so coding agents and chat UIs connect to it directly, and keeps their conversations cached
 between requests. As the launchers run it, drafting, cache reuse and the choice of Windows or Linux never change a
-token of its output.
+token of its output, with one exception: above 240k context the Windows launcher uses KV preset F, the most
+memory-efficient preset, whose output differs slightly from the q8_0 cache's. Runs with preset F still give the same
+tokens as each other.
 
 Built on the megakernel of [open-jet](https://github.com/L-Forster/open-jet) by Louis Forster
 ([credits](#credits-and-license)).
@@ -36,8 +38,8 @@ What is not bit-identical, and how close it is:
   distributions (13,299 positions of code and prose, llama.cpp generating token by token), the engine picks the same top
   token at 98.737% of positions with a mean KL divergence of 0.00119 nats; llama.cpp's own batched mode scores 98.489%
   / 0.00166 against the same reference (q8_0 KV cache; 2026-10-17, unchanged at 7322fbd on 2026-10-20).
-- **The low-bit KV presets** ([below](#the-full-262k-context-on-24-gb)): opt-in and near-lossless, not identical to
-  q8_0.
+- **The low-bit KV presets** ([below](#the-full-262k-context-on-24-gb)): near-lossless, not identical to q8_0. Opt-in,
+  except that `scripts/serve.bat` uses preset F above 240k context unless `MK_KV` is set.
 - **`MK_EXACT_REUSE=0`** makes follow-up turns faster by appending to the previous reply instead of reading it again.
 - **The lean build** (`make MKFLAGS=`, up to 4 drafts) reads the weights with other kernels, so it rounds differently
   from the served build; the checks above run on the served build.
