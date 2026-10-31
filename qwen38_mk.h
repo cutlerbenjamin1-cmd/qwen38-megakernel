@@ -6,8 +6,9 @@
 #include <string>
 #include <vector>
 
-// A failed (non-sticky) CUDA call inside the engine. The engine's sequence state is then undefined: reset() it
-// before the next use (the C API does). Sticky errors (the CUDA context is lost) exit the process with code 4.
+// A failed (non-sticky) CUDA call inside the engine, or no finite logit. The sequence it ran on is then undefined:
+// reset() it before the next use (the C API does; a slot call marks its slots failed, see slots_open). Sticky errors
+// (the CUDA context is lost) exit the process with code 4.
 struct MKCudaError : std::runtime_error {
     using std::runtime_error::runtime_error;
 };
@@ -208,7 +209,8 @@ class MKEngine {
     // of the given slots (two or more: one batched launch, each slot up to 1 + MAXT / n - 1 tokens), the tokens each
     // emitted (a slot's first call after its prefill: the prefill's token only; empty: its context is full).
     // slots_step_mixed: slots_step, then the next chunk of pslot's prompt. Every slot call leaves the engine's own
-    // sequence current again.
+    // sequence current again. An MKCudaError fails the slots the call ran on: slot_prefill / slots_step refuse them
+    // (std::runtime_error) until slot_begin, which starts them from scratch (reuses nothing).
     int slots_open(int n, int ctx, int seg_tokens = 0);
     int slots_count() const;
     int slot_begin(int slot, const std::vector<int> & toks, float temp, float top_p, int top_k, float min_p, unsigned long long seed,

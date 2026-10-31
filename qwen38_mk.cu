@@ -84,13 +84,13 @@ extern char ** environ; // (state files: the MK_* settings in the key)
 #define MK_WV 0
 #endif
 // MK_WV_FMK (default 1): Q4_K / Q5_K main-pass matrices fragment-ordered like IQ4_XS. 0: tile-major whole blocks (the
-// prefill reads whole 16-B chunks, but decode loses: -d 0 -5.8%, -d 4 +-0 vs dp4a instead of +3% / +7%; notes/agent_wvplumb.md)
+// prefill reads whole 16-B chunks, but decode loses: -d 0 -5.8%, -d 4 +-0 vs dp4a instead of +3% / +7%)
 #ifndef MK_WV_FMK
 #define MK_WV_FMK 1
 #endif
 // MK_WV_OUT (MK_MAXT > 5, default 0): out / ssm_out of the offset types (Q6_K / Q3_K / IQ3_S) in the wv layout too (tile-major,
 // as ffn_down's) on the split MMAs at every T, instead of dp4a resid32 (padded to 8 rows at T 6-7). Changes those matrices'
-// summation order (wv vs dp4a): opt-in, KLD-gated (notes/agent_spill.md M3).
+// summation order (wv vs dp4a): opt-in, KLD-gated.
 #ifndef MK_WV_OUT
 #define MK_WV_OUT 0
 #endif
@@ -199,10 +199,10 @@ extern char ** environ; // (state files: the MK_* settings in the key)
 #endif
 
 // A failed CUDA call prints its message and throws MKCudaError (the C API returns -1 with the message and resets
-// the engine; the server answers with an HTTP error and keeps serving). A sticky error (the context is unusable:
-// a faulting kernel, illegal address, trap, ECC, ...) cannot be recovered in-process: every later CUDA call fails
-// too, so the process exits with code 4 after the message (the launcher / user restarts it). The library used to
-// exit(1) on every error, which took the server down without an answer.
+// the engine, a slot call's slots at their next prompt; the server answers with an HTTP error and keeps serving). A
+// sticky error (the context is unusable: a faulting kernel, illegal address, trap, ECC, ...) cannot be recovered
+// in-process: every later CUDA call fails too, so the process exits with code 4 after the message (the launcher / user
+// restarts it). The library used to exit(1) on every error, which took the server down without an answer.
 [[noreturn]] static void mk_cuda_fail(cudaError_t e, const char * expr, const char * file, int line) {
     char msg[768];
     snprintf(msg, sizeof msg, "CUDA error %s at %s:%d: %s", expr, file, line, cudaGetErrorString(e));
@@ -1358,7 +1358,7 @@ __device__ __noinline__ void gemv_pairs(const Mat m, int lo, int hi, Out out) {
 // lambda would take the address of the caller's locals and push them to local memory.
 // (mk_cycle's stack frame is the deepest call chain incl. the callees' spills: a spilling GEMV instantiation of any
 // type raises the local memory of the whole kernel, ~0.12 MiB per byte. A second out-of-line switch for the newer types
-// was worse, 816 -> 1232 B: notes/agent_unsloth.md.)
+// was worse, 816 -> 1232 B.)
 template <int T, int IT, class Out>
 __device__ __forceinline__ void gemv_pairs_any(const Mat & m, int lo, int hi, Out out) {
     switch (m.type) {
@@ -1575,7 +1575,7 @@ __device__ __noinline__ void embed_prologue(RowTab rt = RowTab{}) {
 }
 
 // ffn_down (K = FF) whole-K rows out of line (half_rows) at the T of mask bit T: inlined into resid32's item loop,
-// resid32<2..4,17,*> spilled 20-88 B and the phase ran 0.17-0.25 ms per pass slower (notes/agent_mtpcut.md). T = 5
+// resid32<2..4,17,*> spilled 20-88 B and the phase ran 0.17-0.25 ms per pass slower. T = 5
 // splits K anyway; the K = 5120 / 6144 roles stay inline (out of line they got slower).
 #ifndef MK_FD_NOINL
 #define MK_FD_NOINL 0x1c
@@ -1714,7 +1714,7 @@ __device__ __noinline__ void ffn_gu_q4k(const LayerW & W, uint8_t * /*sm*/) {
 #pragma unroll
         for (int t = 0; t < T; t++) act[t] = 0.f;
         // one row per matrix per step at every T: the 2 + 2-row step T <= 2 used to take was slower (T = 1 / 2 ffn_gu
-        // 10.2 / 10.9 -> 9.0 / 9.4 ms per pass on UD-Q4_K_XL, where it spilled; notes/agent_mtpcut.md)
+        // 10.2 / 10.9 -> 9.0 / 9.4 ms per pass on UD-Q4_K_XL, where it spilled)
         constexpr int RG = 1;
 #pragma unroll 1
         for (int r = 0; r < 16; r += RG) {
@@ -1847,8 +1847,8 @@ __device__ __forceinline__ void store_pair_t(float * base, int stride, int idx, 
 
 #if MK_WV
 // MK_WV builds: one store functor type for every gemv_pairs call site. A lambda per site made one gemv_pairs instance per
-// (T, type, site): ~47% of the module's PTX, and ptxas's memory grows with it (> 25 GB for the merged MK_WV build;
-// notes/agent_wvplumb.md "wvplumb2"). Rows t of base (or, ring >= 0, the conv ring rows (ring + t) % CONV_RING), scaled by
+// (T, type, site): ~47% of the module's PTX, and ptxas's memory grows with it (> 25 GB for the merged MK_WV build).
+// Rows t of base (or, ring >= 0, the conv ring rows (ring + t) % CONV_RING), scaled by
 // the RMS-norm scale s_rs[t]: the stores of dn_proj's / attn_proj's lambdas, the same values.
 struct PairOut {
     float * base;
@@ -3720,7 +3720,7 @@ __device__ __forceinline__ void attn_core_w48(const LayerW & W, int slot, int n)
     attn_dims_w(L_ctx, ws, nch, CS);
     // the call's scalars in shared memory, one copy per warp (MK_W48S), read with volatile loads where used: kept in
     // registers, ptxas spilled them and their reload at each item's start waited on local memory (L2) behind the K / V
-    // stream (~0.3% of a 38k -d 7 cycle's stall samples, notes/agent_spill.md)
+    // stream (~0.3% of a 38k -d 7 cycle's stall samples)
 #if MK_W48S
     if ((threadIdx.x & 31) < 5) {
         const int l = threadIdx.x & 31;
@@ -6259,7 +6259,7 @@ struct MKEngine::Impl {
     // draft-depth policy (MKEngine::set_policy). Default: up to n_draft drafts, the on-device gate on the running
     // product c_k of the MTP's own top-1 probabilities stops drafting after draft k >= 2 when c_k < 0.4 and drops
     // the 4th draft (the T = 5 verify row) when c_4 < 0.4; sampled drafts when sampling. Tuned on replayed logs
-    // + live A/B (notes/agent_spec.md). The previous behaviour: "depth=0,drop=0,stop=0,chain=0,h1=0".
+    // + live A/B. The previous behaviour: "depth=0,drop=0,stop=0,chain=0,h1=0".
     struct Policy {
         int depth = 1;       // 0: n_draft - 1 after a cycle with a rejection (at least 3), 1: always n_draft,
                              // 2: 1 + the accepted count of the last cycle (clamped to [dmin, n_draft])
@@ -6274,7 +6274,7 @@ struct MKEngine::Impl {
         int dctx = INT_MAX;
         // g7 (default on): at depth > 5 (the wide tier T 6-8 costs the same per cycle, a draft there only its ~0.5 ms MTP
         // pass) the gates are stop after drafts 2-4 below 0.25, drop draft 5 below 0.3 (stay at T <= 5), stop after drafts
-        // 5-6 below 0.3, never drop the deepest draft (notes/agent_mtp.md: offline policy search on open-policy logs,
+        // 5-6 below 0.3, never drop the deepest draft (offline policy search on open-policy logs,
         // live 38k / 101.6k greedy +1..3% over the gates above, same output). Any explicit stop / drop key turns it off.
         int g7 = 1;
 #else
@@ -6338,7 +6338,9 @@ struct MKEngine::Impl {
             err_mtp_warned = true;
             fprintf(stderr, "[mk] warning: MTP catch-up out of range near position %d (drafts only, output unaffected)\n", hctl.n);
         }
-        if (bad) throw MKCudaError("no finite logit in the output head (NaN / inf model state); the engine was reset");
+        if (bad)
+            throw MKCudaError("no finite logit in the output head (NaN / inf model state); the sequence is reset (a parallel "
+                              "slot's when it begins its next prompt)");
     }
     // Rewrites hb.rope's rows from the first position where `spans` and `rope_spans` differ (none: no copy). Text rows are
     // rope_base rows shifted by the images before them, image rows per-frequency gathers; pageable host-to-device copies
@@ -8147,11 +8149,11 @@ struct MKEngine::Impl {
         mem_mark("decode act bufs, conv, kvgb");
         hb.dstate = dalloc<float>((size_t) 48 * NVH * 128 * 128);
         mem_mark("GDN recurrent state");
-        // stockfix switches (bit-exact; notes/agent_stockfix.md): K1 MK_K1, K2 MK_K2 (both default on)
+        // stockfix switches (bit-exact): K1 MK_K1, K2 MK_K2 (both default on)
         hb.k1 = !(getenv("MK_K1") && atoi(getenv("MK_K1")) == 0);
         hb.k2 = !(getenv("MK_K2") && atoi(getenv("MK_K2")) == 0);
         fprintf(stderr, "[mk] stockfix: K1 ab dealing %d, K2 combine %d (tb %d), gsync form %d\n", hb.k1, hb.k2, MK_K2_TB, MK_GSYNC);
-        // stock2 switches (notes/agent_stock2.md): K6 MK_K6 (bits: 2 dealing across blocks, exact; 4 8-row halves of the Q8_0
+        // stock2 switches: K6 MK_K6 (bits: 2 dealing across blocks, exact; 4 8-row halves of the Q8_0
         // k / v tiles, exact), K8 MK_K8 (bits, prefill, exact: 1 pk_ab on a second stream, 2 pk_norm_quant reads x once,
         // 4 pk_dn_prep MK_K8_NT tokens per block); compile-time K7 (state layout), K6_LD (Q8_0 tile loads)
         hb.k6 = getenv("MK_K6") ? atoi(getenv("MK_K6")) : MK_K6_DEF;
@@ -10454,6 +10456,8 @@ struct MKEngine::Impl {
         std::vector<RingSide> rsides[N_ATT_SLOTS]; // MK_EXACT + MK_KV_WIN: its window rings as its checkpoints copy them
         std::vector<int> pend; // prompt tokens slot_begin queued, not prefilled yet
         int first = -1;        // the first token of the finished prefill: emitted by the next slots_step
+        bool dead = false;     // a slot call on it failed (MKCudaError): state undefined until slot_begin resets it
+        std::string dead_why;  // (that error, in the refusals)
     };
     std::vector<Lane> lanes;
     int live = -1;          // the lane whose state the Impl's members hold (-1: the engine's own sequence)
@@ -10504,11 +10508,63 @@ struct MKEngine::Impl {
         set_cview(view_full(k));
     }
     void lane_out() {
-        if (live < 0) return;
-        hs_quiesce();
-        lane_swap(lanes[live]);
-        live = -1;
-        set_cview(0);
+        if (live >= 0) {
+            hs_quiesce();
+            lane_swap(lanes[live]);
+            live = -1;
+        }
+        set_cview(0); // (also after a failed copy left the device on a lane's view)
+    }
+    // ~LaneOut's lane_out: never throws. A failed device call marks the lane dead and is retried once; failing again it
+    // is taken as sticky (as in mk_cuda_fail: exit code 4), since unsynchronised or on a stale view the next sequence's
+    // work would run on the wrong state
+    void lane_out_nothrow() noexcept {
+        const int k = live;
+        for (int i = 0;; i++) {
+            std::string why = "unknown exception";
+            try {
+                lane_out();
+                return;
+            } catch (const std::exception & e) {
+                why = e.what();
+            } catch (...) {
+            }
+            lane_dead(k, why);
+            if (i > 0) {
+                fprintf(stderr, "[mk] the CUDA error repeats while a slot is put away (sticky): exiting with code 4\n");
+                fflush(stdout);
+                fflush(stderr);
+                _exit(4);
+            }
+        }
+    }
+    // a slot call failed on lane k (MKCudaError, also the NaN check's): nothing runs on it until slot_begin resets it
+    void lane_dead(int k, const std::string & why) {
+        if (k < 0 || k >= (int) lanes.size()) return;
+        Lane & l = lanes[k];
+        l.dead = true;
+        l.dead_why = why;
+        l.pend.clear();
+        l.first = -1;
+    }
+    // lane k for a call that continues its prompt or reply: refused when it does not exist or is dead
+    Lane & lane_ok(int k) {
+        if (k < 0 || k >= (int) lanes.size()) throw std::runtime_error("no slot " + std::to_string(k));
+        if (lanes[k].dead)
+            throw std::runtime_error("slot " + std::to_string(k) + " failed (" + lanes[k].dead_why +
+                                     "): begin a new prompt");
+        return lanes[k];
+    }
+    // a slot call's body f on lanes ks, then the engine's own sequence back in; an MKCudaError marks every lane in ks
+    // dead on its way to the caller (MKCancelled does not: the prefill put the state back itself)
+    template <class F> void lanes_call(const std::vector<int> & ks, F f) {
+        try {
+            f();
+            lane_out(); // (here rather than in ~LaneOut: its failure is this call's error)
+        } catch (const MKCudaError & e) {
+            for (int k : ks) lane_dead(k, e.what());
+            throw;
+        }
     }
     // n pinned checkpoint slots (as ck_alloc's: the streams and events are the engine's)
     std::vector<CkSlot> ck_new_slots(int n) {
@@ -11001,6 +11057,14 @@ void MKEngine::set_n_draft(int n) {
     n_draft_ = n;
 }
 
+// token ids outside the vocabulary would index host arrays and embedding rows: refused before anything changes
+static void check_ids(const std::vector<int> & toks, size_t pos0) {
+    for (size_t i = 0; i < toks.size(); i++)
+        if (toks[i] < 0 || toks[i] >= VOCAB)
+            throw std::runtime_error("token id " + std::to_string(toks[i]) + " at position " + std::to_string(pos0 + i) +
+                                     " out of range (vocabulary " + std::to_string(VOCAB) + ")");
+}
+
 int MKEngine::prefill_state(const std::vector<int> & tokens, const std::string & dir, int * how) {
     if (dir.empty()) throw std::runtime_error("prefill_state: no directory");
     struct Clear {
@@ -11029,6 +11093,7 @@ int MKEngine::prefill(const std::vector<int> & tokens, const std::vector<int> & 
         ~PinClear() { p->pin_req.clear(); }
     } pin_clear{p_};
     if (tokens.empty()) throw std::runtime_error("empty prompt");
+    check_ids(tokens, p_->seq.size());
     std::vector<int> cks = cks_in;
     if (p_->exact && ck_exact >= 0) { // MK_EXACT: on the scan grid like the others (a side scan's state is not on it)
         cks.push_back(ck_exact);
@@ -11065,10 +11130,11 @@ int MKEngine::prefill(const std::vector<int> & tokens, const std::vector<int> & 
         int prev = nsp.empty() ? 0 : nsp.back().pos + nsp.back().n();
         size_t rows = 0;
         for (const MKImage & m : images) {
-            const int n = m.nx * m.ny;
             if (m.nx <= 0 || m.ny <= 0 || !m.embd) throw std::runtime_error("image: empty grid or no embedding rows");
             if (m.pos < prev) throw std::runtime_error("images overlap, or one starts inside an earlier one");
-            if (m.pos + n > end - 1) throw std::runtime_error("an image must end before the prompt's last token");
+            if (m.pos + (long long) m.nx * m.ny > end - 1)
+                throw std::runtime_error("an image must end before the prompt's last token");
+            const int n = m.nx * m.ny; // (no overflow: checked against the prompt's end)
             if (m.pos < s0) { // continues the span cut by n0
                 if (!cut || cut->pos != m.pos || cut->nx != m.nx || cut->ny != m.ny)
                     throw std::runtime_error("image at " + std::to_string(m.pos) + " starts before this prompt (" + std::to_string(s0) +
@@ -11548,6 +11614,7 @@ size_t MKEngine::park_bytes(int id) const {
 }
 
 std::vector<int> MKEngine::score(const std::vector<int> & tokens) {
+    check_ids(tokens, 0);
     reset();
     std::vector<int> pred;
     const char * mode = getenv("MK_PREFILL");
@@ -11588,6 +11655,7 @@ void MKEngine::score_logits(const std::vector<int> & tokens, int mk_from, int fi
                             const std::vector<MKImage> & images) {
     const int N = (int) tokens.size();
     if (N + 8 > p_->ctx) throw std::runtime_error("sequence exceeds context");
+    check_ids(tokens, 0);
     reset();
     p_->logits_alloc();
     mk_from = std::min(std::max(mk_from, 0), N);
@@ -11656,13 +11724,17 @@ int MKEngine::step(std::vector<int> & out) {
 
 // ---- parallel slots (open-jet's slot API over lanes, see Impl::Lane) ----
 // Every slot call leaves the engine's own sequence live again, so the single-sequence API is unaffected between them.
+// An MKCudaError in one marks the lanes it ran on dead (Impl::lanes_call): refused until slot_begin starts them afresh.
 #define MK_LANE_OUT()                                       \
     struct LaneOut {                                        \
         Impl * p;                                           \
-        ~LaneOut() { p->lane_out(); }                       \
+        ~LaneOut() { p->lane_out_nothrow(); }               \
     } lane_out_guard{p_}
 
-int MKEngine::slots_open(int n, int ctx, int /*seg_tokens*/) { return p_->slots_open(n, ctx); }
+int MKEngine::slots_open(int n, int ctx, int /*seg_tokens*/) {
+    MK_LANE_OUT(); // (a failure part way, inside a lane_in: the engine's own sequence is live again)
+    return p_->slots_open(n, ctx);
+}
 
 int MKEngine::slots_count() const { return (int) p_->lanes.size(); }
 
@@ -11671,64 +11743,77 @@ int MKEngine::slot_begin(int slot, const std::vector<int> & toks, float temp, fl
     Impl & I = *p_;
     MK_LANE_OUT();
     if (toks.empty()) throw std::runtime_error("empty prompt");
-    I.lane_in(slot);
-    set_sampling(temp, top_p, top_k, min_p, seed);
-    Impl::Lane & L = I.lanes[slot];
-    L.first = -1;
-    L.pend.clear();
-    if ((int) toks.size() + 8 > I.ctx) throw std::runtime_error("prompt exceeds the slot's context");
-    size_t c = 0;
-    while (c < I.seq.size() && c < toks.size() && I.seq[c] == toks[c]) c++;
-    if (c < I.seq.size() || c == toks.size()) {
-        // back to a position <= c from which at least the prompt's last token is fed: a truncate (emitted tokens past the
-        // committed position), else the newest checkpoint there, else from scratch
-        const int target = (int) std::min(c, toks.size() - 1);
-        int best = -1;
-        for (const auto & k : I.ck)
-            if (k.pos >= 0 && k.pos <= target && k.pos > best) best = k.pos;
-        if (target >= I.hctl.dn_c) truncate(target);
-        else if (best >= 0 && rewind_to(best)) {
-        } else reset();
-    }
-    const int reused = (int) I.seq.size();
-    L.pend.assign(toks.begin() + reused, toks.end());
+    check_ids(toks, 0);
+    int reused = 0;
+    I.lanes_call({slot}, [&] {
+        I.lane_in(slot);
+        set_sampling(temp, top_p, top_k, min_p, seed);
+        Impl::Lane & L = I.lanes[slot];
+        L.first = -1;
+        L.pend.clear();
+        if ((int) toks.size() + 8 > I.ctx) throw std::runtime_error("prompt exceeds the slot's context");
+        if (L.dead) { // (a failed call left its state undefined: from scratch, nothing reused)
+            reset();
+            L.dead = false;
+            L.dead_why.clear();
+        }
+        size_t c = 0;
+        while (c < I.seq.size() && c < toks.size() && I.seq[c] == toks[c]) c++;
+        if (c < I.seq.size() || c == toks.size()) {
+            // back to a position <= c from which at least the prompt's last token is fed: a truncate (emitted tokens past
+            // the committed position), else the newest checkpoint there, else from scratch
+            const int target = (int) std::min(c, toks.size() - 1);
+            int best = -1;
+            for (const auto & k : I.ck)
+                if (k.pos >= 0 && k.pos <= target && k.pos > best) best = k.pos;
+            if (target >= I.hctl.dn_c) truncate(target);
+            else if (best >= 0 && rewind_to(best)) {
+            } else reset();
+        }
+        reused = (int) I.seq.size();
+        L.pend.assign(toks.begin() + reused, toks.end());
+    });
     return reused;
 }
 
 int MKEngine::slot_prefill(int slot, int budget) {
     Impl & I = *p_;
     MK_LANE_OUT();
-    I.lane_in(slot);
-    Impl::Lane & L = I.lanes[slot];
-    if (budget <= 0) { // (abandoned: the sequence keeps what was prefilled)
-        L.pend.clear();
-        return 0;
-    }
-    if (L.pend.empty()) return 0;
-    const size_t n = std::min<size_t>(L.pend.size(), (size_t) budget);
-    const std::vector<int> chunk(L.pend.begin(), L.pend.begin() + n);
-    L.pend.erase(L.pend.begin(), L.pend.begin() + n);
-    if (L.pend.empty()) { // the prompt's last chunk: its first token, a checkpoint before the prompt's last token
-        const int end = (int) I.seq.size() + (int) chunk.size();
-        L.first = prefill(chunk, end - 1);
-    } else { // a chunk before the last: batched rows only (with MK_PREFILL=mk its last row samples a token: dropped)
-        struct Mid {
-            Impl * p;
-            ~Mid() { p->pf_mid = false; }
-        } mid{p_};
-        I.pf_mid = true;
-        if (prefill(chunk) >= 0) truncate((int) I.seq.size() - 1);
-    }
-    return (int) L.pend.size();
+    Impl::Lane & L = I.lane_ok(slot);
+    int left = 0;
+    I.lanes_call({slot}, [&] {
+        I.lane_in(slot);
+        if (budget <= 0) { // (abandoned: the sequence keeps what was prefilled)
+            L.pend.clear();
+            return;
+        }
+        if (L.pend.empty()) return;
+        const size_t n = std::min<size_t>(L.pend.size(), (size_t) budget);
+        const std::vector<int> chunk(L.pend.begin(), L.pend.begin() + n);
+        L.pend.erase(L.pend.begin(), L.pend.begin() + n);
+        if (L.pend.empty()) { // the prompt's last chunk: its first token, a checkpoint before the prompt's last token
+            const int end = (int) I.seq.size() + (int) chunk.size();
+            L.first = prefill(chunk, end - 1);
+        } else { // a chunk before the last: batched rows only (with MK_PREFILL=mk its last row samples a token: dropped)
+            struct Mid {
+                Impl * p;
+                ~Mid() { p->pf_mid = false; }
+            } mid{p_};
+            I.pf_mid = true;
+            if (prefill(chunk) >= 0) truncate((int) I.seq.size() - 1);
+        }
+        left = (int) L.pend.size();
+    });
+    return left;
 }
 
 std::vector<std::vector<int>> MKEngine::slots_step(const std::vector<int> & slots) {
     Impl & I = *p_;
     MK_LANE_OUT();
+    for (int s : slots) I.lane_ok(s); // (every slot before any of them changes)
     std::vector<std::vector<int>> out(slots.size());
     std::vector<int> ks, at;
     for (size_t i = 0; i < slots.size(); i++) {
-        if (slots[i] < 0 || slots[i] >= (int) I.lanes.size()) throw std::runtime_error("no slot " + std::to_string(slots[i]));
         Impl::Lane & L = I.lanes[slots[i]];
         if (L.first >= 0) { // (its prefill's token first: this call only emits it)
             out[i].push_back(L.first);
@@ -11738,23 +11823,26 @@ std::vector<std::vector<int>> MKEngine::slots_step(const std::vector<int> & slot
         ks.push_back(slots[i]);
         at.push_back((int) i);
     }
-    if (ks.size() == 1) {
-        I.lane_in(ks[0]);
-        std::vector<int> o;
-        const Ctl & c = I.hctl;
-        if (c.n + MAXT + 2 < I.ctx) step(o); // (else full: no tokens)
-        out[at[0]] = o;
-    } else if (ks.size() >= 2) {
+    I.lanes_call(ks, [&] {
+        if (ks.size() == 1) {
+            I.lane_in(ks[0]);
+            std::vector<int> o;
+            const Ctl & c = I.hctl;
+            if (c.n + MAXT + 2 < I.ctx) step(o); // (else full: no tokens)
+            out[at[0]] = o;
+        } else if (ks.size() >= 2) {
 #if MK_MAXT > 5 && MK_EGRESS
-        const auto r = I.lanes_step(ks);
-        for (size_t j = 0; j < ks.size(); j++) out[at[j]] = r[j];
+            const auto r = I.lanes_step(ks); // (a failure there: every lane in ks, the batched launch wrote them all)
+            for (size_t j = 0; j < ks.size(); j++) out[at[j]] = r[j];
 #endif
-    }
+        }
+    });
     return out;
 }
 
 // the next chunk of slot pslot's prompt after the step (not yet in the step's pass)
 std::vector<std::vector<int>> MKEngine::slots_step_mixed(int pslot, int budget, const std::vector<int> & slots, int & remain) {
+    p_->lane_ok(pslot); // (a dead pslot fails the call before the step changes anything)
     auto out = slots_step(slots);
     remain = slot_prefill(pslot, budget);
     return out;

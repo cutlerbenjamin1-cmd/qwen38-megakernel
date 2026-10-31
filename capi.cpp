@@ -224,6 +224,9 @@ template <class F> int guarded(void * hp, F f) {
         return -1;
     }
 }
+
+// a caller's array of n ints (n <= 0: none)
+std::vector<int> vec(const int * p, int n) { return n > 0 ? std::vector<int>(p, p + n) : std::vector<int>(); }
 }
 
 extern "C" {
@@ -273,10 +276,12 @@ void * mk_new2(const char * model, int ctx, int n_draft, const char * draft_voca
 }
 
 // ---- parallel slots (open-jet's slot API; MKEngine::slots_open) ----
+// A CUDA error (-1) fails the slots the call ran on: mk_slot_prefill / mk_slots_step(_mixed) refuse them (-1) until
+// mk_slot_begin2 starts them from scratch (reused 0); the engine's own sequence is not reset.
 // n slots of ctx positions each (0: the most that fit); returns ctx (a slot's positions), or -1
 int mk_slots_open2(void * hp, int n, int ctx, int seg_tokens) {
     try {
-        return static_cast<Handle *>(hp)->eng->slots_open(n, ctx, seg_tokens);
+        return gpu_engine(hp)->slots_open(n, ctx, seg_tokens);
     } catch (const std::exception & e) {
         g_err = e.what();
         return -1;
@@ -288,8 +293,7 @@ int mk_slots_open(void * hp, int n, int ctx) { return mk_slots_open2(hp, n, ctx,
 int mk_slot_begin2(void * hp, int slot, const int * toks, int n, float temp, float top_p, int top_k, float min_p, unsigned long long seed,
                    int share_len, int pin) {
     try {
-        return static_cast<Handle *>(hp)->eng->slot_begin(slot, std::vector<int>(toks, toks + n), temp, top_p, top_k, min_p, seed, share_len,
-                                                          pin != 0);
+        return gpu_engine(hp)->slot_begin(slot, vec(toks, n), temp, top_p, top_k, min_p, seed, share_len, pin != 0);
     } catch (const std::exception & e) {
         g_err = e.what();
         return -1;
@@ -302,7 +306,7 @@ int mk_slot_begin(void * hp, int slot, const int * toks, int n, float temp, floa
 // feeds up to budget prompt tokens: returns how many remain (0: ready to step; -1: error)
 int mk_slot_prefill(void * hp, int slot, int budget) {
     try {
-        return static_cast<Handle *>(hp)->eng->slot_prefill(slot, budget);
+        return gpu_engine(hp)->slot_prefill(slot, budget);
     } catch (const std::exception & e) {
         g_err = e.what();
         return -1;
@@ -318,7 +322,7 @@ static void slots_out(const std::vector<std::vector<int>> & em, int n, int * out
 }
 int mk_slots_step(void * hp, const int * slots, int n, int * out, int per, int * counts) {
     try {
-        slots_out(static_cast<Handle *>(hp)->eng->slots_step(std::vector<int>(slots, slots + n)), n, out, per, counts);
+        slots_out(gpu_engine(hp)->slots_step(vec(slots, n)), n, out, per, counts);
         return 0;
     } catch (const std::exception & e) {
         g_err = e.what();
@@ -330,7 +334,7 @@ int mk_slots_step(void * hp, const int * slots, int n, int * out, int per, int *
 int mk_slots_step_mixed(void * hp, int pslot, int budget, const int * slots, int n, int * out, int per, int * counts, int * remain) {
     try {
         int rem = 0;
-        slots_out(static_cast<Handle *>(hp)->eng->slots_step_mixed(pslot, budget, std::vector<int>(slots, slots + n), rem), n, out, per, counts);
+        slots_out(gpu_engine(hp)->slots_step_mixed(pslot, budget, vec(slots, n), rem), n, out, per, counts);
         *remain = rem;
         return 0;
     } catch (const std::exception & e) {
@@ -344,7 +348,7 @@ int mk_slot_segment(void * hp, int slot) { return static_cast<Handle *>(hp)->eng
 // (test) the slot's sequence -> out (up to cap); returns its length
 int mk_slot_sequence(void * hp, int slot, int * out, int cap) {
     try {
-        const auto s = static_cast<Handle *>(hp)->eng->slot_sequence(slot);
+        const auto s = gpu_engine(hp)->slot_sequence(slot); // (lane_in / lane_out synchronise)
         for (int i = 0; i < std::min(cap, (int) s.size()); i++) out[i] = s[i];
         return (int) s.size();
     } catch (const std::exception & e) {
@@ -356,7 +360,7 @@ int mk_slot_sequence(void * hp, int slot, int * out, int cap) {
 // (test) the hidden state of the slot's last processed position -> out[0 .. n), returns its size
 int mk_slot_h(void * hp, int slot, float * out, int n) {
     try {
-        const auto h = static_cast<Handle *>(hp)->eng->slot_h(slot);
+        const auto h = gpu_engine(hp)->slot_h(slot);
         for (int i = 0; i < std::min(n, (int) h.size()); i++) out[i] = h[i];
         return (int) h.size();
     } catch (const std::exception & e) {
@@ -442,8 +446,8 @@ int mk_set_penalty(void * hp, float presence, float frequency) {
 
 // draft-depth policy "key=value,..." (MKEngine::set_policy); returns 0, or -1 on a bad spec
 int mk_set_policy(void * hp, const char * spec) {
-    try {
-        static_cast<Handle *>(hp)->eng->set_policy(spec ? spec : "");
+    try { // (dq4= / mtpq= copy to the draft head's constants: drafts only, the sequence needs no reset after a failure)
+        gpu_engine(hp)->set_policy(spec ? spec : "");
         return 0;
     } catch (const std::exception & e) {
         g_err = e.what();
@@ -453,19 +457,19 @@ int mk_set_policy(void * hp, const char * spec) {
 
 // appends tokens to the sequence; returns the first generated token (negative on error)
 int mk_prefill(void * hp, const int * toks, int n) {
-    return guarded(hp, [&](MKEngine * e) { return e->prefill(std::vector<int>(toks, toks + n)); });
+    return guarded(hp, [&](MKEngine * e) { return e->prefill(vec(toks, n)); });
 }
 
 // mk_prefill with the rewind checkpoint saved at absolute position ck_at (inside this prompt) instead of its end
 int mk_prefill_ck(void * hp, const int * toks, int n, int ck_at) {
-    return guarded(hp, [&](MKEngine * e) { return e->prefill(std::vector<int>(toks, toks + n), ck_at); });
+    return guarded(hp, [&](MKEngine * e) { return e->prefill(vec(toks, n), ck_at); });
 }
 
 // mk_prefill with checkpoints at the absolute positions cks[0..ncks) (ck_exact: the one kept exact, or -1;
 // MKEngine::prefill(tokens, cks, ck_exact))
 int mk_prefill_cks(void * hp, const int * toks, int n, const int * cks, int ncks, int ck_exact) {
     return guarded(hp, [&](MKEngine * e) {
-        return e->prefill(std::vector<int>(toks, toks + n), std::vector<int>(cks, cks + std::max(ncks, 0)), ck_exact);
+        return e->prefill(vec(toks, n), vec(cks, ncks), ck_exact);
     });
 }
 
@@ -476,7 +480,7 @@ int mk_prefill_img(void * hp, const int * toks, int n, const int * cks, int ncks
     return guarded(hp, [&](MKEngine * e) {
         std::vector<MKImage> im;
         for (int i = 0; i < nimg; i++) im.push_back({pos[i], nx[i], ny[i], embd[i]});
-        return e->prefill(std::vector<int>(toks, toks + n), std::vector<int>(cks, cks + std::max(ncks, 0)), ck_exact, im);
+        return e->prefill(vec(toks, n), vec(cks, ncks), ck_exact, im);
     });
 }
 
@@ -517,13 +521,10 @@ void mk_reset(void * hp) {
 }
 
 int mk_truncate(void * hp, int len) {
-    try {
-        gpu_engine(hp)->truncate(len);
+    return guarded(hp, [&](MKEngine * e) {
+        e->truncate(len);
         return 0;
-    } catch (const std::exception & e) {
-        g_err = e.what();
-        return -1;
-    }
+    });
 }
 
 // copies the sequence so far (up to cap tokens); returns its length
