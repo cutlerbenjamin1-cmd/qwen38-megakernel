@@ -65,6 +65,10 @@ extern char ** environ; // (state files: the MK_* settings in the key)
 #ifndef MK_TEST_NAN
 #define MK_TEST_NAN 0
 #endif
+// MK_TEST_SLOTS_FAIL=1 (tests only): env MK_TEST_SLOTS_FAIL_AT=k makes slots_open throw an MKCudaError once lane k is built
+#ifndef MK_TEST_SLOTS_FAIL
+#define MK_TEST_SLOTS_FAIL 0
+#endif
 // MK_KV_EMU=1 (accuracy experiments): MK_KV_EMU_SPEC rounds chosen K / V cache slots to a lower-bit grid (kv_store_emu)
 // while keeping the q8 layout, so lower-bit KV formats can be scored per layer before the kernels support them.
 #ifndef MK_KV_EMU
@@ -8567,11 +8571,7 @@ struct MKEngine::Impl {
             if (e) cudaEventDestroy(e);
         for (cudaEvent_t e : pf_gev) cudaEventDestroy(e);
         for (void * p : allocs) use_pool ? cudaFreeAsync(p, 0) : cudaFree(p);
-        if (!allocs.empty()) {
-            cudaStreamSynchronize(0);
-            cudaMemPool_t pool; // (the pool keeps freed memory: trimmed, a caller's retry finds the VRAM free)
-            if (use_pool && cudaDeviceGetDefaultMemPool(&pool, 0) == cudaSuccess) cudaMemPoolTrimTo(pool, 0);
-        }
+        if (!allocs.empty()) pool_trim(); // (a caller's retry finds the VRAM free)
         if (embd_host) cudaFreeHost(embd_host);
         if (emb_host) cudaFreeHost(emb_host);
         if (err_host) cudaFreeHost(const_cast<int *>(err_host));
@@ -8579,6 +8579,15 @@ struct MKEngine::Impl {
         if (ctl_eg_host) cudaFreeHost(const_cast<Ctl *>(ctl_eg_host));
         if (dv_pin) cudaFreeHost(dv_pin);
 #endif
+    }
+
+    // The default pool keeps what is freed into it, and what a failed allocation grew it by before failing: back to the
+    // device (after the stream-ordered frees). No CUDA call without the pool.
+    void pool_trim() noexcept {
+        if (!use_pool) return;
+        cudaStreamSynchronize(0);
+        cudaMemPool_t pool;
+        if (cudaDeviceGetDefaultMemPool(&pool, 0) == cudaSuccess) cudaMemPoolTrimTo(pool, 0);
     }
 
     // emb_host holding at least `floats` (grown: pinned, mapped; cP.emb follows it)
@@ -10620,6 +10629,10 @@ struct MKEngine::Impl {
         for (size_t i = na; i < allocs.size(); i++) use_pool ? cudaFreeAsync(allocs[i], 0) : cudaFree(allocs[i]);
         allocs.resize(na);
         alloc_bytes = ab;
+        // trimmed: what the lanes held, and what a failed allocation left reserved (~7.7 GB after a 25.6 GB one failed
+        // part way, outside the VRAM), go back to the device. The next open reusing that remainder at once failed with out
+        // of memory, which the context then kept reporting; 60 s later the same reuse worked.
+        pool_trim();
         cudaGetLastError();
     }
     // n pinned checkpoint slots (as ck_alloc's: the streams and events are the engine's)
@@ -10680,6 +10693,13 @@ struct MKEngine::Impl {
 #else
         if (!lanes.empty()) throw std::runtime_error("slots are open already");
         if (n < 1 || n > NSEQ) throw std::runtime_error("slots: 1 .. " + std::to_string(NSEQ));
+        // a slot's positions: at most the model's context length, also for "the most that fit"; checked before anything is
+        // allocated (100,000,000 positions used to build a 26 GB host RoPE table first)
+        const auto cl = file.ints.find("qwen35.context_length");
+        const int lmax = (int) std::min<uint64_t>(cl != file.ints.end() && cl->second > 0 ? cl->second : 1u << 20, 1u << 20);
+        if (lctx > lmax)
+            throw std::runtime_error("parallel slots: " + std::to_string(lctx) + " positions per slot exceed the model's context length (" +
+                                     std::to_string(lmax) + ", qwen35.context_length)");
         lane_out();
         // (any MK_KV / MK_KV_WIN preset: every lane gets the engine's per-slot formats and window rings of its own; every
         // device path reads them through the lane's views, the host's per-sequence ring state is in the Lane)
@@ -10731,7 +10751,7 @@ struct MKEngine::Impl {
             CK(cudaMemGetInfo(&free_b, &total_b));
             const size_t reserve = (size_t) (getenv("MK_SLOT_RESERVE_MIB") ? atol(getenv("MK_SLOT_RESERVE_MIB")) : 1536) << 20;
             const size_t avail = free_b > reserve ? (free_b - reserve) / n : 0;
-            int lo = 0, hi = 1 << 20;
+            int lo = 0, hi = lmax;
             while (lo < hi) {
                 const int mid = (lo + hi + 1) / 2;
                 if (lane_bytes(mid) <= avail) lo = mid;
@@ -10827,6 +10847,12 @@ struct MKEngine::Impl {
             reset();
             seq.clear();
             lane_out();
+#if MK_TEST_SLOTS_FAIL
+            if (getenv("MK_TEST_SLOTS_FAIL_AT") && atoi(getenv("MK_TEST_SLOTS_FAIL_AT")) == k) {
+                fprintf(stderr, "[mk] MK_TEST_SLOTS_FAIL: slots_open fails after lane %d\n", k);
+                throw MKCudaError("MK_TEST_SLOTS_FAIL: slots_open failed after lane " + std::to_string(k));
+            }
+#endif
         }
         dv_reset();
         dv_frozen = true;
