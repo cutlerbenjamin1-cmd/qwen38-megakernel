@@ -1,6 +1,7 @@
 // C API over MKEngine plus libllama's tokenizer (vocab only), for the HTTP server (server/mk_server.py).
 #include <algorithm>
 #include <chrono>
+#include <climits>
 #include <condition_variable>
 #include <cstdio>
 #include <cstdlib>
@@ -238,6 +239,17 @@ template <class F> int guarded(void * hp, F f) {
 
 // a caller's array of n ints (n <= 0: none)
 std::vector<int> vec(const int * p, int n) { return n > 0 ? std::vector<int>(p, p + n) : std::vector<int>(); }
+
+// libllama's tokenizer calls throw (std::out_of_range for an id outside the vocabulary, bad_alloc): INT_MIN, which is
+// also llama_tokenize's own error value, with mk_last_error
+template <class F> int vocab_call(F f) {
+    try {
+        return f();
+    } catch (const std::exception & e) {
+        g_err = e.what();
+        return INT_MIN;
+    }
+}
 }
 
 extern "C" {
@@ -403,20 +415,26 @@ void mk_free(void * hp) {
     delete h;
 }
 
-// chat template stored in the GGUF (tokenizer.chat_template); returns its length, copies up to cap
+// chat template stored in the GGUF (tokenizer.chat_template); returns its length, copies up to cap (-1: none, or an
+// error with mk_last_error)
 int mk_chat_template(void * hp, char * buf, int cap) {
-    auto * h = static_cast<Handle *>(hp);
-    const char * t = llama_model_chat_template(h->lm, nullptr);
-    if (!t) return -1;
-    const int n = (int) strlen(t);
-    if (buf && cap > 0) memcpy(buf, t, std::min(n, cap));
-    return n;
+    try {
+        auto * h = static_cast<Handle *>(hp);
+        const char * t = llama_model_chat_template(h->lm, nullptr);
+        if (!t) return -1;
+        const int n = (int) strlen(t);
+        if (buf && cap > 0) memcpy(buf, t, std::min(n, cap));
+        return n;
+    } catch (const std::exception & e) {
+        g_err = e.what();
+        return -1;
+    }
 }
 
-// text -> token ids (special tokens such as <|im_start|> parsed); returns the count (negative: -needed)
+// text -> token ids (special tokens such as <|im_start|> parsed); returns the count (negative: -needed; INT_MIN: error)
 int mk_tokenize(void * hp, const char * text, int len, int * out, int cap) {
     auto * h = static_cast<Handle *>(hp);
-    return llama_tokenize(h->vocab, text, len, out, cap, false, true);
+    return vocab_call([&] { return llama_tokenize(h->vocab, text, len, out, cap, false, true); });
 }
 
 // mk_tokenize with llama_tokenize's flags: add_special: the vocabulary's BOS / EOS where it adds them; parse_special: the
@@ -424,7 +442,7 @@ int mk_tokenize(void * hp, const char * text, int len, int * out, int cap) {
 // such as <think> are matched either way, as in llama.cpp and Hugging Face tokenizers)
 int mk_tokenize2(void * hp, const char * text, int len, int * out, int cap, int add_special, int parse_special) {
     auto * h = static_cast<Handle *>(hp);
-    return llama_tokenize(h->vocab, text, len, out, cap, add_special != 0, parse_special != 0);
+    return vocab_call([&] { return llama_tokenize(h->vocab, text, len, out, cap, add_special != 0, parse_special != 0); });
 }
 
 // a token's llama_token_attr bits (LLAMA_TOKEN_ATTR_CONTROL 8, _USER_DEFINED 16, _UNKNOWN 1, ...; the control and unknown
@@ -435,15 +453,15 @@ int mk_token_attr(void * hp, int tok) {
     return (int) llama_vocab_get_attr(vocab, tok);
 }
 
-// token -> its bytes (special tokens rendered as text); returns the byte count
+// token -> its bytes (special tokens rendered as text); returns the byte count (INT_MIN: an id outside the vocabulary)
 int mk_piece(void * hp, int tok, char * buf, int cap) {
     auto * h = static_cast<Handle *>(hp);
-    return llama_token_to_piece(h->vocab, tok, buf, cap, 0, true);
+    return vocab_call([&] { return llama_token_to_piece(h->vocab, tok, buf, cap, 0, true); });
 }
 
 int mk_is_eog(void * hp, int tok) { return llama_vocab_is_eog(static_cast<Handle *>(hp)->vocab, tok) ? 1 : 0; }
 
-// the vocabulary's size: valid token ids are 0 .. n - 1 (mk_piece of another id is undefined)
+// the vocabulary's size: valid token ids are 0 .. n - 1
 int mk_n_vocab(void * hp) { return llama_vocab_n_tokens(static_cast<Handle *>(hp)->vocab); }
 
 int mk_set_sampling(void * hp, float temp, float top_p, int top_k, float min_p, unsigned long long seed) {

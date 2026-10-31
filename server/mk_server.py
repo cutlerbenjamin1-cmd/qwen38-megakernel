@@ -333,10 +333,12 @@ class Engine:
         cap = min(len(b) + 16, 1 << 20)  # (a longer text is tokenized twice: the first call returns its count)
         out = (ctypes.c_int * cap)()
         n = run(out, cap)
-        if n < 0:
+        if -2 ** 31 < n < 0:  # (-count: a longer buffer; INT_MIN: an error)
             cap = -n
             out = (ctypes.c_int * cap)()
             n = run(out, cap)
+        if n < 0:
+            raise self._err("tokenize")
         return list(out[:n])
 
     def controls(self):
