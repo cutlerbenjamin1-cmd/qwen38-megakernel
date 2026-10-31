@@ -46,24 +46,26 @@ Evidence and the tests behind each line: [docs/BENCHMARKS.md](docs/BENCHMARKS.md
 
 ## Speed
 
-One RTX 3090 and a Ryzen 9 5900XT, unsloth's UD-Q4_K_XL, the server at 120k context, q8_0 KV cache, 7 drafts, greedy
-unless noted. This engine: the release v2026.10.30 (6f3b257), one session on 2026-10-30 (Linux / WSL2). llama.cpp:
-b11548's `llama-server`, tuned (q8_0 KV, 4 MTP drafts), the same client, prompts and model file, the best value of each
-row over three sessions on 2026-10-12 and 10-13.
+One RTX 3090 and a Ryzen 9 5900XT, unsloth's UD-Q4_K_XL, the server at 120k context, q8_0 KV cache, greedy unless
+noted, one session on 2026-10-31. This engine: the release v2026.10.30 (6f3b257, Linux / WSL2) at its default 7 drafts.
+llama.cpp: b12024's `llama-server`, tuned, at 4 MTP drafts (its fastest) and at 7; the same client, prompts and model
+file.
 
-| | llama.cpp | this engine |
-|---|---|---|
-| greedy decode, short prompts (4 x 512 tokens) | 82.7 tok/s | **156.7 tok/s** |
-| sampled decode, thinking on (8 runs) | 65.8 tok/s | **138.2 tok/s** |
-| decode at 38k tokens of context | 62.3 tok/s | **119.8 tok/s** |
-| decode at 101.6k tokens of context | 53.4 tok/s | **109.4 tok/s** |
-| read a 101.6k-token prompt | 101.0 s | **75.2 s** |
-| first token, short prompt | 124 ms | **66 ms** |
-| edit an earlier message in an 11.7k-token chat | 329 ms | **77 ms** |
-| 282 benchmark questions (GSM8K, MMLU-Pro, ARC-C, MATH-500, HumanEval, NIAH, LongBench v2) | 229 right, 2,727 s | **230 right, 1,676 s** |
+| | llama.cpp, 4 drafts | llama.cpp, 7 drafts | this engine |
+|---|---|---|---|
+| greedy decode, short prompts (4 x 512 tokens) | 86.8 tok/s | 73.4 tok/s | **156.9 tok/s** |
+| sampled decode, thinking on (8 runs) | 72.8 tok/s | 57.6 tok/s | **138.5 tok/s** |
+| decode at 38k tokens of context | 66.1 tok/s | 52.7 tok/s | **119.7 tok/s** |
+| decode at 101.6k tokens of context | 54.4 tok/s | 44.7 tok/s | **109.2 tok/s** |
+| read a 101.6k-token prompt | 95.9 s | 96.5 s | **75.1 s** |
+| first token, short prompt | 117 ms | 120 ms | **66 ms** |
+| edit an earlier message in an 11.7k-token chat | 266 ms | 269 ms | **76 ms** |
+| 282 benchmark questions (GSM8K, MMLU-Pro, ARC-C, MATH-500, HumanEval, NIAH, LongBench v2) | 229 right, 2,563 s | 229 right, 2,841 s | **230 right, 1,676 s** (2026-10-30) |
 
-The short-prompt rows are means of per-request rates, as the client reports them; the full table, token-weighted
-rates, the preset D and F columns and earlier runs are in [docs/BENCHMARKS.md](docs/BENCHMARKS.md).
+Without drafts on either side, this engine decodes 7% faster on short prompts (46.7 against 43.5 tok/s) and 41% faster
+at 101.6k tokens of context (39.1 against 27.8). The short-prompt rows are means of per-request rates, as the client
+reports them; the full table, token-weighted rates, the preset D and F columns and earlier runs are in
+[docs/BENCHMARKS.md](docs/BENCHMARKS.md).
 
 Several agents at once (`--agents 4`, Q4_K_M, 2026-10-30): 380 tok/s in total on short prompts and 319 with a
 ~23k-token context each; one agent alone 183 tok/s with that context and 167-204 on short prompts, depending on how
@@ -75,9 +77,9 @@ The server keeps more than the conversation in front of it, and with exact reuse
 same request sent fresh would:
 
 - **Follow-ups and edits** resume from DeltaNet checkpoints (one at every message start and every 4,096 tokens). A
-  follow-up turn in an 11.8k-token chat cost 176 ms of prompt time (the previous reply is read again, for exactness),
-  editing an earlier message in an 11.7k-token chat 77 ms, editing the end of a 9.1k-token system prompt 89 ms
-  (llama.cpp: 323, 329 and 956 ms; 2026-10-30).
+  follow-up turn in an 11.8k-token chat cost 177 ms of prompt time (the previous reply is read again, for exactness),
+  editing an earlier message in an 11.7k-token chat 76 ms, editing the end of a 9.1k-token system prompt 89 ms
+  (llama.cpp b12024: 222, 266 and 874 ms; 2026-10-31).
 - **New sessions** of the same client resume after its system prompt and tools: that checkpoint is pinned, so the
   checkpoint pool never evicts it, and it is parked with its conversation. A new Claude Code session reused 8,288 of
   its 11,850 prompt tokens and a new Codex CLI session 8,672 of 8,847, where the server before reused none

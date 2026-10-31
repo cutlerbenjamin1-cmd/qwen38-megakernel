@@ -62,7 +62,8 @@ Speculation in numbers (2026-10-16, commit 7d67c5d, CLI, UD-Q4_K_XL, q8_0 KV; to
 
 A cycle that verifies 8 rows took ~29.1 ms against 22.3 ms for 1 row (short context), so the gain comes from accepted
 drafts. Without drafts, llama.cpp b11548 decoded the same prompts at 42.0 tok/s (short) and 35.1 tok/s (38k) in that
-session.
+session (b12024 through the server on 2026-10-31: 43.5 and 36.1 against this engine's 46.7 and 43.3,
+[BENCHMARKS.md](BENCHMARKS.md#without-drafts)).
 
 ## Correctness
 

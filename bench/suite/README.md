@@ -84,8 +84,8 @@ context). The VRAM rows are for the whole card, so nothing else should run on it
 The from-scratch step needs side requests and parking off: with them on, the short request the client sends to clear
 the cache runs beside the cached conversation and keeps it, and the long prompt is then served from the cache.
 
-The llama.cpp column was measured with llama.cpp b11548's `llama-server`, tuned (q8_0 KV cache, 4 MTP drafts), on the
-same model file:
+The llama.cpp columns were measured with llama.cpp b12024's `llama-server` (2026-10-31), tuned (q8_0 KV cache, 4 MTP
+drafts; `--spec-draft-n-max 7` for the 7-draft column, no `--spec-type` without drafts), on the same model file:
 
 ```sh
 llama-server -m Qwen3.8-27B-UD-Q4_K_XL.gguf --mmproj mmproj-BF16.gguf --no-mmproj-offload -ngl 99 -c 120000 -np 1 \
@@ -146,8 +146,8 @@ the question totals and the full-context table, and writes them as JSON with `--
 - **Sessions.** The same build runs several percent faster or slower from one session to the next with GPU temperature
   and clocks. The speed client records nvidia-smi's temperature, clocks, fan and power at the start and the end of a
   pass (`--gpu none` turns VRAM and GPU records off, e.g. for a server on another machine). A label found in several
-  files counts as several sessions, and each row shows the best one (the llama.cpp column is the best of three
-  sessions); give each run its own label unless that is what you want.
+  files counts as several sessions, and each row shows the best one; give each run its own label unless that is what
+  you want.
 - **Re-runs.** `--sub LABEL:KEY[,KEY]=OTHER` takes some rows of a column from another label, e.g. a step re-run after
   something disturbed it. Keys: the row keys listed in `summarize.py`'s usage, `qa` (all question sets) or `qa.SET`.
   The 2026-10-30 table needed none; the 2026-10-20 one was made with
