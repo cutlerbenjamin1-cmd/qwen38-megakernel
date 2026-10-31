@@ -46,8 +46,14 @@ tools/vit_check: vision/vit_check.cpp vision/vit_cpu.o
 tools/vision_ref: tools/vision_ref.cpp logit_stats.h
 	g++ -O2 -std=c++17 -pthread $(VISION_INC) $< $(VISION_LIBS) -o $@
 
+# the engine's compile flags, rewritten only when they change: another MKFLAGS or ARCH rebuilds qwen38_mk.o
+build/nvflags: FORCE
+	@mkdir -p build
+	@echo '$(NVCC) $(NVFLAGS)' > $@.tmp
+	@cmp -s $@.tmp $@ && rm -f $@.tmp || mv $@.tmp $@
+
 # ptxas register / spill report for every phase function goes to ptxas.log
-qwen38_mk.o: qwen38_mk.cu qwen38_mk.h gguf.h prefill.cuh prefill_gemm.cuh prefill_attn.cuh loader.cuh wv.cuh wv_host.cuh
+qwen38_mk.o: qwen38_mk.cu qwen38_mk.h gguf.h prefill.cuh prefill_gemm.cuh prefill_attn.cuh loader.cuh wv.cuh wv_host.cuh build/nvflags
 	$(NVCC) $(NVFLAGS) -I$(LLAMA)/ggml/include -c qwen38_mk.cu -o $@ 2> ptxas.log || (cat ptxas.log; false)
 
 qwen38_mk: qwen38_mk.o main.cu logit_stats.h

@@ -28,7 +28,13 @@ COMMIT="$(sed -n 's/^#define MK_BUILD_COMMIT "\(.*\)"/\1/p' build/mk_build_info.
 FLAGS="$(sed -n 's/^#define MK_BUILD_FLAGS "\(.*\)"/\1/p' build/mk_build_info.h)"
 [ "$COMMIT" = "$(git rev-parse --short=12 HEAD)" ] || { echo "the build is of '$COMMIT', HEAD is $(git rev-parse --short=12 HEAD): run make again" >&2; exit 1; }
 
-NAME="qwen38-megakernel-$VERSION-linux-x64-sm86"
+# the GPU code the build holds (Makefile ARCH: the first GPU's, unless given)
+ARCHS="$("$(dirname "$NVCC")/cuobjdump" --list-elf libqwen38mk.so | grep -oE 'sm_[0-9]+[a-z]?' | sort -u | paste -sd- - || true)"
+[ -n "$ARCHS" ] || { echo "no GPU code found in libqwen38mk.so (cuobjdump --list-elf)" >&2; exit 1; }
+GPU_NOTE=""
+[ "$ARCHS" = sm_86 ] && GPU_NOTE=" (compute capability 8.6; 8.9 runs it, untested)"
+
+NAME="qwen38-megakernel-$VERSION-linux-x64-${ARCHS//_/}"
 STAGE="$OUT/$NAME"
 rm -rf "$STAGE"; mkdir -p "$STAGE/tools" "$STAGE/licenses" "$STAGE/server" "$STAGE/scripts"
 cp "${ELF_ROOT[@]}" "$STAGE/"
@@ -74,7 +80,7 @@ cat > "$STAGE/BUILD_INFO.txt" << EOF
 qwen38-megakernel $VERSION, Linux x86-64
 commit     $COMMIT (https://github.com/cutlerbenjamin1-cmd/qwen38-megakernel/tree/$COMMIT)
 MKFLAGS    $FLAGS
-GPU code   sm_86 (compute capability 8.6; 8.9 runs it, untested)
+GPU code   ${ARCHS//-/, }$GPU_NOTE
 CUDA       $("$NVCC" --version | tail -n1)
 compiler   $(g++ --version | head -n1)
 llama.cpp  $(git -C "$LLAMA" describe --tags 2>/dev/null) (https://github.com/ggml-org/llama.cpp/tree/$(git -C "$LLAMA" describe --tags 2>/dev/null)), $(grep -E '^(GGML_(CUDA|NATIVE|AVX2|AVX512|OPENMP)):' "$LLAMA/build/CMakeCache.txt" | sed 's/:BOOL//' | tr '\n' ' ')

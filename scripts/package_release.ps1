@@ -33,7 +33,14 @@ $vcrt = @("$($redist.FullName)\x64\Microsoft.VC143.CRT\msvcp140.dll", "$($redist
           "$($redist.FullName)\x64\Microsoft.VC143.CRT\vcruntime140_1.dll", "$($redist.FullName)\x64\Microsoft.VC143.OpenMP\vcomp140.dll")
 foreach ($f in $vcrt) { if (-not (Test-Path $f)) { throw "missing $f" } }
 
-$name = "qwen38-megakernel-$Version-windows-x64-sm86"
+# the GPU code the build holds (build.ps1 -Arch: the first GPU's, unless given)
+$cuobjdump = if ($env:CUDA_PATH) { Join-Path $env:CUDA_PATH "bin\cuobjdump.exe" } else { "cuobjdump.exe" }
+$archs = (& $cuobjdump --list-elf "qwen38mk.dll" | Select-String -AllMatches 'sm_\d+[a-z]?' | ForEach-Object { $_.Matches.Value } |
+          Sort-Object -Unique) -join "-"
+if (-not $archs) { throw "no GPU code found in qwen38mk.dll (cuobjdump --list-elf)" }
+$gpuNote = if ($archs -eq "sm_86") { " (compute capability 8.6; 8.9 runs it, untested)" } else { "" }
+
+$name = "qwen38-megakernel-$Version-windows-x64-$($archs -replace '_', '')"
 $stage = Join-Path $Out $name
 if (Test-Path $stage) { Remove-Item -Recurse -Force $stage }
 foreach ($d in @("tools", "licenses", "server", "scripts")) { New-Item -ItemType Directory -Force (Join-Path $stage $d) | Out-Null }
@@ -65,7 +72,7 @@ $llamaTag = (git -C $Llama describe --tags 2>$null)
     "qwen38-megakernel $Version, Windows x64",
     "commit     $commit (https://github.com/cutlerbenjamin1-cmd/qwen38-megakernel/tree/$commit)",
     "MKFLAGS    $flags",
-    "GPU code   sm_86 (compute capability 8.6; 8.9 runs it, untested)",
+    "GPU code   $($archs -replace '-', ', ')$gpuNote",
     "CUDA       $nvccVer",
     "compiler   MSVC $($redist.Name) (Visual Studio 2022)",
     "llama.cpp  $llamaTag (https://github.com/ggml-org/llama.cpp/tree/$llamaTag), CPU only",
