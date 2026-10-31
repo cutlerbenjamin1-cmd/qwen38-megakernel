@@ -7739,6 +7739,9 @@ struct MKEngine::Impl {
         // block_count NLA: the 64 layers + the MTP layer; NL: a conversion without the MTP layer (M3)
         if ((file.ints["qwen35.block_count"] != NLA && file.ints["qwen35.block_count"] != NL) || file.ints["qwen35.embedding_length"] != D)
             throw std::runtime_error("unexpected model dimensions (this kernel is specialised for the 27B)");
+        if (ctx > ctx_limit())
+            throw std::runtime_error("context of " + std::to_string(ctx) + " positions exceeds the model's context length (" +
+                                     std::to_string(ctx_limit()) + ", qwen35.context_length)");
         {
             // MTP source: the mtp argument (CLI --mtp FILE / --no-mtp), else MK_NO_MTP=1 / MK_MTP=FILE, else the model file's
             std::string mtp = mtp_;
@@ -8588,6 +8591,12 @@ struct MKEngine::Impl {
         cudaStreamSynchronize(0);
         cudaMemPool_t pool;
         if (cudaDeviceGetDefaultMemPool(&pool, 0) == cudaSuccess) cudaMemPoolTrimTo(pool, 0);
+    }
+
+    // the most positions a sequence may have: the model's context length (2^20 without the key)
+    int ctx_limit() const {
+        const auto cl = file.ints.find("qwen35.context_length");
+        return (int) std::min<uint64_t>(cl != file.ints.end() && cl->second > 0 ? cl->second : 1u << 20, 1u << 20);
     }
 
     // emb_host holding at least `floats` (grown: pinned, mapped; cP.emb follows it)
@@ -10695,8 +10704,7 @@ struct MKEngine::Impl {
         if (n < 1 || n > NSEQ) throw std::runtime_error("slots: 1 .. " + std::to_string(NSEQ));
         // a slot's positions: at most the model's context length, also for "the most that fit"; checked before anything is
         // allocated (100,000,000 positions used to build a 26 GB host RoPE table first)
-        const auto cl = file.ints.find("qwen35.context_length");
-        const int lmax = (int) std::min<uint64_t>(cl != file.ints.end() && cl->second > 0 ? cl->second : 1u << 20, 1u << 20);
+        const int lmax = ctx_limit();
         if (lctx > lmax)
             throw std::runtime_error("parallel slots: " + std::to_string(lctx) + " positions per slot exceed the model's context length (" +
                                      std::to_string(lmax) + ", qwen35.context_length)");

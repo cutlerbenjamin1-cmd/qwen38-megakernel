@@ -272,7 +272,7 @@ limits in [SERVER.md](SERVER.md#limits).
 | `--allow-host NAME` | `MK_ALLOW_HOSTS` | none | host names clients may use besides localhost, IP addresses and `--host`'s (repeatable or comma-separated; `*` = any name, which turns the DNS-rebinding check off); other names get a 403 | - | 5aab531, 2026-10-19 |
 | `--cors-origin`, `--cors-origins ORIGIN` | `MK_CORS_ORIGINS` | none | web origins (`scheme://host[:port]`) whose pages may call the server (CORS headers, preflights; `*` is refused); pages of other origins get a 403. Clients that are not web pages send no Origin and are not affected | - | 5aab531, 2026-10-19 |
 | `--api-key KEY` | `MK_API_KEY` | none | every request but `/health` and CORS preflights must carry the key (`Authorization: Bearer KEY` or `x-api-key: KEY`); others get a 401 | - | 2026-10-31 |
-| `-c`, `--ctx` | - | `32768` (launchers 120000); with `--agents` `0` (with `--parallel` 32768) | context in tokens (the model's full context is 262,144); with `--agents` each slot's, 0 = the most that fits | - | upstream (4d92fd2) |
+| `-c`, `--ctx` | - | `32768` (launchers 120000); with `--agents` `0` (with `--parallel` 32768) | context in tokens, at most the model's full context of 262,144 (more: the engine refuses to start); with `--agents` each slot's, 0 = the most that fits | - | upstream (4d92fd2) |
 | `-d`, `--draft` | - | `4` (launchers 7) | MTP drafts per cycle: 0-7 with the served build, 0-4 with the lean build; more than 4 needs the q8_0 cache | drafts only | upstream (4d92fd2) |
 | `--draft-vocab` | - | `draft_vocab_32k.bin` in the repo | the draft head's vocabulary (the 32k most frequent tokens; tokens of the current conversation are added) | drafts only | upstream (4d92fd2) |
 | `--mtp FILE` | `MK_MTP` (engine) | the model file's MTP layer | the MTP draft layer from another GGUF of the same model (checked against it) | drafts only | f334fd0, 2026-10-18 |
@@ -561,7 +561,7 @@ Model and engine (one per process; in `--batch` mode these stay the command line
 | Option | Default | What it does | Since |
 |---|---|---|---|
 | `-m FILE` | required | the GGUF | upstream (4d92fd2) |
-| `-c N` | `8192` | context (KV capacity) in tokens | upstream (4d92fd2) |
+| `-c N` | `8192` | context (KV capacity) in tokens, at most the model's context length (262,144) | upstream (4d92fd2) |
 | `--kv f16\|q8\|auto` | `auto` | KV cache format; `auto`: q8_0 when fp16 does not fit, or when `MK_KV` is set | upstream (4d92fd2) |
 | `--draft-vocab FILE` | none: the full lm_head | the draft head's vocabulary (`draft_vocab_32k.bin`) | upstream (4d92fd2) |
 | `--mtp FILE`, `--no-mtp` | the model file's MTP layer | as the server's options (env `MK_MTP`, `MK_NO_MTP=1`) | f334fd0, 2026-10-18 |
