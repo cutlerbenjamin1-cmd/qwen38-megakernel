@@ -8068,7 +8068,7 @@ struct MKEngine::Impl {
         hw.draft_ids = nullptr;
         wrec_on = false;
         if (!draft_vocab.empty() && has_mtp) { // (no MTP block: no draft head)
-            FILE * f = fopen(draft_vocab.c_str(), "rb");
+            FILE * f = ggml_fopen(draft_vocab.c_str(), "rb"); // (a UTF-8 path on Windows too)
             if (!f) throw std::runtime_error("cannot open draft vocab " + draft_vocab);
             std::vector<int> ids;
             int id;

@@ -37,11 +37,17 @@ bool mk_win_module_path(const void * addr, char * out, size_t cap) {
 // minimized windows (the server's console). A high-resolution waitable timer (Windows 10 1803+) wakes within about half a
 // millisecond; without one (older Windows), yield the rest of the time slice instead.
 void mk_win_sleep_us(unsigned us) {
-    static thread_local HANDLE t = CreateWaitableTimerExW(nullptr, nullptr, CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, TIMER_ALL_ACCESS);
-    if (t) {
+    struct Timer { // (one per thread, closed when the thread ends: the server runs a thread per connection)
+        HANDLE h = CreateWaitableTimerExW(nullptr, nullptr, CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, TIMER_ALL_ACCESS);
+        ~Timer() {
+            if (h) CloseHandle(h);
+        }
+    };
+    static thread_local Timer t;
+    if (t.h) {
         LARGE_INTEGER due;
         due.QuadPart = -10LL * static_cast<long long>(us); // relative, in 100 ns units
-        if (SetWaitableTimer(t, &due, 0, nullptr, nullptr, FALSE) && WaitForSingleObject(t, INFINITE) == WAIT_OBJECT_0) return;
+        if (SetWaitableTimer(t.h, &due, 0, nullptr, nullptr, FALSE) && WaitForSingleObject(t.h, INFINITE) == WAIT_OBJECT_0) return;
     }
     SwitchToThread();
 }

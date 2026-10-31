@@ -607,7 +607,7 @@ Vit::Vit(const std::string & mmproj, const Params & prm) {
     gguf_init_params gp = {true, nullptr};
     gg.g = gguf_init_from_file(mmproj.c_str(), gp);
     if (!gg.g) throw std::runtime_error("vit: cannot read " + mmproj);
-    gg.f = fopen(mmproj.c_str(), "rb");
+    gg.f = ggml_fopen(mmproj.c_str(), "rb"); // (a UTF-8 path on Windows too, as gguf_init_from_file reads it)
     if (!gg.f) throw std::runtime_error("vit: cannot open " + mmproj);
     gg.data = gguf_get_data_offset(gg.g);
     {

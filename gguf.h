@@ -26,6 +26,7 @@
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include <unistd.h>
+inline int mk_open(const char * path, int flags) { return open(path, flags); }
 #endif
 
 namespace gguf {
@@ -94,7 +95,7 @@ struct File {
     static constexpr uint64_t MAX_ALIGNMENT = 1u << 20; // general.alignment: a power of two up to this
 
     explicit File(const std::string & path) {
-        int fd = open(path.c_str(), O_RDONLY);
+        int fd = mk_open(path.c_str(), O_RDONLY);
         if (fd < 0) throw std::runtime_error("cannot open " + path);
         struct stat st;
         if (fstat(fd, &st) != 0) {
