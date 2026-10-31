@@ -356,7 +356,10 @@ since merged some of this engine's kernels (open-jet #24 to #27), so the compari
 - **llama.cpp's greedy output depends on the draft depth.** Its greedy answers to the 282 questions at 4 and at 7 MTP
   drafts (b12024, 2026-10-31) differ on 9: none of the 236 answers under 1,000 tokens, 9 of the 46 longer ones. On
   MMLU-Pro (3) and MATH-500 (3) the first difference is 1,936 to 4,550 characters in; on MATH-500 with thinking on (3)
-  the reasoning itself went another way (2,228 against 4,795 tokens on one). A preregistered study of llama.cpp's MTP on
+  the reasoning itself went another way (2,228 against 4,795 tokens on one). Asked again twice at 4 drafts on a fresh
+  server, the 9 got the same answer both times (reasoning text included), and on 8 of them the first run's: those 8
+  differences come from the draft depth. The ninth's first answer came after the other questions on the same server and
+  is not reproduced without them (3,692 against 4,405 tokens). A preregistered study of llama.cpp's MTP on
   one RTX 3090 (Hsiu-Chi Tsai, 2026-08-29, [repository](https://github.com/thc1006/qwen3.8-speculative-decoding-rtx3090),
   [archive](https://doi.org/10.5281/zenodo.22149941)) found its output the same from pass to pass but different from
   decoding without drafts in 23 to 25 of 25 prompts by 1,600 tokens.
