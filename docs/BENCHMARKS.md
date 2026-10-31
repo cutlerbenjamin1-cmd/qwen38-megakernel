@@ -56,7 +56,7 @@ KV, 4 MTP drafts), the same client, prompts and model file, the best value of ea
 | accuracy against llama.cpp generating token by token | top token agrees on 98.737% of positions, mean KL 0.00119 nats (llama.cpp's own batched run: 98.489%, 0.00166) | 2026-10-17, unchanged through v2026.10.30 | [against llama.cpp](#against-llamacpp) |
 | KV presets D / F: KL at 100k context | 0.00226 / 0.00218, against q8_0's 0.00217 | 2026-10-25 | [KV cache presets](#kv-cache-presets) |
 | the full 262,144-token context, preset F | a 260,896-token prompt in 340 s, decode at that depth 66.6 tok/s, 23,650 MiB on the card | 2026-10-25 | [the full context](#the-full-context) |
-| greedy token ids at 0, 4 and 7 drafts | identical | each release | [speculation](#speculation) |
+| greedy token ids at 0, 4 and 7 drafts | identical (llama.cpp b12024's greedy answers at 4 and 7 drafts: 9 of 282 differ) | each release (llama.cpp: 2026-10-31) | [speculation](#speculation) |
 | Windows build against Linux build | identical output | each release | [Windows and Linux](#windows-and-linux) |
 | reused, parked and restored requests (exact reuse) | bit for bit equal to the same request sent fresh | 2026-10-14 to 10-21 | [exact reuse](#exact-reuse) |
 
@@ -353,6 +353,13 @@ since merged some of this engine's kernels (open-jet #24 to #27), so the compari
   length, and the verify GEMMs compute every row the same way whatever the number of rows, so the same prompt gives the
   same token ids at 0, 4 and 7 drafts. Every release is checked this way (v2026.10.30: the Windows build's ids at 0 and
   7 drafts equal the Linux build's at 7).
+- **llama.cpp's greedy output depends on the draft depth.** Its greedy answers to the 282 questions at 4 and at 7 MTP
+  drafts (b12024, 2026-10-31) differ on 9: none of the 236 answers under 1,000 tokens, 9 of the 46 longer ones. On
+  MMLU-Pro (3) and MATH-500 (3) the first difference is 1,936 to 4,550 characters in; on MATH-500 with thinking on (3)
+  the reasoning itself went another way (2,228 against 4,795 tokens on one). A preregistered study of llama.cpp's MTP on
+  one RTX 3090 (Hsiu-Chi Tsai, 2026-08-29, [repository](https://github.com/thc1006/qwen3.8-speculative-decoding-rtx3090),
+  [archive](https://doi.org/10.5281/zenodo.22149941)) found its output the same from pass to pass but different from
+  decoding without drafts in 23 to 25 of 25 prompts by 1,600 tokens.
 - **Sampling keeps the distribution of sampling without drafts.** A draft is accepted with probability p(draft) and a
   rejected one is resampled from the rest of the distribution. Checked with chi-square and PIT tests; the counter-based
   random numbers, keyed by seed and position, were checked with a CPU replica of the loop (396k re-drafted positions)
