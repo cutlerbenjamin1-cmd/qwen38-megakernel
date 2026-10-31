@@ -1196,6 +1196,8 @@ def normalize_messages(messages, media=None):
     or video), so the prompt around each is llama-server's."""
     out = []
     for m in messages:
+        if not isinstance(m, dict):
+            raise BadRequest("messages: each message must be an object")
         m = dict(m)
         content = m.get("content")
         if isinstance(content, list):
@@ -3631,7 +3633,11 @@ class Server:
             if not -2.0 <= v <= 2.0:
                 raise BadRequest(f"{k} must be in [-2, 2]")
             pen.append(v)
-        if float(body.get("repetition_penalty") or body.get("repeat_penalty") or 1.0) != 1.0:
+        try:
+            rep = float(body.get("repetition_penalty") or body.get("repeat_penalty") or 1.0)
+        except (TypeError, ValueError, OverflowError):
+            raise BadRequest("repetition_penalty must be a number")
+        if rep != 1.0:
             self.warn_once("rep", "repetition_penalty is not supported by the megakernel and is ignored")
         if temp <= 0:
             temp, top_p, top_k, min_p = 0.0, 1.0, TOPK_MAX, 0.0
@@ -3690,11 +3696,13 @@ class Server:
                 self.job = None
 
     def _generate(self, body, emit, gone, thinking, toks, images, media=()):
-        max_new = body.get("max_tokens") or body.get("max_completion_tokens") or body.get("n_predict") or -1
+        max_new = next((body[k] for k in ("max_tokens", "max_completion_tokens", "n_predict") if body.get(k) is not None), -1)
         try:
             max_new = int(max_new)
         except (TypeError, ValueError, OverflowError):
             raise BadRequest("max_tokens must be an integer")
+        if max_new == 0:  # (OpenAI's and Anthropic's minimum is 1)
+            raise BadRequest("max_tokens must be at least 1 (-1: up to the context)")
         asked = max_new
         limit = self.args.ctx - len(toks) - ContextOverflow.RESERVE
         if limit <= 0:
@@ -4379,6 +4387,14 @@ def make_handler(srv):
                     self._json(200, out)
                 except BadRequest as e:
                     self._bad(e, anth)
+                except DISCONNECTS:
+                    self.close_connection = True
+                except Exception as e:  # (answered, not a dropped connection)
+                    log(f"{path} error:", repr(e))
+                    try:
+                        self._error(500, str(e), anth)
+                    except Exception:
+                        pass
                 return
             rid = next(srv.rids)
             if srv.sched is None and srv.busy():
@@ -4521,15 +4537,29 @@ def make_handler(srv):
                              "content": blocks, "stop_reason": anthropic_stop_reason(finish, srv.stop_word),
                              "stop_sequence": srv.stop_word, "usage": anthropic_usage(usage)})
 
+        def _stream_head(self):
+            """ends an event stream's headers: chunked, or for HTTP/1.0 (no chunked) a body that ends with the connection"""
+            if self.request_version == "HTTP/1.0":
+                self.send_header("Connection", "close")
+                self.close_connection = True
+            else:
+                self.send_header("Transfer-Encoding", "chunked")
+            self.end_headers()
+
+        def _stream_send(self, data, last=False):
+            """one piece of an event stream's body (_stream_head's framing); last: then the end of the body"""
+            if self.request_version == "HTTP/1.0":
+                self.wfile.write(data)
+            else:
+                self.wfile.write(b"%x\r\n" % len(data) + data + (b"\r\n0\r\n\r\n" if last else b"\r\n"))
+            self.wfile.flush()
+
         def _anthropic_stream(self, chat, model):
             """Anthropic's SSE: message_start, ping, content blocks (thinking / text deltas as they come, tool_use blocks
             with their input as input_json_delta pieces as it is generated), message_delta, message_stop"""
             mid = "msg_" + uuid.uuid4().hex
             st = {"started": False, "index": -1, "open": None, "ws": ""}  # ws: the thinking's held trailing whitespace
-
-            def send(data, last=False):
-                self.wfile.write(b"%x\r\n" % len(data) + data + (b"\r\n0\r\n\r\n" if last else b"\r\n"))
-                self.wfile.flush()
+            send = self._stream_send
 
             def event(name, obj, last=False):
                 send(f"event: {name}\ndata: {json.dumps(obj, ensure_ascii=False)}\n\n".encode(), last)
@@ -4541,8 +4571,7 @@ def make_handler(srv):
                 self.send_response(200)
                 self.send_header("Content-Type", "text/event-stream")
                 self.send_header("Cache-Control", "no-cache")
-                self.send_header("Transfer-Encoding", "chunked")
-                self.end_headers()
+                self._stream_head()
                 n, reused = srv.last_prompt
                 event("message_start", {"type": "message_start", "message": {
                     "id": mid, "type": "message", "role": "assistant", "model": model, "content": [], "stop_reason": None,
@@ -4655,10 +4684,7 @@ def make_handler(srv):
             (response.incomplete after max_output_tokens) with the usage. An error once it has started is
             response.failed (code server_error, invalid_prompt for a bad request). Every event has its sequence_number."""
             st = {"started": False, "seq": 0, "items": [], "open": None, "ws": "", "t": 0.0}
-
-            def send(data, last=False):
-                self.wfile.write(b"%x\r\n" % len(data) + data + (b"\r\n0\r\n\r\n" if last else b"\r\n"))
-                self.wfile.flush()
+            send = self._stream_send
 
             def event(obj, last=False):
                 obj["sequence_number"] = st["seq"]
@@ -4676,8 +4702,7 @@ def make_handler(srv):
                 self.send_response(200)
                 self.send_header("Content-Type", "text/event-stream")
                 self.send_header("Cache-Control", "no-cache")
-                self.send_header("Transfer-Encoding", "chunked")
-                self.end_headers()
+                self._stream_head()
                 event({"type": "response.created", "response": response("in_progress")})
                 event({"type": "response.in_progress", "response": response("in_progress")})
 
@@ -4813,11 +4838,7 @@ def make_handler(srv):
         def _stream(self, body):
             cid, created = "chatcmpl-" + uuid.uuid4().hex, int(time.time())
             started = [False]
-
-            def send(data, last=False):
-                """one event as a chunk of the body; last: then the end of the body"""
-                self.wfile.write(b"%x\r\n" % len(data) + data + (b"\r\n0\r\n\r\n" if last else b"\r\n"))
-                self.wfile.flush()
+            send = self._stream_send
 
             def chunk(delta, finish=None, usage=None, timings=None, progress=None):
                 obj = {"id": cid, "object": "chat.completion.chunk", "created": created, "model": srv.model_id,
@@ -4836,8 +4857,7 @@ def make_handler(srv):
                     self.send_response(200)
                     self.send_header("Content-Type", "text/event-stream")
                     self.send_header("Cache-Control", "no-cache")
-                    self.send_header("Transfer-Encoding", "chunked")
-                    self.end_headers()
+                    self._stream_head()
                     chunk({"role": "assistant", "content": None})
 
             per_token = bool(body.get("timings_per_token"))  # (llama-server's: the timings so far in every chunk)

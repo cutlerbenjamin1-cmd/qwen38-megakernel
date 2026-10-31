@@ -1291,6 +1291,34 @@ class ExtraRouteTests(_HttpCase):
         srv.eng.n_vocab = 0  # (a library without mk_n_vocab)
         self.assertEqual(self._post(http_, "/detokenize", {"tokens": [104]})[0], 400)
 
+    def test_malformed_fields_are_400(self) -> None:
+        _, http_ = self.serve(_ScriptEngine(["ok"]))
+        hi = [{"role": "user", "content": "hi"}]
+        for path, body in (("/v1/chat/completions", {"messages": [1]}), ("/apply-template", {"messages": [None]}),
+                           ("/v1/chat/completions/input_tokens", {"messages": [1]}),
+                           ("/v1/chat/completions", {"messages": hi, "repetition_penalty": "x"}),
+                           ("/v1/chat/completions", {"messages": hi, "max_tokens": 0}),
+                           ("/v1/chat/completions", {"messages": hi, "max_tokens": 0, "stream": True}),
+                           ("/v1/messages", {"messages": hi, "max_tokens": 0})):
+            self.assertEqual(self._post(http_, path, body)[0], 400, (path, body))
+
+    def test_http10_stream_is_not_chunked(self) -> None:
+        _, http_ = self.serve(_ScriptEngine(["ok"]))
+        b = json.dumps({"messages": [{"role": "user", "content": "hi"}], "stream": True}).encode()
+        with socket.create_connection(("127.0.0.1", http_.port), timeout=10) as s:
+            s.sendall(b"POST /v1/chat/completions HTTP/1.0\r\nHost: 127.0.0.1\r\nConnection: keep-alive\r\n"
+                      b"Content-Length: %d\r\n\r\n" % len(b) + b)
+            data = b""
+            while True:  # (the body ends when the server closes the connection)
+                d = s.recv(65536)
+                if not d:
+                    break
+                data += d
+        head, _, body = data.partition(b"\r\n\r\n")
+        self.assertNotIn(b"transfer-encoding", head.lower())
+        self.assertIn(b"connection: close", head.lower())
+        self.assertTrue(body.startswith(b"data: {") and body.endswith(b"data: [DONE]\n\n"), body[-80:])
+
     def test_unsupported_routes_are_501_unknown_404(self) -> None:
         _, http_ = self.serve(_ScriptEngine(["ok"]))
         for path in ("/v1/completions", "/completion", "/v1/embeddings", "/infill", "/v1/rerank", "/v1/responses/compact",
