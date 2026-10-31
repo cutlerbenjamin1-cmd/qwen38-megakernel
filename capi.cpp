@@ -352,7 +352,8 @@ int mk_slots_step(void * hp, const int * slots, int n, int * out, int per, int *
     }
 }
 
-// mk_slots_step, then the next budget tokens of slot pslot's prompt; *remain <- the prompt tokens left
+// the next budget tokens of slot pslot's prompt, then mk_slots_step (a failed chunk steps nothing); *remain <- the
+// prompt tokens left
 int mk_slots_step_mixed(void * hp, int pslot, int budget, const int * slots, int n, int * out, int per, int * counts, int * remain) {
     try {
         int rem = 0;

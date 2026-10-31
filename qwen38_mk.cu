@@ -8547,6 +8547,7 @@ struct MKEngine::Impl {
     // the device and pinned resources: ~Impl, and a constructor that throws part way (~Impl does not run then). Every
     // handle starts null or empty, so a half-built engine frees what it got; no CUDA call when nothing was made.
     void release() noexcept {
+        if (!allocs.empty()) cudaDeviceSynchronize(); // (a non-blocking stream's work may still use them)
         ck_free(); // (checkpoint copies may still read or write device buffers)
         for (auto & l : lanes) { // (a live lane's resources are in the members above, the engine's own ones in its Lane)
             ck_slots_free(l.ck);
@@ -11900,12 +11901,12 @@ std::vector<std::vector<int>> MKEngine::slots_step(const std::vector<int> & slot
     MK_LANE_OUT();
     for (int s : slots) I.lane_ok(s); // (every slot before any of them changes)
     std::vector<std::vector<int>> out(slots.size());
-    std::vector<int> ks, at;
+    std::vector<int> ks, at, firsts;
     for (size_t i = 0; i < slots.size(); i++) {
         Impl::Lane & L = I.lanes[slots[i]];
         if (L.first >= 0) { // (its prefill's token first: this call only emits it)
             out[i].push_back(L.first);
-            L.first = -1;
+            firsts.push_back(slots[i]);
             continue;
         }
         ks.push_back(slots[i]);
@@ -11925,15 +11926,17 @@ std::vector<std::vector<int>> MKEngine::slots_step(const std::vector<int> & slot
 #endif
         }
     });
+    for (int s : firsts) I.lanes[s].first = -1; // (taken only now: a throw above leaves the token for the next call)
     return out;
 }
 
-// the next chunk of slot pslot's prompt after the step (not yet in the step's pass)
+// the next chunk of slot pslot's prompt, then the step (separate launches; the chunk first: a failure in it leaves the
+// decoding slots unstepped, so no emitted token is lost with the call's error)
 std::vector<std::vector<int>> MKEngine::slots_step_mixed(int pslot, int budget, const std::vector<int> & slots, int & remain) {
-    p_->lane_ok(pslot); // (a dead pslot fails the call before the step changes anything)
-    auto out = slots_step(slots);
+    p_->lane_ok(pslot); // (a dead slot fails the call before anything changes)
+    for (int s : slots) p_->lane_ok(s);
     remain = slot_prefill(pslot, budget);
-    return out;
+    return slots_step(slots);
 }
 
 std::vector<int> MKEngine::slot_sequence(int slot) {

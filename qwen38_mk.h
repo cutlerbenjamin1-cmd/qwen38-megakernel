@@ -209,10 +209,11 @@ class MKEngine {
     // last chunk saves a checkpoint before its last token (a repeat of the prompt resumes there). slots_step: one step
     // of the given slots (two or more: one batched launch, each slot up to 1 + MAXT / n - 1 tokens), the tokens each
     // emitted (a slot's first call after its prefill: the prefill's token only; empty: its context is full).
-    // slots_step_mixed: slots_step, then the next chunk of pslot's prompt. Every slot call leaves the engine's own
-    // sequence current again. An MKCudaError fails the slots the call ran on: slot_prefill / slots_step refuse them
-    // (std::runtime_error) until slot_begin, which starts them from scratch (reuses nothing). A slot_prefill stopped by
-    // cancel() (MKCancelled) queues the prompt's rest again from where the slot's sequence went back to.
+    // slots_step_mixed: pslot's next prompt chunk, then slots_step (a failed chunk steps nothing: no token is lost).
+    // Every slot call leaves the engine's own sequence current again. An MKCudaError fails the slots the call ran on:
+    // slot_prefill / slots_step refuse them (std::runtime_error) until slot_begin, which starts them from scratch
+    // (reuses nothing). A slot_prefill stopped by cancel() (MKCancelled) queues the prompt's rest again from where the
+    // slot's sequence went back to.
     int slots_open(int n, int ctx, int seg_tokens = 0);
     int slots_count() const;
     int slot_begin(int slot, const std::vector<int> & toks, float temp, float top_p, int top_k, float min_p, unsigned long long seed,
