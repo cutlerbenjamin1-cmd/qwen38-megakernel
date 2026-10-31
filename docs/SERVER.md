@@ -938,6 +938,9 @@ is that a web page you happen to open cannot use it.
     Assistant turns are content too: a reply that quoted `<|im_end|>` as text comes back as the same text tokens, so
     exact reuse keeps it; only a control token the model emitted mid-reply (none of the end-of-turn ones: those end the
     reply) would re-prefill from there.
+- **Bodies that are not read:** only POST bodies are read. Any other request with a body (a `Content-Length` other than
+  0, or a `Transfer-Encoding`), e.g. a `GET`, is answered with `Connection: close` and the connection closes, so the
+  body is never taken for the next request (behind a reverse proxy: a request the proxy never saw).
 - **Untrusted uploads:** the limits below refuse oversized bodies, images and video frames before they are decoded.
 
 ## Limits

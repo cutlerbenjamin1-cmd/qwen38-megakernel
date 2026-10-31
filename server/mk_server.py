@@ -4145,20 +4145,30 @@ class GatedHandler(BaseHTTPRequestHandler):
     """the handlers' base: the server's Gate decides on each request before it is handled (and before a 100 Continue);
     a refused one gets a 403 and the connection closes (its body is not read). An admitted browser origin gets
     Access-Control-Allow-Origin + Vary: Origin on every response (errors and event streams too), and its CORS preflights
-    (OPTIONS) are answered."""
+    (OPTIONS) are answered. A request with a body its handler does not read (any method but POST: a GET, an OPTIONS)
+    is answered with Connection: close and the connection closes, so that the body is not taken for the next request
+    (behind a proxy: a smuggled one)."""
     protocol_version = "HTTP/1.1"
     cors = None  # the request's admitted Origin: CORS headers on the response
     admitted = None  # the gate's verdict on the request (None: not asked yet)
+    BODY_METHODS = ("POST",)  # the methods whose handlers read the request body
+    unread = False  # the request has a body its handler does not read: the response closes the connection
 
     def log_message(self, *a):
         pass
 
     def handle_one_request(self):
         self.cors = self.admitted = None
+        self.unread = False
         super().handle_one_request()
 
     def parse_request(self):
-        return super().parse_request() and self.admit()
+        if not (super().parse_request() and self.admit()):
+            return False
+        cl = [v.strip() for v in self.headers.get_all("Content-Length") or []]  # (each one: "0" then "80" is a body)
+        self.unread = self.command not in self.BODY_METHODS and bool(self.headers.get_all("Transfer-Encoding")
+                                                                      or any(v != "0" for v in cl))
+        return True
 
     def admit(self):
         """True if the gate lets the request through (asked once per request); else it is answered with a 403 (host,
@@ -4192,6 +4202,8 @@ class GatedHandler(BaseHTTPRequestHandler):
         if self.cors:
             self.send_header("Access-Control-Allow-Origin", self.cors)
             self.send_header("Vary", "Origin")
+        if self.unread and not self.close_connection:  # (send_header sets close_connection: once)
+            self.send_header("Connection", "close")
         super().end_headers()
 
     def do_OPTIONS(self):
@@ -4205,9 +4217,6 @@ class GatedHandler(BaseHTTPRequestHandler):
                 headers.append(("Access-Control-Allow-Headers", want))
             if (self.headers.get("Access-Control-Request-Private-Network") or "").strip().lower() == "true":
                 headers.append(("Access-Control-Allow-Private-Network", "true"))  # (Chrome: a public page to this machine)
-        if self.headers.get("Transfer-Encoding") or (self.headers.get("Content-Length") or "0").strip() != "0":
-            headers.append(("Connection", "close"))  # (a body is not read: it must not be taken for the next request)
-            self.close_connection = True
         self.send_response(200)
         for k, v in headers:
             self.send_header(k, v)

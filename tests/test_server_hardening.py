@@ -312,6 +312,38 @@ class GateHttpTests(_GateCase):
         env = json.loads(body)["engine"]["env"]
         self.assertEqual((env["MK_API_KEY"], env["MK_TEST_SETTING"]), ("(set)", "7"))  # (the others as they are)
 
+    def test_a_body_that_is_not_read_closes_the_connection(self) -> None:
+        _, http_ = self.gated(api_key="k")
+        auth = b"Host: 127.0.0.1\r\nAuthorization: Bearer k\r\n"
+        inner = b"GET /v1/models HTTP/1.1\r\n" + auth + b"\r\n"  # (a whole second request as the body)
+        chunked = b"%x\r\n%s\r\n0\r\n\r\n" % (len(inner), inner)
+        for line, status in ((b"GET /health", 200), (b"GET /props", 200), (b"OPTIONS *", 200), (b"PUT /health", 501)):
+            for framing, body in ((b"Content-Length: %d\r\n" % len(inner), inner),
+                                  (b"Content-Length: 0\r\nContent-Length: %d\r\n" % len(inner), inner),
+                                  (b"Transfer-Encoding: chunked\r\n", chunked)):
+                out = b""
+                with socket.create_connection(("127.0.0.1", http_.port), timeout=5) as s:
+                    s.sendall(line + b" HTTP/1.1\r\n" + auth + framing + b"\r\n" + body)
+                    try:
+                        while True:
+                            b = s.recv(65536)
+                            if not b:  # (the server closed the connection)
+                                break
+                            out += b
+                    except ConnectionResetError:
+                        pass
+                    except socket.timeout:
+                        self.fail(f"{line} {framing}: the connection stayed open after {out[:200]!r}")
+                self.assertEqual(re.findall(rb"HTTP/1\.1 (\d{3}) ", out), [b"%d" % status], (line, framing, out[:300]))
+                self.assertIn(b"Connection: close", out.partition(b"\r\n\r\n")[0].split(b"\r\n"), (line, framing))
+        c = http.client.HTTPConnection("127.0.0.1", http_.port, timeout=10)  # (no body: keep-alive as before)
+        for _ in range(2):
+            c.request("GET", "/health")
+            r = c.getresponse()
+            r.read()
+            self.assertEqual((r.status, r.getheader("Connection")), (200, None))
+        c.close()
+
 
 class ConnectionTests(_GateCase):
     """MK_TIMEOUT_S on idle and stalled connections, and request bodies json cannot parse"""
