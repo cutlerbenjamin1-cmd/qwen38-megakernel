@@ -80,7 +80,11 @@ tools/llama_ref: tools/llama_ref.cpp logit_stats.h
 tests/gguf_fuzz: tests/gguf_fuzz.cpp gguf.h
 	g++ -O1 -g -std=c++17 -fsanitize=address,undefined -fno-sanitize-recover=undefined $< -o $@
 
+# README's exact-output claims on this build (scripts/exactness.py; the GPU to itself): make exactness MK_MODEL=<gguf>
+exactness: qwen38_mk libqwen38mk.so
+	python3 scripts/exactness.py $(if $(MK_MODEL),-m $(MK_MODEL)) $(EXACTNESS_ARGS)
+
 clean:
 	rm -f qwen38_mk libqwen38mk.so qwen38_mk.o ptxas.log tools/vocab_freq tools/llama_ref libqwen38vision.so tools/mkv_cli tools/vision_ref tools/vit_check vision/vit_cpu.o tests/gguf_fuzz
 
-.PHONY: all vision clean FORCE
+.PHONY: all vision clean exactness FORCE

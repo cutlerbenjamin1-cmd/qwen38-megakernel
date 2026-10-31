@@ -177,8 +177,12 @@ hf download unsloth/Qwen3.8-27B-GGUF Qwen3.8-27B-UD-Q4_K_XL.gguf mmproj-BF16.ggu
   3.11 and 3.12).
 - **GGUF parser:** `make tests/gguf_fuzz && tests/gguf_fuzz` feeds `gguf.h` malformed and randomly corrupted files under
   AddressSanitizer and UBSan (CPU only, Linux).
-- **Draft-depth independence:** the same prompt at `-d 0`, `-d 4` and `-d 7` must give identical ids:
-  `./qwen38_mk -m <gguf> -p "..." -n 256 -d 7 --kv q8 --draft-vocab draft_vocab_32k.bin --ids`
+- **Exactness:** `python3 scripts/exactness.py -m <gguf>` (or `make exactness MK_MODEL=<gguf>`; Windows:
+  `python scripts\exactness.py -m <gguf>`) checks the README's [exact output](../README.md#exact-output) claims on the
+  GPU: greedy ids identical at 0, 4 and 7 drafts (`--depths 0,4` for a `make MKFLAGS=` build) and without the MTP
+  layer, the exact-reuse state digest and ids independent of the prefill chunk size, and a warm server's follow-up,
+  edited and sampled replies equal to a fresh server's. It needs the GPU to itself (11 model loads), prints PASS / FAIL
+  per check, exits 1 on a failure and writes every result to `exactness-out/exactness.json`.
 - **Accuracy against llama.cpp:** `tools/llama_ref` writes a reference file, and
   `./qwen38_mk -m <gguf> --kld <ref> --score-path mixed --kv q8` scores the engine against it
   ([BENCHMARKS.md](BENCHMARKS.md#against-llamacpp) has the full recipe and the expected numbers).
@@ -187,8 +191,10 @@ hf download unsloth/Qwen3.8-27B-GGUF Qwen3.8-27B-UD-Q4_K_XL.gguf mmproj-BF16.ggu
 - **Speed:** `python3 bench/bench.py mk --draft 4 -n 512 --draft-vocab draft_vocab_32k.bin --model <gguf>` (4 chat
   prompts through the CLI; it uses the CLI's default KV cache, so at most 4 drafts). `bench/*.cu` are kernel
   microbenchmarks.
-- **Windows against Linux:** the ids of the depth check, the `--kld` report and server replies to the same requests
-  should be identical between a Windows and a Linux build of the same commit.
+- **Windows against Linux:** run the exactness checks on both builds of the same commit, the second with
+  `--compare <the first's output directory>`: every token id, state digest and server reply must be identical, and so
+  should the `--kld` report. Release packages include the script, so a downloaded package can be checked the same way,
+  also against the previous release.
 
 ## Files
 

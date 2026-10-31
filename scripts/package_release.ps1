@@ -44,7 +44,7 @@ Copy-Item ($binRoot | Where-Object { $_ -match "\.dll$" -and $_ -ne "qwen38mk.dl
 Copy-Item $vcrt $stage
 Copy-Item $vcrt "$stage\tools"
 Copy-Item "server\*.py" "$stage\server"
-Copy-Item "scripts\serve.bat" "$stage\scripts"
+Copy-Item "scripts\serve.bat", "scripts\exactness.py" "$stage\scripts"
 Copy-Item -Recurse "docs" $stage
 Copy-Item @("README.md", "LICENSE", "THIRD_PARTY_NOTICES.md", "requirements.txt", "draft_vocab_32k.bin") $stage
 Copy-Item "$Llama\LICENSE" "$stage\licenses\llama.cpp-LICENSE"
