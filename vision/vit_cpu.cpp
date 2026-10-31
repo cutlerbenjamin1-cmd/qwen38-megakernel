@@ -523,7 +523,7 @@ struct Vit::Impl {
     Pool pool;
     int n_embd = 0, D = 0, nH = 0, FF = 0, nL = 0, patch = 0, merge = 0, pside = 0;
     float eps = 1e-6f, mean[3] = {0.5f, 0.5f, 0.5f}, stdv[3] = {0.5f, 0.5f, 0.5f};
-    int min_pixels = 0, max_pixels = 0;
+    long long min_pixels = 0, max_pixels = 0;
     struct Layer {
         PW qkv, out, up, down;
         std::vector<float> ln1w, ln1b, ln2w, ln2b;
@@ -643,8 +643,8 @@ Vit::Vit(const std::string & mmproj, const Params & prm) {
     if ((long long) I.nH * HD != I.D || I.merge != 2 || I.patch != 16) throw std::runtime_error("vit: unexpected vision tower shape");
     // llama.cpp's limits for this projector (clip.cpp: set_limit_image_tokens(8, 4096)), per merged token 32 x 32 pixels
     const int area = I.patch * I.patch * I.merge * I.merge;
-    I.min_pixels = (prm.min_tokens > 0 ? prm.min_tokens : 8) * area;
-    I.max_pixels = (prm.max_tokens > 0 ? prm.max_tokens : 4096) * area;
+    I.min_pixels = (long long) (prm.min_tokens > 0 ? prm.min_tokens : 8) * area;
+    I.max_pixels = (long long) (prm.max_tokens > 0 ? prm.max_tokens : 4096) * area;
     Pool & pool = I.pool;
     const int D = I.D;
     auto vec = [&](const std::string & n, size_t expect) {
@@ -703,7 +703,7 @@ int Vit::n_threads() const { return p_->pool.size(); }
 void Vit::target_size(int width, int height, int & tw, int & th, int max_tokens) const {
     // mtmd-image.cpp calc_size_preserved_ratio (smart resize), float arithmetic as there
     const int f = p_->patch * p_->merge;
-    const int max_pixels = max_tokens > 0 ? max_tokens * f * f : p_->max_pixels;
+    const long long max_pixels = max_tokens > 0 ? (long long) max_tokens * f * f : p_->max_pixels;
     auto round_by = [f](float x) { return static_cast<int>(std::round(x / static_cast<float>(f))) * f; };
     auto ceil_by = [f](float x) { return static_cast<int>(std::ceil(x / static_cast<float>(f))) * f; };
     auto floor_by = [f](float x) { return static_cast<int>(std::floor(x / static_cast<float>(f))) * f; };
@@ -725,9 +725,9 @@ void Vit::target_size(int width, int height, int & tw, int & th, int max_tokens)
     // limit are not changed.
     for (int cut = 0; cut < 2 && (long long) h_bar * w_bar > max_pixels; cut++) {
         if (h_bar <= w_bar)
-            w_bar = std::max(f, max_pixels / h_bar / f * f);
+            w_bar = (int) std::max<long long>(f, max_pixels / h_bar / f * f);
         else
-            h_bar = std::max(f, max_pixels / w_bar / f * f);
+            h_bar = (int) std::max<long long>(f, max_pixels / w_bar / f * f);
     }
     tw = w_bar;
     th = h_bar;
