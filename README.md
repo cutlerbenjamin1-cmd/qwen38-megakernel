@@ -225,7 +225,7 @@ Details: [docs/BUILDING.md](docs/BUILDING.md#requirements).
 - [docs/SERVER.md](docs/SERVER.md): the APIs, the conversation cache (exact reuse, checkpoints, parking, side
   requests), the console, limits and security.
 - [docs/CLIENTS.md](docs/CLIENTS.md): settings for each coding agent and chat UI.
-- [docs/BENCHMARKS.md](docs/BENCHMARKS.md): every measurement, with its date, commit and method.
+- [docs/BENCHMARKS.md](docs/BENCHMARKS.md): headline numbers, then each measurement with its date, commit and method.
 - [docs/ENGINE.md](docs/ENGINE.md): how the engine works inside.
 
 ## Credits and license

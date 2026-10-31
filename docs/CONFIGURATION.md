@@ -132,7 +132,7 @@ The three presets side by side, measured in one session on 2026-10-13 (1ed60cd, 
 against llama.cpp's reference, relative to q8_0's own). 120k is the benchmark anchor (the launchers' default context),
 so memory is compared at that size: the third column is how much context fits in the VRAM q8_0 uses at 120k, not how
 far a preset was tested. D and F run the model's full 262,144 tokens (below, and
-[BENCHMARKS.md](BENCHMARKS.md#preset-d-at-the-full-context)).
+[BENCHMARKS.md](BENCHMARKS.md#the-full-context)).
 
 | Preset | Frees at 120k | Context that fits in q8_0's 120k VRAM | KL: short / 32k / 64k | Decode, ms per cycle at 38k / 101.6k | Prefill speed at 38k / 101.6k |
 |---|---|---|---|---|---|
