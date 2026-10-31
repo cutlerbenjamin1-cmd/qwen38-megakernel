@@ -211,7 +211,9 @@ environment variables (`MK_HOST=0.0.0.0` for the LAN, `MK_KV` / `MK_KV_WIN` for 
 ## Requirements
 
 - **GPU:** NVIDIA Ampere or newer with 24 GB and at least 80 SMs for more than 4 drafts (50 for up to 4). Tuned and
-  tested on an RTX 3090 (sm_86); other architectures build but are untested.
+  tested on an RTX 3090 (sm_86); other architectures build but are untested. `--agents` with 2 or more slots needs 80
+  SMs at any number of drafts, and the engine refuses fewer; making its batched passes work on 50-79 SMs (A10, L4,
+  RTX A5000) is open, and a pull request is welcome.
 - **CUDA 13.2** (older 12.x versions are untested), Linux, WSL2 or Windows 10 / 11 x64.
 - **RAM:** ~20 GiB free to compile the served configuration; at run time, page-locked host memory for parked
   conversations up to `MK_PARK_MIB` (8 GiB by default, allocated as needed).

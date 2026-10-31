@@ -1512,8 +1512,9 @@ constexpr int EMB_UB = 16; // units per embed block
 static_assert(U_D % EMB_UB == 0 && EMB_UB == NW, "embed_prologue: one unit per warp");
 // Grid size (one block per SM): phases that hand one block to each item (embed_prologue U_D / EMB_UB blocks per row,
 // dn_core one per DeltaNet head, the MTP M0 MTP_M0_NB per catch-up row, up to 5 rows) skip items silently on a smaller
-// grid, so the engine refuses a GPU with fewer SMs than mk_min_grid(rows per launch) at load. lm_head's per-block
-// (max, sum) table (SM_LSE) and the MK_PROFILE stamps hold MK_MAX_GRID blocks: a larger GPU runs that many.
+// grid, so the engine refuses a GPU with fewer SMs than mk_min_grid(rows per launch) at load (slots_open: 2+ slots,
+// mk_min_grid(MAXT)). lm_head's per-block (max, sum) table (SM_LSE) and the MK_PROFILE stamps hold MK_MAX_GRID blocks:
+// a larger GPU runs that many.
 constexpr int MTP_M0_NB = 10;
 constexpr int MK_MAX_GRID = 128;
 constexpr int mk_min_grid(int rows) {
@@ -10702,6 +10703,11 @@ struct MKEngine::Impl {
 #else
         if (!lanes.empty()) throw std::runtime_error("slots are open already");
         if (n < 1 || n > NSEQ) throw std::runtime_error("slots: 1 .. " + std::to_string(NSEQ));
+        // (2+ lanes run batched passes of MAXT rows, two lanes always: embed_prologue skips the rows past a smaller grid)
+        if (n >= 2 && nsm < mk_min_grid(MAXT))
+            throw std::runtime_error("parallel slots: " + std::to_string(n) + " slots need a GPU with at least " +
+                                     std::to_string(mk_min_grid(MAXT)) + " SMs (batched passes of " + std::to_string(MAXT) +
+                                     " rows); this one has " + std::to_string(nsm) + " (1 slot runs)");
         // a slot's positions: at most the model's context length, also for "the most that fit"; checked before anything is
         // allocated (100,000,000 positions used to build a 26 GB host RoPE table first)
         const int lmax = ctx_limit();

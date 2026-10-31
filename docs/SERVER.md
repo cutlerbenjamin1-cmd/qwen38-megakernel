@@ -405,7 +405,9 @@ An engine library built before a feature existed turns it off by itself, with a 
 `--agents N` (env `MK_AGENTS`) serves up to N requests at once: several coding agents, or one agent's subagents, on one
 GPU. Each request runs in a parallel slot of the engine, a conversation with its own KV cache and recurrent state, and
 every slot that is decoding runs in the same engine cycle: one batched launch for all of them. Each agent gets fewer
-tokens per second than it would alone, all of them together far more. The engine has 4 slots (N = 1..4).
+tokens per second than it would alone, all of them together far more. The engine has 4 slots (N = 1..4). Two or more
+slots need a GPU with at least 80 SMs at any number of drafts (the batched passes run 8 rows); the engine refuses fewer
+at startup, and 1 slot runs wherever the server does.
 
 ```sh
 python3 server/mk_server.py -m Qwen3.8-27B-UD-Q4_K_XL.gguf -d 7 --agents 4   # 4 slots, the most context that fits
