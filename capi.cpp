@@ -246,11 +246,12 @@ const char * mk_last_error() { return g_err.c_str(); }
 
 // mtp: the MTP layer's source (MKEngine's mtp): NULL / "" the model file (or MK_NO_MTP / MK_MTP), a GGUF path, "none"
 void * mk_new_mtp(const char * model, int ctx, int n_draft, const char * draft_vocab, int kv_mode, const char * mtp) {
+    Handle * h = nullptr;
     try {
         llama_backend_init();
         llama_model_params mp = llama_model_default_params();
         mp.vocab_only = true;
-        auto * h = new Handle;
+        h = new Handle;
         h->lm = llama_model_load_from_file(model, mp);
         if (!h->lm) throw std::runtime_error("failed to load the vocabulary");
         h->vocab = llama_model_get_vocab(h->lm);
@@ -272,6 +273,12 @@ void * mk_new_mtp(const char * model, int ctx, int n_draft, const char * draft_v
         return h;
     } catch (const std::exception & e) {
         g_err = e.what();
+        if (h) { // (what was made before the failure, in mk_free's order)
+            delete h->warm;
+            delete h->eng;
+            if (h->lm) llama_model_free(h->lm);
+            delete h;
+        }
         return nullptr;
     }
 }

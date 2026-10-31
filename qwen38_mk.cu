@@ -32,6 +32,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <exception>
 #include <functional>
 #include <iterator>
 #include <stdexcept>
@@ -7082,7 +7083,7 @@ struct MKEngine::Impl {
             if (use_pool) {
                 cudaMemPool_t pool;
                 CK(cudaDeviceGetDefaultMemPool(&pool, 0));
-                unsigned long long thr = ~0ull; // keep freed memory in the pool (nothing is freed before exit anyway)
+                unsigned long long thr = ~0ull; // keep freed memory in the pool (release() hands it back to the driver)
                 CK(cudaMemPoolSetAttribute(pool, cudaMemPoolAttrReleaseThreshold, &thr));
             }
         }
@@ -7710,6 +7711,19 @@ struct MKEngine::Impl {
 
     Impl(const std::string & path, int ctx_, int ndraft_, const std::string & draft_vocab, int kv_mode_, const std::string & mtp_)
         : file(path), ctx(ctx_), ndraft(ndraft_), nd_avail(ndraft_), n_draft_max(ndraft_), n_draft_cap(ndraft_), kv_mode(kv_mode_) {
+        // a throw anywhere below: ~Impl does not run for a half-built engine, so this frees what it allocated (destroyed
+        // after upl_halt: no queued upload still reads a buffer). A caller can then retry, e.g. with a smaller context.
+        struct FreeOnThrow {
+            Impl * p;
+            int n0;
+            ~FreeOnThrow() {
+                if (std::uncaught_exceptions() <= n0) return;
+#if MK_SPEC_LOG
+                if (p->slog) fclose(p->slog);
+#endif
+                p->release();
+            }
+        } free_on_throw{this, std::uncaught_exceptions()};
         // a refused file (a throw anywhere below) unwinds this body before the members go: the upload worker stops first,
         // so no queued copy reads a buffer a destroyed member owned (own_keep, wv_probes: declared after upl)
         struct UplHalt {
@@ -8528,12 +8542,14 @@ struct MKEngine::Impl {
         } catch (const std::exception & e) {
             fprintf(stderr, "[mk] teardown: %s\n", e.what());
         }
+        release();
+    }
+    // the device and pinned resources: ~Impl, and a constructor that throws part way (~Impl does not run then). Every
+    // handle starts null or empty, so a half-built engine frees what it got; no CUDA call when nothing was made.
+    void release() noexcept {
         ck_free(); // (checkpoint copies may still read or write device buffers)
         for (auto & l : lanes) { // (a live lane's resources are in the members above, the engine's own ones in its Lane)
-            for (auto & k : l.ck) {
-                if (k.ev) cudaEventDestroy(k.ev);
-                if (k.mem) cudaFreeHost(k.mem);
-            }
+            ck_slots_free(l.ck);
 #if MK_EGRESS
             if (l.ctl_eg_host) cudaFreeHost(const_cast<Ctl *>(l.ctl_eg_host));
 #endif
@@ -8550,7 +8566,11 @@ struct MKEngine::Impl {
             if (e) cudaEventDestroy(e);
         for (cudaEvent_t e : pf_gev) cudaEventDestroy(e);
         for (void * p : allocs) use_pool ? cudaFreeAsync(p, 0) : cudaFree(p);
-        cudaStreamSynchronize(0);
+        if (!allocs.empty()) {
+            cudaStreamSynchronize(0);
+            cudaMemPool_t pool; // (the pool keeps freed memory: trimmed, a caller's retry finds the VRAM free)
+            if (use_pool && cudaDeviceGetDefaultMemPool(&pool, 0) == cudaSuccess) cudaMemPoolTrimTo(pool, 0);
+        }
         if (embd_host) cudaFreeHost(embd_host);
         if (emb_host) cudaFreeHost(emb_host);
         if (err_host) cudaFreeHost(const_cast<int *>(err_host));
@@ -9842,8 +9862,10 @@ struct MKEngine::Impl {
     void set_penalty(float pres, float freq) {
         if (!std::isfinite(pres) || !std::isfinite(freq)) throw std::runtime_error("penalties must be finite");
         if ((pres != 0.f || freq != 0.f) && !hb.pcnt) {
-            hb.pcnt = dalloc<unsigned short>(VOCAB, DA_INIT0); // (the first response's counts start from these zeros)
-            CK(cudaMemcpyToSymbol(cBs, &hb.pcnt, sizeof(hb.pcnt), live_view * sizeof(Bufs) + offsetof(Bufs, pcnt)));
+            // (hb.pcnt only after the kernels' copy: a failed copy leaves both unset, and the next call retries)
+            decltype(hb.pcnt) pc = dalloc<unsigned short>(VOCAB, DA_INIT0); // (the first response's counts: these zeros)
+            CK(cudaMemcpyToSymbol(cBs, &pc, sizeof(pc), live_view * sizeof(Bufs) + offsetof(Bufs, pcnt)));
+            hb.pcnt = pc;
             mem_mark("penalty counts");
         }
         pen_pres = pres;
@@ -10982,6 +11004,15 @@ MKEngine::MKEngine(const std::string & path, int ctx, int n_draft, const std::st
     : p_(nullptr), n_draft_(n_draft) {
     if (n_draft < 0 || n_draft > MAXT - 1) throw std::runtime_error("n_draft must be in [0, " + std::to_string(MAXT - 1) + "]");
     p_ = new Impl(path, ctx, n_draft, draft_vocab, kv_mode, mtp);
+    struct DeleteOnThrow { // (~MKEngine does not run for a constructor that throws: a bad MK_POLICY, a CUDA error)
+        Impl *& p;
+        int n0;
+        ~DeleteOnThrow() {
+            if (std::uncaught_exceptions() <= n0) return;
+            delete p;
+            p = nullptr;
+        }
+    } delete_on_throw{p_, std::uncaught_exceptions()};
     n_draft = n_draft_ = p_->n_draft_cap; // (0 without an MTP block)
 #if MK_MAXT > 5
     if (n_draft > 4) { // the wide pass (T >= 6) runs the pipelined q8-cache decode attention only (attn_core<T > 5>: attn_core_q8,
@@ -10991,8 +11022,6 @@ MKEngine::MKEngine(const std::string & path, int ctx, int n_draft, const std::st
         for (int s = 0; s < N_ATT_SLOTS; s++) q8 = q8 && p_->hb.kvb[0][s] == 8 && p_->hb.kvb[1][s] == 8;
 #endif
         if (!q8) {
-            delete p_;
-            p_ = nullptr;
             throw std::runtime_error(MK_DA_Q4 ? "n_draft > 4 needs the q8 KV cache (--kv q8)"
                                               : "n_draft > 4 needs the all-q8 KV cache (--kv q8, no low-bit MK_KV; MK_DA_Q4=0 build)");
         }
