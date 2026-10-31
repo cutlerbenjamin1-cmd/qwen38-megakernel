@@ -7062,6 +7062,7 @@ struct MKEngine::Impl {
     // allocations, where cudaMalloc rounds each one up to whole 2 MiB pages (~0.5 GB over the ~900 weight tensors).
     // MK_CUDAMALLOC=1: plain cudaMalloc.
     bool pool_init = false, use_pool = true;
+    int cuda_dev = 0;    // the device current at construction (a caller's cudaSetDevice)
     double dalloc_s = 0; // time in dalloc (load report)
     // MK_POISON=1 (test runs, read-before-write check): every device allocation is filled with 0xFF bytes (NaN in fp32 /
     // fp16, -1 in integers) instead of zeros, the weight buffers too (their padding), except DA_INIT0 buffers, whose zeros
@@ -7083,11 +7084,11 @@ struct MKEngine::Impl {
             }
             const char * cm = getenv("MK_CUDAMALLOC");
             int ok = 0;
-            cudaDeviceGetAttribute(&ok, cudaDevAttrMemoryPoolsSupported, 0);
+            cudaDeviceGetAttribute(&ok, cudaDevAttrMemoryPoolsSupported, cuda_dev);
             use_pool = ok && !(cm && cm[0] == '1');
             if (use_pool) {
                 cudaMemPool_t pool;
-                CK(cudaDeviceGetDefaultMemPool(&pool, 0));
+                CK(cudaDeviceGetDefaultMemPool(&pool, cuda_dev));
                 unsigned long long thr = ~0ull; // keep freed memory in the pool (release() hands it back to the driver)
                 CK(cudaMemPoolSetAttribute(pool, cudaMemPoolAttrReleaseThreshold, &thr));
             }
@@ -7099,6 +7100,8 @@ struct MKEngine::Impl {
         } else {
             CK(cudaMalloc(&p, n * sizeof(T) + 16));
         }
+        allocs.push_back(p); // (before the fill: a buffer whose fill fails is freed with the others)
+        alloc_bytes += n * sizeof(T) + 16;
         if (poison) {
             const bool skip = zero == DA_INIT0 || std::find(poison_skip.begin(), poison_skip.end(), n_dalloc) != poison_skip.end();
             CK(cudaMemset(p, skip ? 0 : 0xff, n * sizeof(T) + 16));
@@ -7109,8 +7112,6 @@ struct MKEngine::Impl {
         }
         n_dalloc++;
         dalloc_s += lsec(ta);
-        allocs.push_back(p);
-        alloc_bytes += n * sizeof(T) + 16;
         if (wrec_on) wrec.push_back({p, n * sizeof(T)});
         return (T *) p;
     }
@@ -7780,7 +7781,8 @@ struct MKEngine::Impl {
         cudaDeviceProp prop;
         {
             auto _ = lc.scope("CUDA context");
-            CK(cudaGetDeviceProperties(&prop, 0));
+            CK(cudaGetDevice(&cuda_dev));
+            CK(cudaGetDeviceProperties(&prop, cuda_dev));
             CK(cudaFree(0));
         }
         { // the persistent kernel runs one block per SM (mk_min_grid: launches of up to MAXT rows when n_draft > 4)
@@ -7791,6 +7793,20 @@ struct MKEngine::Impl {
                                          " (launches of " + std::to_string(rows) + " rows at n_draft " + std::to_string(ndraft) +
                                          "; n_draft <= 4: " + std::to_string(mk_min_grid(MAXT_PF)) + ")");
         }
+#ifdef __CUDA_ARCH_LIST__
+        { // (without machine code for the GPU the driver JIT-compiles the megakernel from PTX, or finds no kernel image)
+            bool ok = false;
+            std::string have;
+            for (int a : {__CUDA_ARCH_LIST__}) {
+                ok |= a / 100 == prop.major && a / 10 % 10 <= prop.minor;
+                have += (have.empty() ? "sm_" : ", sm_") + std::to_string(a / 10);
+            }
+            if (!ok)
+                throw std::runtime_error(std::string(prop.name) + " is sm_" + std::to_string(10 * prop.major + prop.minor) +
+                                         "; this build has GPU code for " + have +
+                                         " only: rebuild for it (make ARCH=..., build.ps1 -Arch ...; docs/BUILDING.md)");
+        }
+#endif
         upl.start(!(getenv("MK_LOAD_ASYNC") && atoi(getenv("MK_LOAD_ASYNC")) == 0));
         // token_embd's mapped pinned table (0.7 GB: ~0.8 s under WSL2) allocated by a helper thread while the weights load
         // (MK_LOAD_PINBG=0: at its turn, as before)
@@ -8571,7 +8587,7 @@ struct MKEngine::Impl {
             cudaStreamSynchronize(pf_s2);
             cudaStreamDestroy(pf_s2);
         }
-        for (cudaEvent_t e : {pf_e0, pf_e1, pf_cev[0], pf_cev[1]})
+        for (cudaEvent_t e : {pf_e0, pf_e1, pf_cev[0], pf_cev[1], wd_ev})
             if (e) cudaEventDestroy(e);
         for (cudaEvent_t e : pf_gev) cudaEventDestroy(e);
         for (void * p : allocs) use_pool ? cudaFreeAsync(p, 0) : cudaFree(p);
@@ -8591,7 +8607,7 @@ struct MKEngine::Impl {
         if (!use_pool) return;
         cudaStreamSynchronize(0);
         cudaMemPool_t pool;
-        if (cudaDeviceGetDefaultMemPool(&pool, 0) == cudaSuccess) cudaMemPoolTrimTo(pool, 0);
+        if (cudaDeviceGetDefaultMemPool(&pool, cuda_dev) == cudaSuccess) cudaMemPoolTrimTo(pool, 0);
     }
 
     // the most positions a sequence may have: the model's context length (2^20 without the key)
