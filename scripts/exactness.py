@@ -119,10 +119,11 @@ class Server:
                "--kv", "q8", "-d", str(max(a.depths)), "--exact-reuse"]
         if a.draft_vocab:
             cmd += ["--draft-vocab", a.draft_vocab]
+        env = {k: v for k, v in os.environ.items() if k != "MK_API_KEY"}  # (its own server: the requests carry no key)
         self.logf = open(self.log, "wb")
         try:
             self.p = subprocess.Popen(cmd, stdin=subprocess.DEVNULL, stdout=self.logf, stderr=subprocess.STDOUT,
-                                      env=dict(os.environ, MK_KEEP_WARM_S="0"))
+                                      env=dict(env, MK_KEEP_WARM_S="0"))
         except OSError as e:
             self.logf.close()
             raise LegFailed(f"{self.name}: cannot start {a.python} ({e})")
@@ -290,7 +291,8 @@ class Check:
         a = self.a
         meta = {"time": time.strftime("%Y-%m-%d %H:%M:%S"), "build": build_info(), "bin_sha256": sha256(a.bin),
                 "model": os.path.basename(a.model), "model_bytes": os.path.getsize(a.model), "depths": a.depths,
-                "legs": a.legs, "platform": sys.platform}
+                "legs": a.legs, "platform": sys.platform,
+                "env": {k: v for k, v in sorted(os.environ.items()) if k.startswith("MK_") and k != "MK_API_KEY"}}
         with open(self.path("exactness", "json"), "w", encoding="utf-8", newline="\n") as f:
             json.dump({"meta": meta, "results": self.rec}, f, indent=1)
         return meta
@@ -311,6 +313,8 @@ class Check:
         only = sorted(set(self.rec) ^ set(theirs))
         if only:
             print(f"     (in one run only, not compared: {', '.join(only)})")
+        if om.get("env") != meta["env"]:
+            print(f"     (the runs' MK_* settings differ: {om.get('env')} there, {meta['env']} here)")
 
 
 def main():

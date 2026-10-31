@@ -60,6 +60,7 @@ on when the vision projector is found. These are the settings worth knowing:
 | Drafts per cycle | `MK_DRAFT` | `-d` | 7 | 4 for a lean build; 0 turns speculation off |
 | Listen address | `MK_HOST` | `--host` | 127.0.0.1 | `0.0.0.0` for other machines on the LAN (then also `MK_ALLOW_HOSTS`) |
 | Host names, web pages | `MK_ALLOW_HOSTS`, `MK_CORS_ORIGINS` | `--allow-host`, `--cors-origin` | none | a LAN name or a reverse proxy; a browser UI on another origin |
+| API key | `MK_API_KEY` | `--api-key` | none | other machines on the LAN: clients then send it as their API key |
 | Images and video | `MK_MMPROJ` | `--mmproj` | `mmproj-BF16.gguf` next to the model | another projector file, or images off |
 | Exact reuse | `MK_EXACT_REUSE=0` turns it off | `--exact-reuse` | on | off: a follow-up turn appends to the previous reply instead of re-reading it (faster, but not bit-identical to the same request sent fresh) |
 | Keep-warm | `MK_KEEP_WARM_S` | (engine) | 120 s | 0: no extra draw after a request (an RTX 3090 held ~165 W instead of 30-35 W, 2026-10-17), but a reply after a pause starts at low clocks |
@@ -247,9 +248,9 @@ These variables are read by the launchers themselves and turned into options:
 
 Everything else is read from the environment by the server or the engine, so it works the same with or without a
 launcher: `MK_KV`, `MK_KV_WIN`, `MK_KEEP_WARM_S`, `MK_DRAFT_Q4`, `MK_MTP`, `MK_NO_MTP`, `MK_SIDE_MAX`, `MK_PARK_MIB`,
-`MK_ALLOW_HOSTS`, `MK_CORS_ORIGINS`, `MK_CHAT_TEMPLATE_KWARGS`, `MK_CONTENT_SPECIALS`, `MK_REASONING_FORMAT`,
-`MK_MAX_BODY_MB`, `MK_MAX_IMAGES`, `MK_IMAGE_MAX_PIXELS`, `MK_MAX_VIDEO_FRAMES`, `MK_FFMPEG` (all listed at the top of
-`scripts/serve.sh`) and every engine variable below.
+`MK_ALLOW_HOSTS`, `MK_CORS_ORIGINS`, `MK_API_KEY`, `MK_CHAT_TEMPLATE_KWARGS`, `MK_CONTENT_SPECIALS`,
+`MK_REASONING_FORMAT`, `MK_TIMEOUT_S`, `MK_MAX_BODY_MB`, `MK_MAX_IMAGES`, `MK_IMAGE_MAX_PIXELS`, `MK_MAX_VIDEO_FRAMES`,
+`MK_FFMPEG` (all listed at the top of `scripts/serve.sh`) and every engine variable below.
 
 The launchers do not pass `--park-min`, `--park-cks`, `--ck-every`, `--ck-msgs`, `--ck-pin`, `--image-min-tokens`,
 `--image-cache`, `--video-cache`, `--vision-threads`, `--vision-backend`, `--chat-template`, `--lib`, `--vision-lib`
@@ -270,6 +271,7 @@ limits in [SERVER.md](SERVER.md#limits).
 | `--port` | - | `18080` (launchers 8080) | listen port; a port in use ends the server before the model loads | - | upstream (4d92fd2) |
 | `--allow-host NAME` | `MK_ALLOW_HOSTS` | none | host names clients may use besides localhost, IP addresses and `--host`'s (repeatable or comma-separated; `*` = any name, which turns the DNS-rebinding check off); other names get a 403 | - | 5aab531, 2026-10-19 |
 | `--cors-origin`, `--cors-origins ORIGIN` | `MK_CORS_ORIGINS` | none | web origins (`scheme://host[:port]`) whose pages may call the server (CORS headers, preflights; `*` is refused); pages of other origins get a 403. Clients that are not web pages send no Origin and are not affected | - | 5aab531, 2026-10-19 |
+| `--api-key KEY` | `MK_API_KEY` | none | every request but `/health` and CORS preflights must carry the key (`Authorization: Bearer KEY` or `x-api-key: KEY`); others get a 401 | - | 2026-10-31 |
 | `-c`, `--ctx` | - | `32768` (launchers 120000); with `--agents` `0` (with `--parallel` 32768) | context in tokens (the model's full context is 262,144); with `--agents` each slot's, 0 = the most that fits | - | upstream (4d92fd2) |
 | `-d`, `--draft` | - | `4` (launchers 7) | MTP drafts per cycle: 0-7 with the served build, 0-4 with the lean build; more than 4 needs the q8_0 cache | drafts only | upstream (4d92fd2) |
 | `--draft-vocab` | - | `draft_vocab_32k.bin` in the repo | the draft head's vocabulary (the 32k most frequent tokens; tokens of the current conversation are added) | drafts only | upstream (4d92fd2) |
@@ -317,6 +319,7 @@ Read by the server only (there is no option for them):
 
 | Variable | Default | What it does | Since |
 |---|---|---|---|
+| `MK_TIMEOUT_S` | `600` | seconds a connection's read or write may make no progress before the connection closes (llama-server's `--timeout`; `0`: none): idle keep-alive connections, stalled requests, a client that stopped reading a reply | 2026-10-31 |
 | `MK_MAX_BODY_MB` | `128` | largest request body in MB, Content-Length or chunked; larger ones get a 413 | 5a61fb6, 2026-10-17 |
 | `MK_MAX_IMAGES` | `32` | images per request; more get a 400 | 87ab132, 2026-10-17 |
 | `MK_MAX_VIDEO_FRAMES` | `256` | video frames per request, all of its videos (64 s at 4 fps) | 1ffaa76, 2026-10-18 |
@@ -326,9 +329,10 @@ Read by the server only (there is no option for them):
 | `MK_IMAGE_MAX_PIXELS` | `100000000` | largest image or video frame in pixels, checked from the file header before decoding; also read by the vision library. The server reads it only with `--mmproj` | 8f24df3, 2026-10-17 |
 
 `MK_MAX_BODY_MB`, `MK_MAX_IMAGES`, `MK_MAX_VIDEO_FRAMES` and `MK_IMAGE_MAX_PIXELS` must be positive integers, the three
-`MK_PF_*` integers >= 0: anything else ends the server at startup with a message. `MK_SIDE_MAX`, `MK_PARK_MIB` and
-`MK_AGENTS` accept `0` (off). The server sets `MK_EXACT=1` for the engine when `--exact-reuse` is given, and with
-`--agents` sets `MK_EXACT=1` and `MK_PF_CAP=1024` unless they are set; it reports `MK_CK_SLOTS` in `/props`.
+`MK_PF_*` integers >= 0: anything else ends the server at startup with a message. `MK_SIDE_MAX`, `MK_PARK_MIB`,
+`MK_AGENTS` and `MK_TIMEOUT_S` accept `0` (off). The server sets `MK_EXACT=1` for the engine when `--exact-reuse` is
+given, and with `--agents` sets `MK_EXACT=1` and `MK_PF_CAP=1024` unless they are set; it reports `MK_CK_SLOTS` in
+`/props`.
 llama-server's `LLAMA_ARG_*` variables are not read.
 
 ## Engine environment variables

@@ -16,6 +16,7 @@
 #                       requests for other names get a 403 (DNS rebinding)
 #   MK_CORS_ORIGINS     web origins whose pages may call the server (comma-separated, e.g. http://localhost:5173):
 #                       requests from pages of other origins get a 403
+#   MK_API_KEY          require this key on every request but /health (clients send it as their API key); default none
 #   MK_DRAFT            MTP drafts per cycle (default 7; a `make MKFLAGS=` build takes at most 4)
 #   MK_EXACT_REUSE=0    turn exact reuse off: a reused prompt then appends the previous reply instead of re-prefilling it
 #                       (faster follow-up turns, but not bit-identical to the same request sent fresh)
@@ -44,6 +45,7 @@
 #   MK_MAX_BODY_MB, MK_MAX_IMAGES, MK_IMAGE_MAX_PIXELS, MK_MAX_VIDEO_FRAMES
 #                       request limits: body size (default 128 MB), images per request (32), pixels per image
 #                       (100,000,000; checked before decoding), video frames per request (256)
+#   MK_TIMEOUT_S        seconds a connection may make no progress before it closes (default 600, 0 = never)
 #   MK_PYTHON           Python with jinja2 (default python3)
 set -euo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"

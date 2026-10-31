@@ -12,6 +12,7 @@ REM   MK_FFMPEG           the ffmpeg executable (or its directory) for video inp
 REM   MK_HOST             listen address (default 127.0.0.1; 0.0.0.0 for other machines on the LAN)
 REM   MK_ALLOW_HOSTS      host names clients use besides localhost, IP addresses and MK_HOST (comma-separated; * = any)
 REM   MK_CORS_ORIGINS     web origins whose pages may call the server (comma-separated; see scripts/serve.sh)
+REM   MK_API_KEY          require this key on every request but /health (clients send it as their API key); default none
 REM   MK_DRAFT            MTP drafts per cycle (default 7; a build.ps1 -MkFlags "" build takes at most 4)
 REM   MK_EXACT_REUSE=0    turn exact reuse off (see scripts/serve.sh)
 REM   MK_SIDE_MAX         side requests up to this many prompt tokens (default 8192; 0 = off; see scripts/serve.sh)
@@ -31,6 +32,7 @@ REM   MK_REASONING_FORMAT auto (default: the thinking as reasoning_content), non
 REM   MK_MAX_BODY_MB, MK_MAX_IMAGES, MK_IMAGE_MAX_PIXELS, MK_MAX_VIDEO_FRAMES
 REM                       request limits: body size (default 128 MB), images per request (32), pixels per image
 REM                       (100,000,000; checked before decoding), video frames per request (256)
+REM   MK_TIMEOUT_S        seconds a connection may make no progress before it closes (default 600, 0 = never)
 REM   MK_PYTHON           Python with jinja2 (default python)
 setlocal
 set "HERE=%~dp0.."

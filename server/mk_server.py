@@ -24,7 +24,8 @@ After each request the engine keeps the GPU's clocks up for MK_KEEP_WARM_S secon
 reply after a pause starts at full speed.
 Limits (environment): MK_MAX_BODY_MB (request body, Content-Length or chunked, default 128), MK_MAX_IMAGES (images per
 request, default 32),
-MK_MAX_VIDEO_FRAMES (video frames per request, default 256);
+MK_MAX_VIDEO_FRAMES (video frames per request, default 256), MK_TIMEOUT_S (a connection that sends and takes nothing
+for this long is closed, default 600, 0 = never); --api-key / MK_API_KEY requires that key on every request but /health;
 the image library refuses images over MK_IMAGE_MAX_PIXELS (default 100,000,000) before decoding them. A request
 whose client disconnects stops at the next prefill chunk (2048 tokens) or engine cycle. A connection the server closes
 while the client is still sending (an early 4xx for a body it does not read) is half-closed and drained first (bounded),
@@ -39,6 +40,7 @@ import contextlib
 import ctypes
 import errno
 import hashlib
+import hmac
 import ipaddress
 import itertools
 import json
@@ -75,6 +77,7 @@ MAX_STOP, MAX_STOP_LEN = 64, 1024  # stop strings per request, characters per st
 MAX_VIDEO_FRAMES = 256  # MK_MAX_VIDEO_FRAMES: video frames per request (all of its videos; 64 s at 4 fps)
 IMAGE_MAX_PIXELS = 100_000_000  # MK_IMAGE_MAX_PIXELS (the vision library's too): larger video frames are not decoded
 VIDEO_DECODE_S = 300  # a video's ffmpeg decode is stopped after this many seconds (400)
+TIMEOUT_S = 600  # MK_TIMEOUT_S: a read or write stalled this long closes the connection (llama-server's --timeout)
 VIDEO_TS_MS = 5000  # llama.cpp's video timestamp interval (mtmd_helper_video_init_params_default)
 # lingering close (HTTPServer.shutdown_request): what a client still sends after the server's last answer is read and
 # dropped for at most LINGER_S seconds / LINGER_BYTES bytes, LINGER_IDLE_S seconds without data (nginx's defaults)
@@ -327,7 +330,7 @@ class Engine:
                 return self.L.mk_tokenize2(self.h, b, len(b), out, cap, int(add_special), int(special))
         else:
             raise ValueError("parse_special false / add_special need a newer libqwen38mk (mk_tokenize2)")
-        cap = len(b) + 16
+        cap = min(len(b) + 16, 1 << 20)  # (a longer text is tokenized twice: the first call returns its count)
         out = (ctypes.c_int * cap)()
         n = run(out, cap)
         if n < 0:
@@ -1171,6 +1174,10 @@ class ContextOverflow(BadRequest):
 
 class ClientGone(Exception):
     """the client closed its connection: the request stops, nothing is sent"""
+
+
+# a client that is gone: closed, reset, or stalled past MK_TIMEOUT_S (a socket timeout is not a ConnectionError)
+DISCONNECTS = (ConnectionError, TimeoutError)
 
 
 class PrefillCancelled(Exception):
@@ -4047,9 +4054,11 @@ class Gate:
     Host's, 80 without a port) or an --cors-origin one; pages of any other origin (other sites, another program's port
     on this machine, file: pages) get a 403, including the simple requests (a text/plain POST) a page may send without a
     preflight. Requests without an Origin are not from a web page (curl, the SDKs, agents) and are answered. An
-    admitted origin gets CORS headers (GatedHandler)."""
+    admitted origin gets CORS headers (GatedHandler).
+    API key (--api-key): every request but /health and CORS preflights must carry it (authorized)."""
 
-    def __init__(self, host="127.0.0.1", allow_hosts=(), cors_origins=()):
+    def __init__(self, host="127.0.0.1", allow_hosts=(), cors_origins=(), api_key=None):
+        self.api_key = api_key.encode() if api_key else None
         names = [h.strip().lower().rstrip(".") for h in allow_hosts if h.strip()]
         self.any_host = "*" in names
         self.hosts = {"localhost"} | {h for h in names if h != "*"}
@@ -4095,6 +4104,16 @@ class Gate:
         return (f"Origin {shown} is not allowed (requests from web pages of other origins are refused): start the server "
                 f"with --cors-origin {shown} (env MK_CORS_ORIGINS) to accept it"), None
 
+    def authorized(self, command, path, headers):
+        """the request may be answered: no API key set, /health or a CORS preflight (browsers send no credentials with
+        those), or the key as `Authorization: Bearer <key>` (OpenAI's clients) or `x-api-key: <key>` (Anthropic's)"""
+        if self.api_key is None or command == "OPTIONS" or path.split("?")[0] in ("/health", "/v1/health"):
+            return True
+        auth = (headers.get("Authorization") or "").strip()
+        given = [auth[7:].strip()] if auth[:7].lower() == "bearer " else []
+        given.append((headers.get("x-api-key") or "").strip())
+        return any(hmac.compare_digest(g.encode(), self.api_key) for g in given if g)
+
     @staticmethod
     def same(p, auth):
         """the origin p is the server's own: Host's name and port (80 when Host has none). The scheme does not matter:
@@ -4122,18 +4141,25 @@ class GatedHandler(BaseHTTPRequestHandler):
         return super().parse_request() and self.admit()
 
     def admit(self):
-        """True if the gate lets the request through (asked once per request); else it is answered with a 403"""
+        """True if the gate lets the request through (asked once per request); else it is answered with a 403 (host,
+        origin) or a 401 (API key)"""
         if self.admitted is None:
             gate = getattr(self.server, "gate", None)
             why, self.cors = gate.check(self.headers) if gate else (None, None)
+            code, kind = 403, "permission_error"
+            if why is None and gate and not gate.authorized(self.command, self.path, self.headers):
+                why = "invalid or missing API key (the server was started with --api-key / MK_API_KEY)"
+                code, kind = 401, "authentication_error"
             self.admitted = why is None
             if why:
                 path = self.path.split("?")[0]
-                log(f"{self.command} {path[:200]} -> 403: {why}")
-                err = ({"type": "error", "error": {"type": "permission_error", "message": why}} if path.startswith("/v1/messages")
-                       else {"error": {"code": 403, "message": why, "type": "permission_error"}})
+                log(f"{self.command} {path[:200]} -> {code}: {why}")
+                err = ({"type": "error", "error": {"type": kind, "message": why}} if path.startswith("/v1/messages")
+                       else {"error": {"code": code, "message": why, "type": kind}})
                 data = json.dumps(err).encode()
-                self.send_response(403)
+                self.send_response(code)
+                if code == 401:
+                    self.send_header("WWW-Authenticate", "Bearer")
                 self.send_header("Content-Type", "application/json")
                 self.send_header("Content-Length", str(len(data)))
                 self.send_header("Connection", "close")
@@ -4331,7 +4357,7 @@ def make_handler(srv):
                 return
             try:
                 body = json.loads(raw or b"{}")
-            except (json.JSONDecodeError, UnicodeDecodeError):
+            except (json.JSONDecodeError, UnicodeDecodeError, RecursionError):  # (RecursionError: nested too deep)
                 body = None
             if not isinstance(body, dict):
                 self._error(400, "the request body must be a JSON object", anth)
@@ -4371,7 +4397,7 @@ def make_handler(srv):
                 except BadRequest as e:
                     srv.count(requests_bad=1)
                     self._bad(e, anth, rid)
-                except (ConnectionError, ClientGone) as e:
+                except (*DISCONNECTS, ClientGone) as e:
                     srv.count(requests_cancelled=1)
                     self.close_connection = True
                     if not isinstance(e, ClientGone):  # (generate reports the disconnects it notices itself)
@@ -4560,7 +4586,7 @@ def make_handler(srv):
                         if st["open"] != "text":
                             block({"type": "text", "text": ""})
                         delta({"type": "text_delta", "text": text})
-                except ConnectionError:
+                except DISCONNECTS:
                     return False
                 return True
 
@@ -4569,7 +4595,7 @@ def make_handler(srv):
             try:
                 finish, calls, usage, _ = srv.generate(chat, emit, self.client_gone)
             except Exception as e:
-                if not st["started"] or isinstance(e, (ConnectionError, ClientGone)):
+                if not st["started"] or isinstance(e, (*DISCONNECTS, ClientGone)):
                     raise
                 bad = isinstance(e, BadRequest)
                 log(f"#{srv.rid} 400: {e}" if bad else f"#{srv.rid} error: {e!r}")
@@ -4659,7 +4685,7 @@ def make_handler(srv):
                         start()
                     elif time.monotonic() - st["t"] >= RESP_KEEPALIVE_S:
                         event({"type": "response.in_progress", "response": response("in_progress")})
-                except ConnectionError:  # (generate notices the disconnect)
+                except DISCONNECTS:  # (generate notices the disconnect)
                     pass
 
             def where():
@@ -4742,7 +4768,7 @@ def make_handler(srv):
                         st["open"]["text"] += x
                         event({"type": "response.output_text.delta", **where(), "content_index": 0, "delta": x,
                                "logprobs": []})
-                except ConnectionError:
+                except DISCONNECTS:
                     return False
                 return True
 
@@ -4754,7 +4780,7 @@ def make_handler(srv):
                 start()
                 close()
             except Exception as e:
-                if not st["started"] or isinstance(e, (ConnectionError, ClientGone)):
+                if not st["started"] or isinstance(e, (*DISCONNECTS, ClientGone)):
                     raise  # nothing sent yet: do_POST answers with a status (400 / 500)
                 bad = isinstance(e, BadRequest)
                 log(f"#{srv.rid} 400: {e}" if bad else f"#{srv.rid} error: {e!r}")
@@ -4820,7 +4846,7 @@ def make_handler(srv):
                     chunk({"tool_calls": [text]} if kind == "tool_call" else
                           {"reasoning_content": text} if kind == "reasoning" else {"content": text},
                           timings=srv.timings_now() if per_token else None)
-                except ConnectionError:
+                except DISCONNECTS:
                     return False
                 return True
 
@@ -4833,7 +4859,7 @@ def make_handler(srv):
                     chunk({"role": "assistant", "content": None}, progress={
                         "total": total, "cache": cached, "processed": processed,
                         "time_ms": int((time.monotonic() - t_p[0]) * 1e3)})
-                except ConnectionError:  # (generate notices the disconnect)
+                except DISCONNECTS:  # (generate notices the disconnect)
                     pass
 
             # parameter / render errors are reported as a 400 before the stream starts
@@ -4843,7 +4869,7 @@ def make_handler(srv):
             try:
                 finish, calls, usage, timings = srv.generate(body, emit, self.client_gone)
             except Exception as e:
-                if not started[0] or isinstance(e, (ConnectionError, ClientGone)):
+                if not started[0] or isinstance(e, (*DISCONNECTS, ClientGone)):
                     raise  # nothing sent yet: do_POST answers with a status (400 / 500)
                 # the status (200) and part of the reply are out: the error is the stream's last event, OpenAI style
                 bad = isinstance(e, BadRequest)
@@ -5033,6 +5059,9 @@ def main():
                          "headers (repeatable or comma-separated; env MK_CORS_ORIGINS); requests from pages of other origins "
                          "get a 403 (default: none, only the server's own origin; clients that are not web pages send no "
                          "Origin and are not affected)")
+    ap.add_argument("--api-key", default=os.environ.get("MK_API_KEY") or None, metavar="KEY",
+                    help="require this key on every request but /health, as 'Authorization: Bearer KEY' or 'x-api-key: "
+                         "KEY'; others get a 401 (env MK_API_KEY, which keeps the key out of the process list)")
     ap.add_argument("-c", "--ctx", type=int, default=None,
                     help="context positions (default 32768; with --agents: per slot, 0 = the most that fit, the default "
                          "there)")
@@ -5178,9 +5207,11 @@ def main():
     def listed(env, values):  # (the environment's comma-separated values, then the options')
         return [v.strip() for s in [os.environ.get(env, "")] + values for v in s.split(",") if v.strip()]
     try:
-        gate = Gate(args.host, listed("MK_ALLOW_HOSTS", args.allow_host), listed("MK_CORS_ORIGINS", args.cors_origin))
+        gate = Gate(args.host, listed("MK_ALLOW_HOSTS", args.allow_host), listed("MK_CORS_ORIGINS", args.cors_origin),
+                    args.api_key)
     except ValueError as e:
         ap.error(str(e))
+    GatedHandler.timeout = env_int("MK_TIMEOUT_S", TIMEOUT_S, 0) or None  # (StreamRequestHandler applies it)
     MAX_BODY_MB = env_int("MK_MAX_BODY_MB", MAX_BODY_MB)
     MAX_IMAGES = env_int("MK_MAX_IMAGES", MAX_IMAGES)
     MAX_VIDEO_FRAMES = env_int("MK_MAX_VIDEO_FRAMES", MAX_VIDEO_FRAMES)
@@ -5199,6 +5230,8 @@ def main():
         log("host names: any (--allow-host *)" if gate.any_host else f"host names: {', '.join(sorted(gate.hosts))} and IP addresses")
     if gate.origins:
         log(f"CORS: pages of {', '.join(sorted(gate.origins))} may call the server")
+    if gate.api_key:
+        log("API key: required on every request but /health")
     box = {}
 
     def load():

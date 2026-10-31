@@ -1,5 +1,6 @@
-"""Tests of server/mk_server.py's hardening without a GPU: the request gate (Host / Origin checks, CORS), special-token
-text in message content, video frame sizes. Fake engines and the test server come from test_mk_server.py."""
+"""Tests of server/mk_server.py's hardening without a GPU: the request gate (Host / Origin checks, CORS, the API key),
+connection timeouts and malformed bodies, special-token text in message content, video frame sizes. Fake engines and
+the test server come from test_mk_server.py."""
 import email.message
 import http.client
 import io
@@ -8,10 +9,12 @@ import os
 import re
 import shutil
 import socket
+import socketserver
 import subprocess
 import sys
 import tempfile
 import threading
+import time
 import types
 import unittest
 from unittest import mock
@@ -128,6 +131,25 @@ class GateUnitTests(unittest.TestCase):
         # a listed null (file: pages) matches only null
         g = self.mk.Gate(cors_origins=["null"])
         self.ok(g, Host=h, Origin="null")
+
+    def test_api_key(self) -> None:
+        g = self.mk.Gate(api_key="s3cret")
+
+        def ok(path="/v1/chat/completions", method="POST", **h):
+            return g.authorized(method, path, _headers(**h))
+        self.assertTrue(ok(Authorization="Bearer s3cret"))
+        self.assertTrue(ok(Authorization="bearer  s3cret "))
+        self.assertTrue(ok(x_api_key="s3cret"))
+        self.assertTrue(ok(Authorization="Bearer wrong", x_api_key="s3cret"))  # (either header)
+        for h in ({}, {"Authorization": "Bearer wrong"}, {"Authorization": "Basic czNjcmV0"}, {"x_api_key": ""},
+                  {"Authorization": "Bearer "}, {"x_api_key": "s3cretX"}):
+            self.assertFalse(ok(**h), h)
+        self.assertTrue(ok("/health", "GET"))
+        self.assertTrue(ok("/v1/health?x=1", "GET"))
+        self.assertTrue(ok(method="OPTIONS"))  # (a CORS preflight carries no credentials)
+        self.assertFalse(ok("/props", "GET"))
+        self.assertTrue(self.mk.Gate().authorized("POST", "/v1/messages", _headers()))  # (no key: as before)
+        self.assertTrue(self.mk.Gate(api_key="").authorized("POST", "/v1/messages", _headers()))
 
     def test_bad_lists(self) -> None:
         for bad in ("*", "localhost:5173", "http://", "http://x/y", "http://x:70000"):
@@ -253,6 +275,76 @@ class GateHttpTests(_GateCase):
         _, http_ = self.serve(base._ScriptEngine(["ok"]))  # (HTTPServer.gate None: as before)
         st, _, _ = self.ask(http_, "GET", "/health", [("Host", "anything.example"), ("Origin", "http://x.example")])
         self.assertEqual(st, 200)
+
+    def test_a_missing_api_key_is_401_and_nothing_runs(self) -> None:
+        srv, http_ = self.gated(api_key="s3cret")
+        host = ("Host", f"127.0.0.1:{http_.port}")
+        st, h, body = self.ask(http_, "POST", "/v1/chat/completions", [host], self.CHAT)
+        err = json.loads(body)["error"]
+        self.assertEqual((st, err["code"], err["type"], h["WWW-Authenticate"], h["Connection"]),
+                         (401, 401, "authentication_error", "Bearer", "close"))
+        self.assertEqual(srv.eng.calls, [])
+        st, _, body = self.ask(http_, "POST", "/v1/messages", [host, ("x-api-key", "wrong")], b"{}")
+        self.assertEqual((st, json.loads(body)["type"], json.loads(body)["error"]["type"]),
+                         (401, "error", "authentication_error"))
+        st, _, body = self.ask(http_, "GET", "/props", [host])
+        self.assertEqual(st, 401)
+        self.assertNotIn(b"engine", body)
+        self.assertEqual(self.ask(http_, "GET", "/health", [host])[0], 200)
+        for key in (("Authorization", "Bearer s3cret"), ("x-api-key", "s3cret")):
+            st, _, body = self.ask(http_, "POST", "/v1/chat/completions", [host, key], self.CHAT)
+            self.assertEqual(st, 200, body)
+        # a browser UI: its preflight carries no key and is answered; the request itself needs the key
+        _, http_ = self.gated(api_key="s3cret", cors_origins=["http://localhost:5173"])
+        o = [("Host", f"127.0.0.1:{http_.port}"), ("Origin", "http://localhost:5173")]
+        st, h, _ = self.ask(http_, "OPTIONS", "/v1/chat/completions", o + [("Access-Control-Request-Method", "POST")])
+        self.assertEqual((st, h["Access-Control-Allow-Origin"]), (200, "http://localhost:5173"))
+        st, h, _ = self.ask(http_, "POST", "/v1/chat/completions", o, self.CHAT)  # (the 401 is readable by the page)
+        self.assertEqual((st, h["Access-Control-Allow-Origin"]), (401, "http://localhost:5173"))
+
+
+class ConnectionTests(_GateCase):
+    """MK_TIMEOUT_S on idle and stalled connections, and request bodies json cannot parse"""
+
+    def test_a_body_nested_too_deep_is_a_400(self) -> None:
+        srv, http_ = self.serve(base._ScriptEngine(["ok"]))
+        for body in (b"[" * 100000 + b"]" * 100000, b'{"messages": ' + b"[" * 100000 + b"]" * 100000 + b"}"):
+            st, _, out = self.ask(http_, "POST", "/v1/chat/completions", [("Content-Type", "application/json")], body)
+            self.assertEqual(st, 400)
+            self.assertIn(b"must be a JSON object", out)
+        self.assertEqual(srv.eng.calls, [])
+
+    def test_idle_and_stalled_connections_are_closed(self) -> None:
+        _, http_ = self.serve(base._ScriptEngine(["ok"]))
+        with mock.patch.object(self.mk.GatedHandler, "timeout", 0.5):
+            post = b"POST /v1/chat/completions HTTP/1.1\r\nHost: x\r\n"
+            # an idle keep-alive connection, headers that stall, a body that stalls
+            for sent in (b"", post + b"Content-Type: appl", post + b"Content-Length: 100\r\n\r\n{\"mess"):
+                with socket.create_connection(("127.0.0.1", http_.port), timeout=10) as s:
+                    s.sendall(sent)
+                    t0 = time.monotonic()
+                    self.assertEqual(s.recv(65536), b"", sent)
+                    self.assertLess(time.monotonic() - t0, 5, sent)
+            self.assertEqual(http_.post({"messages": [{"role": "user", "content": "hi"}], "max_tokens": 4})[0], 200)
+
+    def test_a_stream_whose_write_times_out_is_a_disconnect(self) -> None:
+        eng = base._ScriptEngine(["a"], eog=False, delay=0.01)
+        srv, http_ = self.serve(eng, 1024)
+        real, writes = socketserver._SocketWriter.write, [0]
+
+        def write(w, b):
+            writes[0] += 1
+            if writes[0] == 3:  # (the status line and headers went out, then one chunk: the client stopped reading)
+                raise TimeoutError("timed out")
+            return real(w, b)
+        body = {"messages": [{"role": "user", "content": "long"}], "max_tokens": 100000, "stream": True}
+        with mock.patch.object(socketserver._SocketWriter, "write", write):
+            out = http_.raw(base._request(body), timeout=10)
+        self.assertNotIn(b'"error"', out)  # (no error event: the client is gone, as for a reset)
+        c1 = eng.cycles
+        time.sleep(0.3)
+        self.assertEqual(eng.cycles, c1, "still generating after the write timed out")
+        self.assertEqual(http_.post({"messages": [{"role": "user", "content": "next"}], "max_tokens": 4})[0], 200)
 
 
 # === C3-5 + G9: special-token text in message content ===
@@ -467,6 +559,21 @@ class EngineTokenizeTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             e.tokenize("ab", special=False)
         self.assertEqual(e.controls(), {})
+
+    def test_a_long_text_starts_with_a_bounded_buffer(self) -> None:
+        e, _ = self.engine()
+        caps = []
+
+        def tok(h, b, n, out, cap):  # (a token per 4 bytes)
+            caps.append(cap)
+            if cap < n // 4:
+                return -(n // 4)
+            out[n // 4 - 1] = 7
+            return n // 4
+        e.L.mk_tokenize = tok
+        self.assertEqual(len(e.tokenize("a" * 4000)), 1000)
+        self.assertEqual(len(e.tokenize("a" * (8 << 20))), 2 << 20)  # (8 MiB of text: not a 32 MiB first buffer)
+        self.assertEqual(caps, [4016, 1 << 20, 2 << 20])
 
 
 # === C3-3: video frame size before the pixel limit ===

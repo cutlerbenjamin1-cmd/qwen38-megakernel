@@ -86,11 +86,11 @@ what they do.
 |---|---|
 | several agents at once | `--agents N` [0] (`MK_AGENTS`), `--parallel N` / `-np N`: [several agents at once](#several-agents-at-once---agents) |
 | model and engine | `-m` / `--model` (required), `-c` / `--ctx` [32768], `-d` / `--draft` [4], `--kv auto\|f16\|q8` [auto], `--draft-vocab` [draft_vocab_32k.bin], `--mtp FILE` (`MK_MTP`), `--no-mtp` (`MK_NO_MTP=1`), `--lib` |
-| network | `--host` [127.0.0.1], `--port` [18080], `--allow-host NAME` (`MK_ALLOW_HOSTS`), `--cors-origin ORIGIN` (`MK_CORS_ORIGINS`): [Security](#security) |
+| network | `--host` [127.0.0.1], `--port` [18080], `--allow-host NAME` (`MK_ALLOW_HOSTS`), `--cors-origin ORIGIN` (`MK_CORS_ORIGINS`), `--api-key KEY` (`MK_API_KEY`): [Security](#security) |
 | conversation cache | `--exact-reuse` (`MK_EXACT=1`), `--ck-every` [4096], `--ck-msgs` [1], `--ck-pin` [1], `--side-max` [8192] (`MK_SIDE_MAX`), `--park-mib` [8192] (`MK_PARK_MIB`), `--park-min` [1024], `--park-cks` [2]: [the conversation cache](#the-conversation-cache) |
 | templates and output | `--chat-template-file PATH`, `--chat-template TEMPLATE`, `--chat-template-kwargs JSON` (`MK_CHAT_TEMPLATE_KWARGS`), `--reasoning-format` [auto] (`MK_REASONING_FORMAT`), `--content-specials` [text] (`MK_CONTENT_SPECIALS`) |
 | images and video | `--mmproj FILE`, `--vision-lib`, `--vision-backend` [auto], `--vision-threads` [0: every logical CPU but two], `--image-min-tokens` / `--image-max-tokens` [0: the mmproj's], `--image-cache` [8], `--video-fps` [4], `--video-max-tokens` [0: the image limit], `--video-cache` [2], `--ffmpeg` (`MK_FFMPEG`) |
-| engine environment | `MK_CK_SLOTS` [8], `MK_KEEP_WARM_S` [120], `MK_STORE_CHUNK_MIB` [32], `MK_MAX_BODY_MB` [128], `MK_MAX_IMAGES` [32], `MK_IMAGE_MAX_PIXELS` [100000000], `MK_MAX_VIDEO_FRAMES` [256] |
+| engine environment | `MK_CK_SLOTS` [8], `MK_KEEP_WARM_S` [120], `MK_STORE_CHUNK_MIB` [32], `MK_TIMEOUT_S` [600], `MK_MAX_BODY_MB` [128], `MK_MAX_IMAGES` [32], `MK_IMAGE_MAX_PIXELS` [100000000], `MK_MAX_VIDEO_FRAMES` [256] |
 
 ## The conversation cache
 
@@ -887,8 +887,14 @@ the rest:
 
 ## Security
 
-The server is meant for one machine or a trusted LAN: it checks no API keys. What it does check is that a web page you
-happen to open cannot use it.
+The server is meant for one machine or a trusted LAN. It checks an API key only when given one; what it always checks
+is that a web page you happen to open cannot use it.
+
+- **API key** (`--api-key KEY`, env `MK_API_KEY`; default none): every request but `/health` and CORS preflights must
+  carry the key, as `Authorization: Bearer KEY` (the OpenAI clients' `api_key`) or `x-api-key: KEY` (the Anthropic
+  clients'); others get a 401 with `WWW-Authenticate: Bearer` (llama-server's error shape; Anthropic's on
+  `/v1/messages`) before the body is read. Prefer the environment variable: an option shows in the process list. Over
+  plain HTTP the key crosses the network in clear text: beyond a trusted LAN, put a TLS reverse proxy in front.
 
 - **Host names (DNS rebinding):** a request whose `Host` is not `localhost`, an IP address, the `--host` name or an
   `--allow-host` name (any port; repeatable or comma-separated, env `MK_ALLOW_HOSTS`) gets a 403 naming the option. A
@@ -937,6 +943,7 @@ Read from the environment at startup ([CONFIGURATION.md](CONFIGURATION.md)):
 | limit | default | answer |
 |---|---|---|
 | request body, `MK_MAX_BODY_MB` | 128 MB | 413, refused before the body is read (also on `Expect: 100-continue`) |
+| a connection's read or write without progress, `MK_TIMEOUT_S` | 600 s (llama-server's `--timeout`; 0: none) | the connection closes: an idle keep-alive one, a stalled request, or a client that stopped reading a reply (a disconnect: the generation stops) |
 | images per request, `MK_MAX_IMAGES` | 32 | 400 |
 | pixels per image or video frame, `MK_IMAGE_MAX_PIXELS` | 100,000,000 | 400, checked from the header before decoding |
 | video frames per request, `MK_MAX_VIDEO_FRAMES` | 256 (64 s at 4 fps) | 400 as soon as the frame past it is decoded |
