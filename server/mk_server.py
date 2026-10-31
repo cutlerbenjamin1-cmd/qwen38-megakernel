@@ -3205,7 +3205,8 @@ class Server:
                 "image_max_tokens": g(a, "image_max_tokens"), "image_cache": g(v, "cache_max")},
             "limits": {"max_body_mb": MAX_BODY_MB, "max_images": MAX_IMAGES, "max_stop": MAX_STOP,
                        "image_max_pixels": int(os.environ.get("MK_IMAGE_MAX_PIXELS") or 100_000_000)},
-            "env": {k: val for k, val in sorted(os.environ.items()) if k.startswith("MK_")},
+            "env": {k: "(set)" if k == "MK_API_KEY" and val else val  # (not the key: /props ends up in bug reports)
+                    for k, val in sorted(os.environ.items()) if k.startswith("MK_")},
             "busy": self.busy(), "uptime_s": round(time.time() - self.t_start, 1) if self.t_start else 0.0,
         }
 

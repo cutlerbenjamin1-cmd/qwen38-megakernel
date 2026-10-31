@@ -302,6 +302,16 @@ class GateHttpTests(_GateCase):
         st, h, _ = self.ask(http_, "POST", "/v1/chat/completions", o, self.CHAT)  # (the 401 is readable by the page)
         self.assertEqual((st, h["Access-Control-Allow-Origin"]), (401, "http://localhost:5173"))
 
+    def test_props_does_not_show_the_api_key(self) -> None:
+        _, http_ = self.gated(api_key="s3cret-k3y")
+        with mock.patch.dict(os.environ, {"MK_API_KEY": "s3cret-k3y", "MK_TEST_SETTING": "7"}):
+            st, _, body = self.ask(http_, "GET", "/props", [("Host", f"127.0.0.1:{http_.port}"),
+                                                            ("Authorization", "Bearer s3cret-k3y")])
+        self.assertEqual(st, 200, body)
+        self.assertNotIn(b"s3cret-k3y", body)
+        env = json.loads(body)["engine"]["env"]
+        self.assertEqual((env["MK_API_KEY"], env["MK_TEST_SETTING"]), ("(set)", "7"))  # (the others as they are)
+
 
 class ConnectionTests(_GateCase):
     """MK_TIMEOUT_S on idle and stalled connections, and request bodies json cannot parse"""

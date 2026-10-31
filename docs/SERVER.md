@@ -837,9 +837,9 @@ flags of the engine library, written by the Makefile and `build.ps1`; "unknown" 
 engine), MTP layer and draft depth, draft vocabulary, exact reuse, the checkpoint settings (pool, every, messages,
 pinned, slots), the keep-warm window, `host_cache` (budget, side-request and parking settings, the parked conversations
 and their token counts, how many are side conversations or low priority, whether side conversations are kept, host
-memory in use and allocated), the vision settings, the limits, the `MK_*` environment, busy and uptime. Some clients
-(Hermes Agent) read the context size from it. `GET /slots`: one slot with `is_processing`. `GET /v1/models`: the model
-with `meta`.
+memory in use and allocated), the vision settings, the limits, the `MK_*` environment (`MK_API_KEY` as `(set)`, not
+the key), busy and uptime. Some clients (Hermes Agent) read the context size from it. `GET /slots`: one slot with
+`is_processing`. `GET /v1/models`: the model with `meta`.
 
 ### `/metrics`
 
