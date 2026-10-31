@@ -10,7 +10,8 @@ import unittest
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 SCRIPT = os.path.join(ROOT, "scripts", "exactness.py")
 
-# qwen38_mk: ids and a digest from the prompt (+ STUB_SALT); STUB_BREAK=d<n> / cap<n> changes them at that depth / chunk
+# qwen38_mk: ids and a digest from the prompt (+ STUB_SALT); STUB_BREAK=d<n> / cap<n> changes them at that depth / chunk;
+# depths above 0 report drafts unless STUB_NO_DRAFTS=1
 STUB_CLI = r'''
 import hashlib, os, re, shlex, sys
 
@@ -32,12 +33,17 @@ def run(args, out, err):
     if brk: ids[5] = "99999"
     out.write("IN_IDS: 1 2 3\nIDS: " + " ".join(ids) + "\n")
     err.write("[mk] prompt %d tok in 0.1 s\n" % len(prompt.split()))
+    drafts = 0 if depth == "0" or os.environ.get("STUB_NO_DRAFTS") else 6
+    err.write("[mk] decode 12 tok in 0.1 s = 1.00 tok/s | cycles 4, accepted %d/%d drafts (50.0%%), 3.00 tok/cycle\n"
+              % (drafts // 2, drafts))
     if dig: err.write("[mk] state digest after the prefill: %s (9 words)\n" % (h[12:20].hex() if not brk else "0" * 16))
 
 if os.environ.get("STUB_FAIL"):
     sys.stderr.write("[mk] error: stub failure\n")
     sys.exit(1)
 argv = sys.argv[1:]
+if "--no-mtp" in argv:
+    sys.stderr.write("[mk] MTP layer off (--no-mtp / MK_NO_MTP=1): plain decoding, depth 0\n")
 if "--batch" in argv:
     for line in open(argv[argv.index("--batch") + 1]):
         job = shlex.split(line)
@@ -48,7 +54,8 @@ else:
     run(argv, sys.stdout, sys.stderr)
 '''
 
-# the server's Python: answers /health and chat requests; STUB_BREAK=warm changes every reply after a server's first
+# the server's Python: answers /health and chat requests, reporting reused prompt tokens from a server's second request
+# on; STUB_BREAK=warm changes every reply after a server's first, STUB_BREAK=nocache reports no reuse
 STUB_SERVER = r'''
 import hashlib, json, os, sys
 from http.server import BaseHTTPRequestHandler, HTTPServer
@@ -72,8 +79,9 @@ class H(BaseHTTPRequestHandler):
         key = os.environ.get("STUB_SALT", "") + json.dumps(json.loads(body), sort_keys=True)
         text = hashlib.sha256(key.encode()).hexdigest()[:24]
         if os.environ.get("STUB_BREAK") == "warm" and served[0] > 1: text += "!"
+        cached = 0 if served[0] == 1 or os.environ.get("STUB_BREAK") == "nocache" else 10
         self.send({"choices": [{"message": {"role": "assistant", "content": text}, "finish_reason": "stop"}],
-                   "usage": {"completion_tokens": 7}})
+                   "usage": {"completion_tokens": 7, "prompt_tokens_details": {"cached_tokens": cached}}})
 
 HTTPServer(("127.0.0.1", port), H).serve_forever()
 '''
@@ -124,6 +132,14 @@ class ExactnessScriptTests(unittest.TestCase):
         self.assertIn("d4 vs d0: first difference at output token 5", out)
         self.assertIn("PASS mtp, code prompt", out)
 
+    def test_a_depth_that_made_no_drafts_fails(self) -> None:
+        rc, out = self.run_script("nodraft", "--legs", "depth,mtp", STUB_NO_DRAFTS="1")
+        self.assertEqual(rc, 1, out)
+        self.assertEqual(out.count("FAIL depth, "), 2, out)
+        self.assertIn("d4, d7 made no drafts (no MTP layer in the model, or MK_NO_MTP is set), so depth independence is untested", out)
+        self.assertEqual(out.count("FAIL mtp, "), 2, out)  # (both of its sides then ran plain decoding)
+        self.assertIn("d7 made no drafts", out)
+
     def test_a_chunk_size_that_changes_the_state_fails(self) -> None:
         rc, out = self.run_script("cap", "--legs", "chunks", STUB_BREAK="cap1280")
         self.assertEqual(rc, 1, out)
@@ -135,6 +151,12 @@ class ExactnessScriptTests(unittest.TestCase):
         rc, out = self.run_script("warm", "--legs", "server", STUB_BREAK="warm")
         self.assertEqual(rc, 1, out)
         self.assertEqual(out.count("FAIL server, "), 3, out)
+
+    def test_a_warm_server_that_reused_nothing_fails(self) -> None:
+        rc, out = self.run_script("nocache", "--legs", "server", STUB_BREAK="nocache")
+        self.assertEqual(rc, 1, out)
+        self.assertEqual(out.count("FAIL server, "), 3, out)
+        self.assertIn("the warm server reused nothing (usage.prompt_tokens_details.cached_tokens 0), so warm == fresh proves nothing", out)
 
     def test_a_failing_cli_is_reported_with_its_error(self) -> None:
         rc, out = self.run_script("fail", "--legs", "depth", STUB_FAIL="1")

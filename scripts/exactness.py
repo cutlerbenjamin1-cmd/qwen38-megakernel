@@ -25,12 +25,12 @@ U2_EDIT = "Now write a four-line poem about the third one."
 
 DESCRIPTION = """\
 Checks the exactness claims of README.md ("Exact output") on this build:
-  depth   greedy token ids are identical at every draft depth of --depths (two prompts)
+  depth   greedy token ids are identical at every draft depth of --depths (two prompts; the depths above 0 must draft)
   mtp     greedy ids without the MTP layer (--no-mtp, depth 0) equal the drafted ones
   chunks  with exact reuse (MK_EXACT=1) the state digest and greedy ids after a ~5k-token prompt do not depend on the
           prefill chunk size (MK_PF_CAP)
   server  with --exact-reuse, a follow-up turn, an edited turn and a sampled follow-up (fixed seed) on a warm server
-          equal the same request sent to a fresh server
+          equal the same request sent to a fresh server (and the warm server did reuse its cache)
 Every result goes to <out>/exactness.json. --compare DIR then checks that another build's results (Windows against Linux,
 or the previous release) are identical. Needs the GPU to itself: one CLI process per depth, one without the MTP layer,
 one per chunk size, and four server starts."""
@@ -167,8 +167,11 @@ class Server:
         except (OSError, ValueError) as e:
             raise LegFailed(f"{self.name}: the request failed ({e})", tail(self.log))
         c = d["choices"][0]
-        return {"content": c["message"].get("content"), "reasoning": c["message"].get("reasoning_content"),
-                "finish": c.get("finish_reason"), "tokens": (d.get("usage") or {}).get("completion_tokens")}
+        usage = d.get("usage") or {}
+        reply = {"content": c["message"].get("content"), "reasoning": c["message"].get("reasoning_content"),
+                 "finish": c.get("finish_reason"), "tokens": usage.get("completion_tokens")}
+        # (the reused prompt tokens are returned apart from the reply: a fresh server's are 0, so they are not compared)
+        return reply, (usage.get("prompt_tokens_details") or {}).get("cached_tokens")
 
 
 class Check:
@@ -223,6 +226,19 @@ class Check:
         m = re.search(pattern, tail(self.path(name, "err"), 200))
         return m.group(1) if m else None
 
+    def err_has(self, name, pattern):
+        """the pattern anywhere in <name>.err (the whole file: the engine's load lines are not in its tail)"""
+        try:
+            with open(self.path(name, "err"), encoding="utf-8", errors="replace") as f:
+                return re.search(pattern, f.read()) is not None
+        except OSError:
+            return False
+
+    def drafted(self, name):
+        """True if the job's decode made drafts (its "accepted A/B drafts" line with B > 0)"""
+        b = self.err_match(name, r"accepted \d+/(\d+) drafts")
+        return b is not None and int(b) > 0
+
     def same(self, what, got):
         """a verdict on whether the labelled results in got are all present and identical"""
         vals = list(got.values())
@@ -245,16 +261,30 @@ class Check:
             got = {f"d{n}": self.ids(f"depth_{p}_d{n}") for n in d}
             for k, v in got.items():
                 self.rec[f"cli/{p}/{k}"] = v
-            self.same(f"depth, {p} prompt: greedy ids identical at {', '.join(map(str, d))} drafts", got)
+            what = f"depth, {p} prompt: greedy ids identical at {', '.join(map(str, d))} drafts"
+            undrafted = [f"d{n}" for n in d if n > 0 and not self.drafted(f"depth_{p}_d{n}")]
+            if undrafted:  # (every depth then ran plain decoding: identical ids would prove nothing)
+                self.verdict(False, what, f"{', '.join(undrafted)} made no drafts (no MTP layer in the model, or MK_NO_MTP is "
+                                          "set), so depth independence is untested")
+            else:
+                self.same(what, got)
         self.rec["cli/story/sampled"] = self.ids("sampled_story")  # (--compare only: across depths only the distribution is kept)
 
     def mtp(self):
         top = f"d{max(self.a.depths)}"
         self.batch("nomtp", [(f"nomtp_{p}", ["-p", t, "-d", "0"]) for p, t in PROMPTS.items()], ["--no-mtp"])
+        off = self.err_has("nomtp", r"MTP layer off")  # (the engine's load line: --no-mtp took effect)
         for p in PROMPTS:
             got = {"no MTP layer": self.ids(f"nomtp_{p}"), top: self.rec.get(f"cli/{p}/{top}")}
             self.rec[f"cli/{p}/nomtp"] = got["no MTP layer"]
-            self.same(f"mtp, {p} prompt: greedy ids without the MTP layer equal those at {top[1:]} drafts", got)
+            what = f"mtp, {p} prompt: greedy ids without the MTP layer equal those at {top[1:]} drafts"
+            if not off:
+                self.verdict(False, what, "the --no-mtp run did not report 'MTP layer off', so it ran with the layer: nothing is compared")
+            elif not self.drafted(f"depth_{p}_{top}"):  # (the depth check's run, which mtp needs)
+                self.verdict(False, what, f"{top} made no drafts (no MTP layer in the model, or MK_NO_MTP is set), so both sides "
+                                          "ran plain decoding")
+            else:
+                self.same(what, got)
 
     def chunks(self):
         prompt = self.path("chunks_prompt", "txt")
@@ -274,18 +304,24 @@ class Check:
     def server(self):
         greedy, sampled = {"temperature": 0}, {"temperature": 1.0, "top_p": 0.95, "top_k": 20, "seed": 7}
         with Server(self, "server_warm") as s:
-            r1 = s.chat([user(U1)], greedy)
+            r1, _ = s.chat([user(U1)], greedy)
             hist = [user(U1), {"role": "assistant", "content": r1["content"] or ""}]
             cases = {"follow-up": (hist + [user(U2)], greedy), "edit": (hist + [user(U2_EDIT)], greedy),
                      "sampled follow-up": (hist + [user(U2)], sampled)}
-            warm = {k: s.chat(m, o) for k, (m, o) in cases.items()}
+            warm, cached = {}, {}
+            for k, (m, o) in cases.items():
+                warm[k], cached[k] = s.chat(m, o)
         self.rec["server/first turn"] = r1
         for k, (m, o) in cases.items():
             with Server(self, "server_fresh_" + k.replace(" ", "_")) as s:
-                fresh = s.chat(m, o)
+                fresh, _ = s.chat(m, o)
             self.rec[f"server/{k}"] = fresh
-            self.verdict(fresh == warm[k], f"server, {k}: the warm server's reply (exact reuse) equals a fresh server's",
-                         f"warm:  {warm[k]!r}\nfresh: {fresh!r}")
+            what = f"server, {k}: the warm server's reply (exact reuse) equals a fresh server's"
+            if not cached[k]:  # (nothing reused: the same reply would prove nothing)
+                self.verdict(False, what, f"the warm server reused nothing (usage.prompt_tokens_details.cached_tokens "
+                                          f"{cached[k]!r}), so warm == fresh proves nothing")
+            else:
+                self.verdict(fresh == warm[k], what, f"warm:  {warm[k]!r}\nfresh: {fresh!r}")
 
     def save(self):
         a = self.a

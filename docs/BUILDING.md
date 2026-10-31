@@ -181,8 +181,9 @@ hf download unsloth/Qwen3.8-27B-GGUF Qwen3.8-27B-UD-Q4_K_XL.gguf mmproj-BF16.ggu
   `python scripts\exactness.py -m <gguf>`) checks the README's [exact output](../README.md#exact-output) claims on the
   GPU: greedy ids identical at 0, 4 and 7 drafts (`--depths 0,4` for a `make MKFLAGS=` build) and without the MTP
   layer, the exact-reuse state digest and ids independent of the prefill chunk size, and a warm server's follow-up,
-  edited and sampled replies equal to a fresh server's. It needs the GPU to itself (11 model loads), prints PASS / FAIL
-  per check, exits 1 on a failure and writes every result to `exactness-out/exactness.json`.
+  edited and sampled replies equal to a fresh server's (a check whose runs drafted nothing or reused nothing fails: it
+  would prove nothing). It needs the GPU to itself (11 model loads), prints PASS / FAIL per check, exits 1 on a failure
+  and writes every result to `exactness-out/exactness.json`.
 - **Accuracy against llama.cpp:** `tools/llama_ref` writes a reference file, and
   `./qwen38_mk -m <gguf> --kld <ref> --score-path mixed --kv q8` scores the engine against it
   ([BENCHMARKS.md](BENCHMARKS.md#against-llamacpp) has the full recipe and the expected numbers).
