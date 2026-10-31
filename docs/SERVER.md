@@ -740,9 +740,11 @@ curl -s http://127.0.0.1:8080/v1/chat/completions -H 'Content-Type: application/
 With `--mmproj` and an ffmpeg (`--ffmpeg` / `MK_FFMPEG`: the executable or its directory; else `ffmpeg` on `PATH`;
 else the binary of the `imageio-ffmpeg` Python package, which bundles one for Windows, Linux and macOS) the server
 takes video clips: llama-server's `{"type": "input_video", "input_video": {"data": <base64>}}` and vLLM-style
-`{"type": "video_url", "video_url": {"url": "data:video/mp4;base64,..."}}` (no remote or file URLs). Any container or
-codec the ffmpeg reads works. `/props` `modalities.video` says whether video works in this process; without ffmpeg, or
-with an older vision library, a video request gets a 400 naming what is missing. There is no audio.
+`{"type": "video_url", "video_url": {"url": "data:video/mp4;base64,..."}}` (no remote or file URLs). The containers
+read are MP4 / MOV (3GP, M4V), Matroska / WebM, AVI, MPEG-TS, MPEG-PS, Ogg, FLV and GIF (ffmpeg's `-format_whitelist`),
+with any codec the ffmpeg reads; anything else is a 400, including DASH manifests, HLS playlists and concat lists, which
+would make ffmpeg open other files or URLs. `/props` `modalities.video` says whether video works in this process;
+without ffmpeg, or with an older vision library, a video request gets a 400 naming what is missing. There is no audio.
 
 ```sh
 VID=$(base64 -w0 clip.mp4)

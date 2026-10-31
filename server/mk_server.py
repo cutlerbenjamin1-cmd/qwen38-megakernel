@@ -943,6 +943,10 @@ class VideoDecoder:
     would be decoded, 4.8 GB of rgb24 each) with MAX_PIXELS_SLACK more, as decoders check their row-aligned size
     (1100 x 1000 counts as 1152 x 1000), so that every frame within the limit decodes."""
     MAX_PIXELS_SLACK = 1 << 23  # (a 64-column and 64-row alignment of frames up to 65535 x 65535)
+    # the demuxers ffmpeg may use (-format_whitelist; "mov,mp4,m4a,..." matches by any of its names): media containers
+    # that read nothing but the file (mov's external tracks, enable_drefs, are off by default). Not DASH / HLS /
+    # concat: a manifest or playlist opens other files and URLs (ffmpeg 6's dash outside -protocol_whitelist too)
+    FORMATS = "mov,mp4,matroska,webm,avi,mpegts,mpeg,ogg,flv,gif"
 
     def __init__(self, exe):
         self.exe = exe
@@ -965,12 +969,13 @@ class VideoDecoder:
         max_frames frames (when the next frame arrives) or a decode over `timeout` seconds"""
         timeout = VIDEO_DECODE_S if timeout is None else timeout
         with tempfile.TemporaryDirectory(prefix="mkvideo") as d:
-            # (a name without an extension and only the file protocol: a "video" that is a playlist or a concat list
-            # cannot make ffmpeg open URLs or other files; ffmpeg 6 refuses an HLS playlist without .m3u8 by itself)
+            # (FORMATS only: a "video" that is a manifest, a playlist or a concat list cannot make ffmpeg open other
+            # files or URLs; the file protocol only and a name without an extension stay as a second layer)
             path = os.path.join(d, "input")
             with open(path, "wb") as f:
                 f.write(data)
             cmd = [self.exe, "-nostdin", "-hide_banner", "-loglevel", "error", "-protocol_whitelist", "file",
+                   "-format_whitelist", self.FORMATS,
                    "-max_pixels", str(min(IMAGE_MAX_PIXELS + self.MAX_PIXELS_SLACK, 2 ** 31 - 1)), "-i", path,
                    "-an", "-sn", "-vf", f"fps={fps:.6f}", "-f", "image2pipe", "-c:v", "ppm", "-pix_fmt", "rgb24", "pipe:1"]
             try:
@@ -1026,6 +1031,10 @@ class VideoDecoder:
             if big:  # (-max_pixels: ffmpeg did not decode a frame, also after others of a smaller size)
                 raise BadRequest(f"video: frames of about {big[1]} x {big[2]} pixels: over the limit of {IMAGE_MAX_PIXELS} "
                                  f"pixels (MK_IMAGE_MAX_PIXELS)")
+            fmt = re.search(r"\[([\w,]+) @ \w+\] Format not on whitelist", err.decode(errors="replace"))
+            if fmt and n == 0:  # (-format_whitelist: a manifest, a playlist, another container)
+                raise BadRequest(f"video: {fmt[1][:40]} input is refused (the containers read: "
+                                 f"{self.FORMATS.replace(',', ', ')})")
             if n == 0:
                 msg = err.decode(errors="replace").strip().splitlines()
                 raise BadRequest("video: no frames decoded" + (f" ({msg[-1][:300]})" if msg else ""))

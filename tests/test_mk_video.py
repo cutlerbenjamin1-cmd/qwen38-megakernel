@@ -2,13 +2,16 @@
 the PPM frame stream, the ffmpeg decoder (a fake process; the real ffmpeg when one is installed), the frame budget,
 caching / pinning of a video's frame pairs, and requests end to end over a scripted engine and a fake vision library."""
 import base64
+import http.server
 import io
 import json
 import os
 import shutil
 import subprocess
 import tempfile
+import threading
 import unittest
+from pathlib import Path
 from unittest import mock
 
 from test_mk_server import _FakeVisionLib, _HttpCase, _load_mk_server, _ScriptEngine  # (tests/ is on sys.path)
@@ -127,6 +130,8 @@ class VideoDecoderTests(unittest.TestCase):
         self.assertIn("ppm", cmd)
         self.assertEqual(cmd[cmd.index("-protocol_whitelist") + 1], "file")  # (no URLs from inside a "video")
         self.assertLess(cmd.index("-protocol_whitelist"), cmd.index("-i"))
+        self.assertEqual(cmd[cmd.index("-format_whitelist") + 1], self.mk.VideoDecoder.FORMATS)  # (no manifests)
+        self.assertLess(cmd.index("-format_whitelist"), cmd.index("-i"))
 
     def test_too_many_frames_no_frames_and_bad_streams_are_400(self) -> None:
         mk = self.mk
@@ -168,6 +173,61 @@ class VideoDecoderTests(unittest.TestCase):
         self.assertEqual([(w, h, len(b)) for w, h, b in frames], [(64, 48, 64 * 48 * 3)] * 8)
         with self.assertRaises(mk.BadRequest):
             list(dec.frames(b"not a video at all", 4.0, 100))
+
+    @unittest.skipUnless(shutil.which("ffmpeg"), "no ffmpeg on PATH")
+    def test_manifests_and_playlists_are_refused_media_containers_decode(self) -> None:
+        mk, ff, hits = self.mk, shutil.which("ffmpeg"), []
+
+        class Listener(http.server.BaseHTTPRequestHandler):  # (records what ffmpeg asks for)
+            def do_GET(self):
+                hits.append(self.path)
+                self.send_error(404)
+
+            def log_message(self, *a):
+                pass
+        lis = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Listener)
+        threading.Thread(target=lis.serve_forever, daemon=True).start()
+        self.addCleanup(lis.server_close)
+        self.addCleanup(lis.shutdown)
+        dec = mk.VideoDecoder(ff)
+        with tempfile.TemporaryDirectory() as d:
+            def clip(name, *args):  # (1 s; None: this ffmpeg has no encoder for it)
+                p = os.path.join(d, name)
+                src = f"testsrc=size=64x48:rate={25 if name.endswith('.mpg') else 4}:duration=1"  # (MPEG-1: no 4 fps)
+                r = subprocess.run([ff, "-loglevel", "error", "-f", "lavfi", "-i", src, *args, p], capture_output=True,
+                                   timeout=60)
+                return open(p, "rb").read() if r.returncode == 0 else None
+
+            def mpd(base):  # (a DASH manifest of one representation: the whole file at BaseURL)
+                return ('<?xml version="1.0"?><MPD xmlns="urn:mpeg:dash:schema:mpd:2011" type="static" '
+                        'mediaPresentationDuration="PT1S" minBufferTime="PT1S" '
+                        'profiles="urn:mpeg:dash:profile:isoff-on-demand:2011"><Period>'
+                        '<AdaptationSet mimeType="video/mp4"><Representation id="1" bandwidth="100000" width="64" '
+                        f'height="48" codecs="mp4v.20.9"><BaseURL>{base}</BaseURL></Representation></AdaptationSet>'
+                        '</Period></MPD>').encode()
+            self.assertIsNotNone(clip("local.mp4", "-c:v", "mpeg4"))
+            local = Path(d, "local.mp4").as_uri()
+            url = f"http://127.0.0.1:{lis.server_address[1]}/probe.mp4"
+            hls = f"#EXTM3U\n#EXT-X-TARGETDURATION:1\n#EXTINF:1,\n{url}\n#EXT-X-ENDLIST\n".encode()
+            for name, data in (("dash, a local file", mpd(local)), ("dash, a URL", mpd(url)), ("hls", hls),
+                               ("concat", f"ffconcat version 1.0\nfile '{local}'\n".encode())):
+                with self.assertRaises(mk.BadRequest, msg=name) as cm:
+                    list(dec.frames(data, 4.0, 100))
+                if name.startswith("dash"):
+                    self.assertIn("video: dash input is refused (the containers read: mov, mp4, ", str(cm.exception))
+            self.assertEqual(hits, [])  # (no request reached the listener)
+            # the containers read (webm and ogg need libvpx / libtheora in this ffmpeg)
+            codecs = {"mp4": "mpeg4", "mov": "mpeg4", "mkv": "ffv1", "webm": "libvpx", "avi": "mjpeg",
+                      "ts": "mpeg2video", "mpg": "mpeg1video", "ogv": "libtheora", "flv": "flv1", "gif": "gif"}
+            decoded = set()
+            for ext, codec in codecs.items():
+                data = clip("c." + ext, "-c:v", codec)
+                if data is not None:
+                    frames = list(dec.frames(data, 4.0, 100))
+                    self.assertEqual({(w, h) for w, h, _ in frames}, {(64, 48)}, ext)
+                    self.assertIn(len(frames), (4, 5), ext)
+                    decoded.add(ext)
+            self.assertLessEqual({"mp4", "mov", "mkv", "avi", "ts", "mpg", "flv", "gif"}, decoded)
 
 
 class _VideoEngine(_ScriptEngine):
