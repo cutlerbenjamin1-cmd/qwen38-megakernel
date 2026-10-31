@@ -67,6 +67,10 @@ int main(int argc, char ** argv) {
         else usage();
     }
     if (model.empty() || mmproj.empty() || prompt.empty() || images.empty() || ref_out.empty() || img_out.empty()) usage();
+    if (tb < 1) {
+        fprintf(stderr, "--text-batch must be at least 1\n");
+        return 1;
+    }
 
     std::vector<std::vector<float>> rows_in;
     if (!rows_file.empty()) {
