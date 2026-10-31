@@ -61,8 +61,11 @@ XR=(--exact-reuse) XS=on
 CT=()
 [ -n "${MK_CHAT_TEMPLATE_FILE:-}" ] && CT=(--chat-template-file "$MK_CHAT_TEMPLATE_FILE")
 if [ -n "${MK_MMPROJ+x}" ]; then MMPROJ="$MK_MMPROJ"
-else MMPROJ=$(ls "$(dirname "$MODEL")/mmproj-BF16.gguf" "$HOME/models/mmproj-BF16.gguf" "$HOME/models/mmproj-Qwen3.8-27B-BF16.gguf" \
-                    2>/dev/null | head -n1 || true)
+else
+    MMPROJ=
+    for f in "$(dirname "$MODEL")/mmproj-BF16.gguf" "$HOME/models/mmproj-BF16.gguf" "$HOME/models/mmproj-Qwen3.8-27B-BF16.gguf"; do
+        if [ -f "$f" ]; then MMPROJ="$f"; break; fi
+    done
 fi
 VA=() VS=off
 if [ -n "$MMPROJ" ] && [ -f "$MMPROJ" ] && [ -f "$HERE/libqwen38vision.so" ]; then
