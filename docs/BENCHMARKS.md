@@ -8,7 +8,10 @@ How to read them:
 - **Sessions.** The same binary runs several percent faster or slower from one session to the next with GPU temperature
   and clocks (up to ~11% between sessions on 2026-10-12). Absolute numbers are only compared within one session;
   changes made after a full run are measured A-B-A (old build, new build, old build again, in one session), never added
-  onto older absolutes.
+  onto older absolutes. The llama.cpp column (2026-10-12 / 13) is the one exception, compared with later runs because
+  each of its rows is already the best of three sessions, which can only favour it, and because every gap is wider than
+  that spread: the narrowest, reading a 38k-token prompt (29.6 s against 24.2 s with preset F), is 22%, twice the ~11%,
+  and the decode rates are 63% to 110% apart.
 - **Rates.** Decode "tok/s" is generated tokens over decode time, as the server reports it (`timings`). The
   short-prompt rows are means of the per-request rates, as the client reports them; token-weighted rates (total tokens
   over total time) are given next to them.
