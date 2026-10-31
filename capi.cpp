@@ -200,9 +200,18 @@ MKEngine * gpu_engine(void * hp) {
     return h->eng;
 }
 
+// The reset after a CUDA error failed too: the error repeats after it was cleared (mk_cuda_fail's test for a sticky
+// one), and a later retry would run calls a caller planned against the pre-error sequence() on an emptied engine.
+[[noreturn]] void reset_failed(const char * why) {
+    fprintf(stderr, "[mk] the reset after a CUDA error failed too (%s): exiting with code 4\n", why);
+    fflush(stdout);
+    fflush(stderr);
+    std::_Exit(4);
+}
+
 // Runs an engine call; an exception becomes -1 with mk_last_error(). A CUDA failure (MKCudaError: the engine
 // threw instead of exiting) leaves the sequence state undefined, so the engine is reset: the next prompt is
-// prefilled in full. (Sticky CUDA errors never get here: the engine exits with code 4.)
+// prefilled in full. (Sticky CUDA errors never get here: the engine exits with code 4, as when that reset fails.)
 template <class F> int guarded(void * hp, F f) {
     auto * h = static_cast<Handle *>(hp);
     try {
@@ -213,7 +222,9 @@ template <class F> int guarded(void * hp, F f) {
             if (h->eng->side_active()) h->eng->side_drop(); // (a side request's kept sequence goes too: never restored over an undefined state)
             else h->eng->reset();
         } catch (const std::exception & e2) {
-            g_err += std::string(" (reset after it failed too: ") + e2.what() + ")";
+            reset_failed(e2.what());
+        } catch (...) {
+            reset_failed("unknown exception");
         }
         return -1;
     } catch (const MKCancelled & e) { // (mk_cancel; the engine put its state back itself)
@@ -303,10 +314,14 @@ int mk_slot_begin(void * hp, int slot, const int * toks, int n, float temp, floa
     return mk_slot_begin2(hp, slot, toks, n, temp, top_p, top_k, min_p, seed, 0, 0);
 }
 
-// feeds up to budget prompt tokens: returns how many remain (0: ready to step; -1: error)
+// feeds up to budget prompt tokens: returns how many remain (0: ready to step; -1: error; -2: mk_cancel stopped it, the
+// rest from the sequence's checkpoint on is queued again)
 int mk_slot_prefill(void * hp, int slot, int budget) {
     try {
         return gpu_engine(hp)->slot_prefill(slot, budget);
+    } catch (const MKCancelled & e) {
+        g_err = e.what();
+        return -2;
     } catch (const std::exception & e) {
         g_err = e.what();
         return -1;
@@ -433,7 +448,7 @@ int mk_set_sampling(void * hp, float temp, float top_p, int top_k, float min_p, 
     }
 }
 
-// presence / frequency penalty (MKEngine::set_penalty); returns 0, or -1
+// presence / frequency penalty (MKEngine::set_penalty: the engine's own sequence, never the slots); returns 0, or -1
 int mk_set_penalty(void * hp, float presence, float frequency) {
     try {
         gpu_engine(hp)->set_penalty(presence, frequency); // (the first non-zero penalty allocates its counts)

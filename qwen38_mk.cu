@@ -2384,7 +2384,7 @@ __device__ __forceinline__ int kv_tbits(int w, int slot, int p0, int ws) {
 __device__ __forceinline__ int kv_wsm(int ws) { return cB.kvrc > 0 ? ws % cB.kvrc : 0; }
 // Per-slot KV format facts, loaded once per launch: the hot kernels then decide a tile's format and source with one integer
 // compare of the tile index against kv_ring_tile (kv_tbits / kv_src per tile cost a uniform-datapath chain with R2UR
-// conversions of the ring pointer right after the tile barrier: 10% of pk_attn8<_, true>'s stall samples, notes/kvq/ncu).
+// conversions of the ring pointer right after the tile barrier: 10% of pk_attn8<_, true>'s stall samples).
 struct KvFmt { int kb, vb, kr, vr; }; // main-buffer bits of K / V; 1 if the side has a q8 ring (MK_KV_WIN)
 __device__ __forceinline__ KvFmt kv_fmt(int slot) {
     return {cB.kvb[0][slot], cB.kvb[1][slot], cB.kvrp[0][slot] != nullptr, cB.kvrp[1][slot] != nullptr};
@@ -2419,7 +2419,7 @@ __device__ __forceinline__ int kv_src(int w, int slot, int g, int p0, int ws, in
 
 #if MK_KV_EMU
 
-// Lloyd-Max (MSE-optimal) codebooks for N(0,1), positive half (symmetric), 2..6 bits: notes/kvq/lloyd_max.py.
+// Lloyd-Max (MSE-optimal) codebooks for N(0,1), positive half (symmetric), 2..6 bits.
 // MSE / variance: 0.1175 (2 bits), 0.03455 (3), 0.009501 (4), 0.002505 (5), 0.000644 (6).
 __constant__ float LM_LEVELS[62] = {
     0.4527800f, 1.5104176f,                                                                                     // 2 bits
@@ -9115,7 +9115,7 @@ struct MKEngine::Impl {
     // per 64-K stage, 86 of 128 columns wasted); 32 / 64 cut the MMA work and add CTAs.
     // The choice is a small cost model over waves of CTAs (nrt row tiles x token tiles) on the nsm SMs, with the
     // per-stage time of a lone CTA at NB = 32 / 64 / 128 (0.80 / 0.95 / 1.44, relative; the model's Q4_K .. Q8_0
-    // shapes, microbenchmark notes/ttft/gemm_nb.cu). NB 64 / 128 run one CTA per SM (shared memory), NB 32 two (a
+    // shapes, microbenchmark). NB 64 / 128 run one CTA per SM (shared memory), NB 32 two (a
     // pair takes 1.77x as long as one CTA). It picks 32 for <= 32 tokens; up to 64 tokens 64, or 32 when the GEMM is
     // narrow (40 row tiles x 2 token tiles still fit one wave); up to 128 tokens 128, or 64 when narrow; above that
     // mostly 128. Chunks of more than 384 tokens always use 128 (the original kernel).
@@ -10447,6 +10447,8 @@ struct MKEngine::Impl {
         float smp_temp = 0.f, smp_top_p = 1.f, smp_min_p = 0.f;
         int smp_top_k = TOPK_MAX;
         unsigned long long smp_seed = 0;
+        float pen_pres = 0.f, pen_freq = 0.f; // (always 0: a lane has no penalty counts, hb.pcnt null)
+        bool pcnt_dirty = false;
         std::vector<Span> spans, rope_spans;
 #if MK_EGRESS
         volatile Ctl * ctl_eg_host = nullptr;
@@ -10454,10 +10456,11 @@ struct MKEngine::Impl {
         std::vector<CkSlot> ck;
         std::vector<CkChunk> ck_plan;
         std::vector<RingSide> rsides[N_ATT_SLOTS]; // MK_EXACT + MK_KV_WIN: its window rings as its checkpoints copy them
-        std::vector<int> pend; // prompt tokens slot_begin queued, not prefilled yet
-        int first = -1;        // the first token of the finished prefill: emitted by the next slots_step
-        bool dead = false;     // a slot call on it failed (MKCudaError): state undefined until slot_begin resets it
-        std::string dead_why;  // (that error, in the refusals)
+        std::vector<int> prompt; // slot_begin's prompt (a cancelled chunk queues the rest again from it)
+        std::vector<int> pend;   // prompt tokens slot_begin queued, not prefilled yet
+        int first = -1;          // the first token of the finished prefill: emitted by the next slots_step
+        bool dead = false;       // a slot call on it failed (MKCudaError): state undefined until slot_begin resets it
+        std::string dead_why;    // (that error, in the refusals)
     };
     std::vector<Lane> lanes;
     int live = -1;          // the lane whose state the Impl's members hold (-1: the engine's own sequence)
@@ -10484,6 +10487,9 @@ struct MKEngine::Impl {
         std::swap(smp_min_p, l.smp_min_p);
         std::swap(smp_top_k, l.smp_top_k);
         std::swap(smp_seed, l.smp_seed);
+        std::swap(pen_pres, l.pen_pres); // (the own sequence's penalties and their counts never reach a lane)
+        std::swap(pen_freq, l.pen_freq);
+        std::swap(pcnt_dirty, l.pcnt_dirty);
         std::swap(spans, l.spans);
         std::swap(rope_spans, l.rope_spans);
 #if MK_EGRESS
@@ -10566,6 +10572,33 @@ struct MKEngine::Impl {
             throw;
         }
     }
+    // frees ck_new_slots' slots (events, pinned blocks, ring copies; nothing may still use them)
+    void ck_slots_free(std::vector<CkSlot> & v) noexcept {
+        for (CkSlot & s : v) {
+            if (s.ev) cudaEventDestroy(s.ev);
+            if (s.mem) cudaFreeHost(s.mem);
+            if (s.ring) cudaFreeHost(s.ring);
+        }
+        v.clear();
+    }
+    // slots_open failing part way (allocs had na entries, alloc_bytes ab): its lanes and every device / pinned
+    // allocation it made go, lanes stay empty, the engine's own sequence is live (never throws: results ignored, the last
+    // error cleared)
+    void slots_undo(size_t na, size_t ab) noexcept {
+        lane_out_nothrow();
+        cudaDeviceSynchronize();
+        for (Lane & l : lanes) {
+            ck_slots_free(l.ck);
+#if MK_EGRESS
+            if (l.ctl_eg_host) cudaFreeHost(const_cast<Ctl *>(l.ctl_eg_host));
+#endif
+        }
+        lanes.clear();
+        for (size_t i = na; i < allocs.size(); i++) use_pool ? cudaFreeAsync(allocs[i], 0) : cudaFree(allocs[i]);
+        allocs.resize(na);
+        alloc_bytes = ab;
+        cudaGetLastError();
+    }
     // n pinned checkpoint slots (as ck_alloc's: the streams and events are the engine's)
     std::vector<CkSlot> ck_new_slots(int n) {
         std::vector<CkSlot> v;
@@ -10579,8 +10612,14 @@ struct MKEngine::Impl {
             s.dstate = static_cast<float *>(s.mem);
             s.conv = s.dstate + CK_NS;
             s.hhist = s.conv + CK_NC;
-            CK(cudaHostGetDevicePointer(reinterpret_cast<void **>(&s.hdev), s.hhist, 0));
-            CK(cudaEventCreateWithFlags(&s.ev, cudaEventDisableTiming));
+            try {
+                CK(cudaHostGetDevicePointer(reinterpret_cast<void **>(&s.hdev), s.hhist, 0));
+                CK(cudaEventCreateWithFlags(&s.ev, cudaEventDisableTiming));
+            } catch (...) { // (the slots made so far go with it)
+                v.push_back(s);
+                ck_slots_free(v);
+                throw;
+            }
             if (ring_bytes_ck > 0 && cudaHostAlloc(reinterpret_cast<void **>(&s.ring), ring_bytes_ck, cudaHostAllocDefault) != cudaSuccess) {
                 cudaGetLastError();
                 s.ring = nullptr; // (as ck_alloc's: restores of this checkpoint refill the rings, not exact)
@@ -10631,6 +10670,16 @@ struct MKEngine::Impl {
             if (!hw.L[L].attn && !(hw.L[L].qkv.fm && hw.L[L].gate.fm))
                 throw std::runtime_error("parallel slots: this model's delta-net projections are not all in the wv layout (types the batched launch does not serve)");
         if (!spans.empty()) throw std::runtime_error("parallel slots: the engine's own sequence holds images (reset it first)");
+        // a failure from here on: slots_undo frees what this call allocated, lanes stay empty (a call while slots are
+        // open throws above, before any change, so lanes it did not build are never undone)
+        struct Undo {
+            Impl * p;
+            size_t na, ab;
+            bool done;
+            ~Undo() {
+                if (!done) p->slots_undo(na, ab);
+            }
+        } undo{this, allocs.size(), alloc_bytes, false};
         par_wide = false;
 #if MK_PAR_WIDE
         {
@@ -10758,6 +10807,7 @@ struct MKEngine::Impl {
         }
         dv_reset();
         dv_frozen = true;
+        undo.done = true;
         bool lowbit = false;
         for (int w = 0; w < 2; w++)
             for (int sl = 0; sl < kv_slots; sl++) lowbit |= hb.kvb[w][sl] != 8 || (w ? hb.kvrv[sl] : hb.kvr[sl]);
@@ -11731,10 +11781,7 @@ int MKEngine::step(std::vector<int> & out) {
         ~LaneOut() { p->lane_out_nothrow(); }               \
     } lane_out_guard{p_}
 
-int MKEngine::slots_open(int n, int ctx, int /*seg_tokens*/) {
-    MK_LANE_OUT(); // (a failure part way, inside a lane_in: the engine's own sequence is live again)
-    return p_->slots_open(n, ctx);
-}
+int MKEngine::slots_open(int n, int ctx, int /*seg_tokens*/) { return p_->slots_open(n, ctx); }
 
 int MKEngine::slots_count() const { return (int) p_->lanes.size(); }
 
@@ -11771,6 +11818,7 @@ int MKEngine::slot_begin(int slot, const std::vector<int> & toks, float temp, fl
             } else reset();
         }
         reused = (int) I.seq.size();
+        L.prompt = toks;
         L.pend.assign(toks.begin() + reused, toks.end());
     });
     return reused;
@@ -11791,16 +11839,27 @@ int MKEngine::slot_prefill(int slot, int budget) {
         const size_t n = std::min<size_t>(L.pend.size(), (size_t) budget);
         const std::vector<int> chunk(L.pend.begin(), L.pend.begin() + n);
         L.pend.erase(L.pend.begin(), L.pend.begin() + n);
-        if (L.pend.empty()) { // the prompt's last chunk: its first token, a checkpoint before the prompt's last token
-            const int end = (int) I.seq.size() + (int) chunk.size();
-            L.first = prefill(chunk, end - 1);
-        } else { // a chunk before the last: batched rows only (with MK_PREFILL=mk its last row samples a token: dropped)
-            struct Mid {
-                Impl * p;
-                ~Mid() { p->pf_mid = false; }
-            } mid{p_};
-            I.pf_mid = true;
-            if (prefill(chunk) >= 0) truncate((int) I.seq.size() - 1);
+        try {
+            if (L.pend.empty()) { // the prompt's last chunk: its first token, a checkpoint before the prompt's last token
+                const int end = (int) I.seq.size() + (int) chunk.size();
+                L.first = prefill(chunk, end - 1);
+            } else { // a chunk before the last: batched rows only (with MK_PREFILL=mk its last row samples a token: dropped)
+                struct Mid {
+                    Impl * p;
+                    ~Mid() { p->pf_mid = false; }
+                } mid{p_};
+                I.pf_mid = true;
+                if (prefill(chunk) >= 0) truncate((int) I.seq.size() - 1);
+            }
+        } catch (const MKCancelled &) {
+            // the sequence went back to a checkpoint before this call (or was reset): a prefix of the prompt, whose
+            // rest is pending again (the next slot_prefill continues there)
+            const size_t s = I.seq.size();
+            if (s <= L.prompt.size() && std::equal(I.seq.begin(), I.seq.end(), L.prompt.begin()))
+                L.pend.assign(L.prompt.begin() + s, L.prompt.end());
+            else
+                L.pend.clear(); // (not a prefix: nothing queued, the next slot_begin matches again)
+            throw;
         }
         left = (int) L.pend.size();
     });

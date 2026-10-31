@@ -71,7 +71,8 @@ class MKEngine {
     // Presence / frequency penalty (OpenAI parameters, vLLM's semantics): each generated token's logit is lowered by
     // frequency * c + presence * (c > 0), c = its occurrences among the tokens generated so far in this response
     // (since the last prefill; prompt tokens do not count). Greedy and sampled; speculative verification stays exact
-    // (a verify row counts the drafts before it). 0, 0 (default): off.
+    // (a verify row counts the drafts before it). 0, 0 (default): off. The engine's own sequence only: parallel slots
+    // never apply them.
     void set_penalty(float presence, float frequency);
     // Draft-depth policy, "key=value,..." (see qwen38_mk.cu); "" restores the default. The env var
     // MK_POLICY sets it at construction.
@@ -210,7 +211,8 @@ class MKEngine {
     // emitted (a slot's first call after its prefill: the prefill's token only; empty: its context is full).
     // slots_step_mixed: slots_step, then the next chunk of pslot's prompt. Every slot call leaves the engine's own
     // sequence current again. An MKCudaError fails the slots the call ran on: slot_prefill / slots_step refuse them
-    // (std::runtime_error) until slot_begin, which starts them from scratch (reuses nothing).
+    // (std::runtime_error) until slot_begin, which starts them from scratch (reuses nothing). A slot_prefill stopped by
+    // cancel() (MKCancelled) queues the prompt's rest again from where the slot's sequence went back to.
     int slots_open(int n, int ctx, int seg_tokens = 0);
     int slots_count() const;
     int slot_begin(int slot, const std::vector<int> & toks, float temp, float top_p, int top_k, float min_p, unsigned long long seed,

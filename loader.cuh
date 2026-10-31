@@ -36,8 +36,8 @@ struct LoadClock {
 };
 
 // Parallel read-ahead of the GGUF's tensor data (MK_LOAD_IO threads, default 8; 0: off). Under WSL2 one thread reading a
-// cold file through the mmap gets ~0.2 GB/s (4 KiB faults, small readahead), 8 threads touching 4 MiB pieces ~3 GB/s
-// (notes/tool/pftest.log). The pieces go in the loader's order (blk.<i> by layer, then the rest; by offset within a
+// cold file through the mmap gets ~0.2 GB/s (4 KiB faults, small readahead), 8 threads touching 4 MiB pieces ~3 GB/s.
+// The pieces go in the loader's order (blk.<i> by layer, then the rest; by offset within a
 // group), at most `window` bytes past the furthest piece the loader has asked for (need), so the read-ahead cannot evict
 // pages the loader has not reached yet. The touching threads also map the pages into the process: the loader's own
 // accesses then take no faults.
