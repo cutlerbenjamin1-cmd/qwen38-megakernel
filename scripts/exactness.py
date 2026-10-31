@@ -19,6 +19,18 @@ PROMPTS = {"code": "Write a C++ function that parses a GGUF header.",
            "story": "Tell me a short story about a lighthouse keeper."}
 SAMPLED = ["--temp", "1", "--top-p", "0.95", "--top-k", "20", "--seed", "7"]
 CHUNKS = (2048, 1280, 768)  # MK_PF_CAP values: multiples of 128, all >= 640 (smaller caps take another end-snapshot path)
+# the server checks' system message: with exact reuse a request resumes at a checkpoint (a 64-token grid and each message
+# start), so the first turn must span several of them for the follow-up to reuse anything, as an agent's system prompt does
+SYSTEM = " ".join([
+    "You are a careful assistant for a lighthouse museum.",
+    "Answer in plain English, without markdown, headings or lists unless the user asks for one.",
+    "Keep answers short: a few lines unless more is requested, and never pad them with filler.",
+    "When you are unsure of a fact about lighthouses, keepers or navigation, say so instead of guessing.",
+    "Prefer concrete details: the name of a lighthouse, the year it was lit, the range of its light.",
+    "When asked for verse, keep the meter simple and the rhymes natural, and do not explain the poem.",
+    "Visitors range from children to retired sailors, so avoid jargon or explain it in a few words.",
+    "If a request is outside the museum's subject, answer it briefly and politely all the same.",
+] * 3)
 U1 = "Name three uses of a lighthouse, one line each."
 U2 = "Now write a four-line poem about the second one."
 U2_EDIT = "Now write a four-line poem about the third one."
@@ -101,6 +113,9 @@ def build_info():
 
 def user(text):
     return {"role": "user", "content": text}
+
+
+SYS = {"role": "system", "content": SYSTEM}
 
 
 class Server:
@@ -304,8 +319,8 @@ class Check:
     def server(self):
         greedy, sampled = {"temperature": 0}, {"temperature": 1.0, "top_p": 0.95, "top_k": 20, "seed": 7}
         with Server(self, "server_warm") as s:
-            r1, _ = s.chat([user(U1)], greedy)
-            hist = [user(U1), {"role": "assistant", "content": r1["content"] or ""}]
+            r1, _ = s.chat([SYS, user(U1)], greedy)
+            hist = [SYS, user(U1), {"role": "assistant", "content": r1["content"] or ""}]
             cases = {"follow-up": (hist + [user(U2)], greedy), "edit": (hist + [user(U2_EDIT)], greedy),
                      "sampled follow-up": (hist + [user(U2)], sampled)}
             warm, cached = {}, {}
