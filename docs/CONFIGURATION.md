@@ -253,7 +253,7 @@ limits in [SERVER.md](SERVER.md#limits).
 | `--allow-host NAME` | `MK_ALLOW_HOSTS` | none | host names clients may use besides localhost, IP addresses and `--host`'s (repeatable or comma-separated; `*` = any name, which turns the DNS-rebinding check off); other names get a 403 | - |
 | `--cors-origin`, `--cors-origins ORIGIN` | `MK_CORS_ORIGINS` | none | web origins (`scheme://host[:port]`) whose pages may call the server (CORS headers, preflights; `*` is refused); pages of other origins get a 403. Clients that are not web pages send no Origin and are not affected | - |
 | `--api-key KEY` | `MK_API_KEY` | none | every request but `/health` and CORS preflights must carry the key (`Authorization: Bearer KEY` or `x-api-key: KEY`); others get a 401 | - |
-| `-c`, `--ctx` | - | `32768` (launchers 120000); with `--agents` `0` (with `--parallel` 32768) | context in tokens, at most the model's full context of 262,144 (more: the engine refuses to start); with `--agents` each slot's, 0 = the most that fits | - |
+| `-c`, `--ctx` | - | `32768` (launchers 120000); with `--agents` `0` (with `--parallel` 32768) | context in tokens, at most the model's full context of 262,144 (more: the engine refuses to start; a KV cache larger than the free device memory loads with a warning, [ENGINE.md](ENGINE.md#kv-cache)); with `--agents` each slot's, 0 = the most that fits | - |
 | `-d`, `--draft` | - | `4` (launchers 7) | MTP drafts per cycle: 0-7; more than 4 needs the q8_0 cache | drafts only |
 | `--draft-vocab` | - | `draft_vocab_32k.bin` in the repo | the draft head's vocabulary (the 32k most frequent tokens; tokens of the current conversation are added) | drafts only |
 | `--mtp FILE` | `MK_MTP` (engine) | the model file's MTP layer | the MTP draft layer from another GGUF of the same model (checked against it) | drafts only |
@@ -467,7 +467,8 @@ Wide verify replaced a dp4a verify pass of at most 4 drafts, which summed in ano
 ### Former flags
 
 On 2026-11-01 these compile-time switches were removed and their served values built in: the other arms were not
-released or gated, and nothing measured them any more. A `-D` for one of them has no effect.
+released or gated, and nothing measured them any more. A `-D` for one of them stops the build with an error that names
+it.
 
 | Former flag | Built in | What it does | Output against the removed arm | Since |
 |---|---|---|---|---|
@@ -522,7 +523,7 @@ released or gated, and nothing measured them any more. A `-D` for one of them ha
 
 `build.ps1` skips the engine's compile when its object is newer than every engine source and was built
 with the same flags. Make targets: `all` (the default: CLI, engine library, tools, and the vision library when
-llama.cpp's build has libmtmd), `vision`, `check` (the kernel checks without a model), `exactness` and `gate`
+llama.cpp's build has libmtmd), `vision`, `check` (the kernel benches' self-checks, no model), `exactness` and `gate`
 (`scripts/exactness.py` and `scripts/gate.sh` on the build, with `MK_MODEL=<gguf>`;
 [BUILDING.md](BUILDING.md#checking-a-build)), `tools/vit_check`, `tests/gguf_fuzz`, `clean`. `NVFLAGS`, `VISION_INC`,
 `VISION_LIBS`, `VIT_OBJ` and `VIT_DEF` are the Makefile's internal variables (`VIT_DEF` is `-DMKV_NO_VIT` on CPUs
@@ -604,8 +605,8 @@ These are for measuring and checking, not for serving. Each one's usage text is 
 | `bench/code_bench.py` (code workloads, both engines) | `--ctx-sizes LIST` (default 0,2000,4000,8000,16000,30000), `--reps N` (2), `-n N` (256), `--model FILE` |
 | `bench/think_bench.py` (thinking-mode decode, both engines) | `--seeds N` (2), `-n N` (1024) |
 | `bench/wv_extract.py` | `[qwen38_mk.cu] [out.cuh]`: copies the engine's dp4a GEMV code from `mk_shared.cuh` and `qwen38_mk.cu` into `bench/wv_ref.cuh` for `wvgemm_bench` (`make check` runs it first) |
-| `scripts/gate.sh` (every GPU check of a build: [checking a build](BUILDING.md#checking-a-build)) | `-m GGUF` (default `MK_MODEL`), `--record DIR` (keep the outputs as a reference) or `--ref DIR` (every output must equal it), `--out DIR` (default `gate-out`), `--legs LIST` (default `benches,exactness,pfcap,cli,tinv,slots,capi,kld`), `--model2 GGUF`, `--kld-ref FILE` (the kld leg), `--capi FILE`, `--capi-cases "CASE ..."`, `--python PY` (with jinja2), `--port N` (default 18190), `--timeout S` (per run, default 1800) |
-| `scripts/capi_checks.py` (the C API: engine errors and roll-backs, out-of-memory inside the free VRAM, penalties, policies) | `LIB MODEL DRAFT_VOCAB [CASE]`: every case in its own process, PASS / FAIL / SKIP, exit 1 on a FAIL; env `CAPI_DEVOOM=0` (skip the device out-of-memory cases), `CAPI_COMMIT_MIN_GB` (Windows commit those wait for, default 45) |
+| `scripts/gate.sh` (every GPU check of a build: [checking a build](BUILDING.md#checking-a-build)) | `-m GGUF` (default `MK_MODEL`), `--record DIR` (keep the outputs as a reference) or `--ref DIR` (every output, and the inherited `MK_*` environment, must equal the reference's; a check it did not run is a skip), `--out DIR` (default `gate-out`; one holding a recorded reference is refused), `--legs LIST` (default `benches,exactness,pfcap,cli,tinv,slots,capi,kld`), `--model2 GGUF`, `--kld-ref FILE` (the kld leg), `--capi FILE` (default `scripts/capi_checks.py`), `--capi-cases "CASE ..."` (one or more), `--python PY` (with jinja2), `--port N` (default 18190), `--timeout S` (per run, default 1800); exit 1 if a check failed, 2 for bad arguments, a stale build or a refused `--out` |
+| `scripts/capi_checks.py` (the C API: engine errors and roll-backs, out-of-memory inside the free VRAM, penalties, policies) | `LIB MODEL DRAFT_VOCAB [CASE ...]`: the given cases (default: all), each in its own process, PASS / FAIL / SKIP, exit 1 on a FAIL and 2 for an unknown case; env `CAPI_DEVOOM=0` (skip the device out-of-memory cases), `CAPI_COMMIT_MIN_GB` (Windows commit those wait for, default 45) |
 | `bench/suite/fetch.py` (downloads the benchmark items and checks each against `bench/suite/items.json`) | `--data DIR` (default `bench/suite/data`), `--sets NAME ...` (default all, and `pf101k`), `--check` (check the files already there, download nothing) |
 | `bench/suite/speed_client.py` (decode, prefill, first token, follow-up turns, prompt edits, VRAM; one server) | `--label L`, `--out FILE` (JSON lines, appended), `--url URL` (default `http://127.0.0.1:8080`), `--mode all\|edit` (default all; edit: the warm-up and the edit scenarios only), `--data DIR`, `--gpu N\|none` (nvidia-smi GPU for the VRAM and clock records, default 0) |
 | `bench/suite/qa_client.py` (the 282 questions) | `--label`, `--out`, `--url`, `--data`, `--limit N` (the first N items of each set only), then set names (default all) |

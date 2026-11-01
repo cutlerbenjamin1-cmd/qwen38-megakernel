@@ -28,7 +28,7 @@ Contents: [headline numbers](#headline-numbers) - [against llama.cpp, 2026-10-31
 [parallel agents](#parallel-agents) - [KV cache presets](#kv-cache-presets) -
 [Q4_K_M and upstream's scripts](#q4_k_m-and-upstreams-scripts) - [exactness](#exactness) -
 [the conversation cache](#the-conversation-cache) - [keep-warm](#keep-warm) - [images and video](#images-and-video) -
-[earlier full runs](#earlier-full-runs) - [reproducing](#reproducing).
+[wide verify](#wide-verify-2026-10-13) - [earlier full runs](#earlier-full-runs) - [reproducing](#reproducing).
 
 ## Headline numbers
 
@@ -651,6 +651,14 @@ On the Ryzen 9 5900XT (32 threads):
 The image and video encoder runs on the CPU, so it takes no VRAM: with an image projector loaded, the idle server's
 VRAM at 120k context did not grow (2026-10-16).
 
+## Wide verify (2026-10-13)
+
+The int8 tensor-core verify pass (wide verify, up to 7 drafts) when it was first served, 72a58cd at 7 drafts, against
+the dp4a verify pass before it, 999fc68 at its most, 4 drafts: greedy decode on the short prompts 17.6% faster, sampled
+with thinking 19.5% faster, decode at 101.6k context 9.2% faster. The dp4a pass summed in another order (greedy output
+still independent of the draft depth) and was neither released nor gated; its build went with the other compile-time
+switches ([CONFIGURATION.md](CONFIGURATION.md#former-flags)).
+
 ## Earlier full runs
 
 Older runs (2026-10-14 and 10-15) are in this file's history at fe21771, and the previous llama.cpp column (b11548, the
@@ -676,14 +684,6 @@ The same client and settings as the 2026-10-30 run, q8_0 and preset D, one sessi
 
 Time per engine cycle, q8_0 / D: 27.4 / 28.2 ms at 11.6k, 29.9 / 29.2 at 38k, 33.3 / 34.5 at 101.6k. Preset D's edit
 rows and the timing of its GSM8K and MMLU-Pro sets come from a second pass that evening.
-
-### Wide verify (2026-10-13)
-
-The int8 tensor-core verify pass (wide verify, up to 7 drafts) when it was first served, 72a58cd at 7 drafts, against
-the dp4a verify pass before it, 999fc68 at its most, 4 drafts: greedy decode on the short prompts 17.6% faster, sampled
-with thinking 19.5% faster, decode at 101.6k context 9.2% faster. The dp4a pass summed in another order (greedy output
-still independent of the draft depth) and was neither released nor gated; its build went with the other compile-time
-switches ([CONFIGURATION.md](CONFIGURATION.md#former-flags)).
 
 ## Reproducing
 

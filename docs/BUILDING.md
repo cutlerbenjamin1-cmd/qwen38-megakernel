@@ -180,14 +180,19 @@ hf download unsloth/Qwen3.8-27B-GGUF Qwen3.8-27B-UD-Q4_K_XL.gguf mmproj-BF16.ggu
   drafts, parallel slots against solo runs (`bench/slots_bench.py`: 4 and 2 slots, the MTP window, a slot prefilled
   between the others' steps) and their sampled outputs, the C API checks (`scripts/capi_checks.py`: errors, roll-backs
   and out-of-memory kept inside the free VRAM), and with `--kld-ref <file>` the KL report against llama.cpp;
-  `--model2 <gguf>` adds a second model. Each check prints ok / FAIL / skip and the exit status is 1 if one failed. A
-  reference is kept only if all its own checks passed, and holds for the GPU, driver and model files it was recorded
-  with (the manifest names them; another model is refused). Linux or WSL2, the GPU to itself, about 16 minutes on an
-  RTX 3090.
-- **Kernels without a model:** `make check` builds and runs `bench/wvgemm_bench check` (the tensor-core verify GEMM
-  bit-identical at every token count and against fp64 and the engine's dp4a GEMVs, whose code `bench/wv_extract.py`
-  copies from `mk_shared.cuh` and `qwen38_mk.cu` first) and `bench/dattn_bench` with `TINV=1` (the decode attention
-  variants bit-identical to each other and token-count invariant, at 4 and 5 tokens); either exits 1 on a difference.
+  `--model2 <gguf>` adds a second model. Each check prints ok / FAIL / skip (the C API leg skips when none of its cases
+  can run); the exit status is 1 if one failed, 2 for bad arguments, a stale build or an `--out` that holds a recorded
+  reference. A reference is kept only if all its own checks passed, and holds for the GPU, driver, model files and
+  `MK_*` environment it was recorded with (the manifest names them, `MK_MODEL` and `MK_API_KEY` aside): another model
+  is refused, another environment is a FAIL, and a check the reference did not run is a skip with a NOTE. Linux or
+  WSL2, the GPU to itself, about 16 minutes on an RTX 3090.
+- **Kernels without a model:** `make check` builds and runs the benches' self-checks. `bench/wvgemm_bench check` tests
+  its own tensor-core verify kernel (a counterpart of `wv.cuh`, not the engine's code) for bit-identical output at
+  every token count, and it and the engine's dp4a GEMVs (copied from `mk_shared.cuh` and `qwen38_mk.cu` by
+  `bench/wv_extract.py` first) against fp64 within error bounds (rms 1e-5 and max 1e-4 of the rows' rms; |wv - dp4a|
+  at most 1e-4; a NaN fails). `bench/dattn_bench` with `TINV=1` tests its own, older copies of the decode attention
+  kernels (up to 5 tokens) for bit-identical output across variants and token counts, at 4 and 5 tokens. Either exits
+  1 on a failure.
 - **Server tests:** `python -m pytest -q tests` runs without a GPU, against fake engines (the CI runs it on Python 3.10,
   3.11 and 3.12).
 - **GGUF parser:** `make tests/gguf_fuzz && tests/gguf_fuzz` feeds `gguf.h` malformed and randomly corrupted files under

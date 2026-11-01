@@ -250,6 +250,10 @@ exact reuse, each checkpoint also holds the window rings as of its position. The
 D', E and F: [CONFIGURATION.md](CONFIGURATION.md#kv-cache-presets); their accuracy, VRAM and speed:
 [BENCHMARKS.md](BENCHMARKS.md#kv-cache-presets).
 
+A cache that takes more device memory than was free before it was allocated gets a warning at load, and the load goes
+on: a driver with the CUDA sysmem fallback (Windows, WSL2) puts the rest in system memory, read over PCIe and much
+slower. A smaller `-c`, a preset (`MK_KV`) or `--kv q8` fits.
+
 Each layer's cache and the RoPE table hold 2 x MAXT rows (16, ~0.6 MB in all) past the
 context: with more than 5 drafts, the last cycles before "context full" write the MTP block's draft rows up to 4
 positions past it.
@@ -411,7 +415,7 @@ those waits use a high-resolution waitable timer, since a plain sleep ends at th
 - `qwen38_mk.cu` - the device code (the megakernel, its phases and the other kernels) and, at its end, the launchers
   and symbol copies the host side calls through `mk_launch.h`
 - `mk_shared.cuh` - the structs, constants and build settings both sides use; the engine refuses a device object built
-  with other settings than its host files
+  with other settings, or for other GPU architectures, than its host files
 - `engine_impl.h` - `MKEngine::Impl`, the engine's host-side state and methods, defined in `engine.cu` (launches,
   decode steps, policy, most of the API), `loader.cu` (the model load: repacks, re-encodes, the constructor),
   `prefill_host.cu` (the batched prefill's chunks and launches), `ck_pool.cu` (checkpoints), `host_store.cu` (side
