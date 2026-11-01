@@ -10,7 +10,7 @@ Contents: [prebuilt packages](#prebuilt-packages) - [requirements](#requirements
 ## Prebuilt packages
 
 Each [release](https://github.com/cutlerbenjamin1-cmd/qwen38-megakernel/releases) has a Windows x64 zip and a Linux
-x86-64 tarball of the served configuration (`MKFLAGS` as below: wide verify, up to 7 drafts), built from the tagged
+x86-64 tarball of the served configuration (`MKFLAGS` as below), built from the tagged
 commit. Each holds the engine library, the CLI, the vision library, the tools, llama.cpp b10246's libraries (CPU only:
 the engine uses its tokenizer and image library), the server, the launcher, the docs, the licenses
 (`THIRD_PARTY_NOTICES.md`), `BUILD_INFO.txt` (commit, flags, toolchain) and `QUICKSTART.txt`. They need:
@@ -46,8 +46,7 @@ folder) and `scripts\package_release.ps1` (after `build.ps1`; it bundles the Vis
 - **OS:** Linux, WSL2, or Windows 10 / 11 x64.
 - **RAM to compile:** most of the build is ptxas on the megakernel, one thread with a large heap. For the served
   configuration it peaked at 18.8 GiB both on Linux / WSL2, in a 10.5-minute `make -j2`, and natively on Windows, in
-  a 12-minute `build.ps1` (2026-10-30, 6f3b257). The lean build (`MKFLAGS=`, up to 4 drafts) was last measured at
-  about 19 GB (2026-10-17), before the served build was trimmed.
+  a 12-minute `build.ps1` (2026-10-30, 6f3b257).
 - **RAM at run time:** parked conversations and side requests use page-locked host memory, up to `--park-mib` /
   `MK_PARK_MIB` (default 8192 MiB; 1024 MiB for side requests alone when parking is off), allocated as it is needed and
   kept until the server exits. The token embedding table also stays in page-locked host memory instead of VRAM.
@@ -78,10 +77,8 @@ What `make` builds:
   `../llama.cpp/build/bin/libmtmd.so` exists, which is llama.cpp's default; `make vision` builds them explicitly.
 
 Build settings:
-- **The served configuration** is the default: `MKFLAGS=-DMK_WV=1 -DMK_MAXT=8 -DMK_WV_Q6F=1 -DMK_K5=1` (wide verify on
-  int8 tensor cores, up to 7 drafts, the fragment-ordered Q6_K layout, the split barrier before the DeltaNet core).
-- **The lean engine:** `make MKFLAGS=`. It verifies at most 5 rows (4 drafts) with dp4a GEMVs; run it with
-  `MK_DRAFT=4` (the launchers default to 7).
+- **The served configuration** is the default: `MKFLAGS=-DMK_WV_Q6F=1 -DMK_K5=1` (the fragment-ordered Q6_K layout,
+  the split barrier before the DeltaNet core). The engine always verifies on int8 tensor cores, up to 7 drafts.
 - **Architecture:** `make` asks `nvidia-smi` for the first GPU's compute capability (sm_86 if it is missing); override
   it with `ARCH=sm_89` or similar.
 - **Huge pages:** the Makefile sets `GLIBC_TUNABLES=glibc.malloc.hugetlb=1`, which lets ptxas's heap use transparent
@@ -119,7 +116,7 @@ python -m venv .venv; .venv\Scripts\pip install -r requirements.txt
 - **What `build.ps1` builds:** `qwen38mk.dll` (the server's engine), `qwen38_mk.exe` (CLI), `qwen38vision.dll` and
   `tools\*.exe`, with the Makefile's nvcc flags and `MKFLAGS`. It writes `ptxas.log` and copies llama.cpp's DLLs next
   to the outputs. It finds Visual Studio 2022 itself (vswhere) and sets up its environment.
-- **Parameters:** `-MkFlags ""` builds the lean engine; `-Targets engine|vision|tools` builds one part (`vision`
+- **Parameters:** `-MkFlags` sets `MKFLAGS`; `-Targets engine|vision|tools` builds one part (`vision`
   needs no CUDA compile); `-Arch sm_86` overrides the GPU architecture (default: the first GPU's); `-Llama` points at
   another llama.cpp build; `-Cuda` at the toolkit. An engine object that is newer than the sources and was built with
   the same flags is reused.
@@ -179,7 +176,7 @@ hf download unsloth/Qwen3.8-27B-GGUF Qwen3.8-27B-UD-Q4_K_XL.gguf mmproj-BF16.ggu
   AddressSanitizer and UBSan (CPU only, Linux).
 - **Exactness:** `python3 scripts/exactness.py -m <gguf>` (or `make exactness MK_MODEL=<gguf>`; Windows:
   `python scripts\exactness.py -m <gguf>`) checks the README's [exact output](../README.md#exact-output) claims on the
-  GPU: greedy ids identical at 0, 4 and 7 drafts (`--depths 0,4` for a `make MKFLAGS=` build) and without the MTP
+  GPU: greedy ids identical at 0, 4 and 7 drafts and without the MTP
   layer, the exact-reuse state digest and ids independent of the prefill chunk size, and a warm server's follow-up,
   edited and sampled replies equal to a fresh server's (a check whose runs drafted nothing or reused nothing fails: it
   would prove nothing). It needs the GPU to itself (11 model loads), prints PASS / FAIL per check, exits 1 on a failure

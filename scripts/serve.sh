@@ -17,7 +17,7 @@
 #   MK_CORS_ORIGINS     web origins whose pages may call the server (comma-separated, e.g. http://localhost:5173):
 #                       requests from pages of other origins get a 403
 #   MK_API_KEY          require this key on every request but /health (clients send it as their API key); default none
-#   MK_DRAFT            MTP drafts per cycle (default 7; a `make MKFLAGS=` build takes at most 4)
+#   MK_DRAFT            MTP drafts per cycle (default 7)
 #   MK_EXACT_REUSE=0    turn exact reuse off: a reused prompt then appends the previous reply instead of re-prefilling it
 #                       (faster follow-up turns, but not bit-identical to the same request sent fresh)
 #   MK_SIDE_MAX         side requests: a first-turn prompt of at most this many tokens (default 8192; 0 = off) that would

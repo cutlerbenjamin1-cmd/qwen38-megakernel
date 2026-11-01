@@ -41,8 +41,6 @@ What is not bit-identical, and how close it is:
 - **The low-bit KV presets** ([below](#the-full-262k-context-on-24-gb)): near-lossless, not identical to q8_0. Opt-in,
   except that `scripts/serve.bat` uses preset F above 240k context unless `MK_KV` is set.
 - **`MK_EXACT_REUSE=0`** makes follow-up turns faster by appending to the previous reply instead of reading it again.
-- **The lean build** (`make MKFLAGS=`, up to 4 drafts) reads the weights with other kernels, so it rounds differently
-  from the served build; the checks above run on the served build.
 
 Evidence and the tests behind each line: [docs/BENCHMARKS.md](docs/BENCHMARKS.md#exactness).
 

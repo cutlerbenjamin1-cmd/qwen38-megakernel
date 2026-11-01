@@ -388,7 +388,7 @@ def main():
     ap.add_argument("-m", "--model", default=os.environ.get("MK_MODEL"), help="the GGUF (default: MK_MODEL)")
     ap.add_argument("--bin", default=os.path.join(HERE, "qwen38_mk.exe" if WIN else "qwen38_mk"), help="the CLI")
     ap.add_argument("--draft-vocab", default=dv if os.path.isfile(dv) else "", help="(default: draft_vocab_32k.bin)")
-    ap.add_argument("--depths", default="0,4,7", help="draft depths (default 0,4,7; a `make MKFLAGS=` build: 0,4)")
+    ap.add_argument("--depths", default="0,4,7", help="draft depths (default 0,4,7)")
     ap.add_argument("--legs", default=",".join(LEGS), help=f"the checks to run (default {','.join(LEGS)})")
     ap.add_argument("--out", default="exactness-out", help="output directory (default exactness-out)")
     ap.add_argument("--compare", metavar="DIR", help="another run's output directory (or its exactness.json)")

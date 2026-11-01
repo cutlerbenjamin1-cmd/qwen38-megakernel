@@ -24,8 +24,8 @@ setting that is missing here is a documentation bug.
 
 There are four layers. Each one passes its settings down to the next:
 
-1. **Build** (`make` / `build.ps1`): compile-time flags (`MKFLAGS`, `-D...`) decide which kernels exist in the binary.
-   The served build and the lean build differ here ([Compile-time flags](#compile-time-flags)).
+1. **Build** (`make` / `build.ps1`): compile-time flags (`MKFLAGS`, `-D...`) decide which kernels exist in the binary
+   ([Compile-time flags](#compile-time-flags)).
 2. **Launchers** (`scripts/serve.sh`, `scripts/serve.bat`): read `MK_*` environment variables, turn some of them into
    server options, and start the server with the rest of the environment unchanged.
 3. **Server** (`server/mk_server.py`): command-line options. Some have an environment twin (`--side-max` /
@@ -57,7 +57,7 @@ on when the vision projector is found. These are the settings worth knowing:
 | Model file | `MK_MODEL` | `-m` | `$HOME/models/Qwen3.8-27B-UD-Q4_K_XL.gguf` (Windows: `%USERPROFILE%\models\...`) | another GGUF or another folder |
 | Port, context | 1st and 2nd argument | `--port`, `-c` | 8080, 120000 | context up to 262,144 tokens with preset D or F (`serve.bat` picks F above 240k) |
 | KV cache preset | `MK_KV`, `MK_KV_WIN` | (engine) | q8_0 | [preset D](#kv-cache-presets) frees ~1.1 GB at 120k and fits the full 262,144-token context; near-lossless, not bit-identical. Above 240k `serve.bat` uses preset F unless `MK_KV` is set |
-| Drafts per cycle | `MK_DRAFT` | `-d` | 7 | 4 for a lean build; 0 turns speculation off |
+| Drafts per cycle | `MK_DRAFT` | `-d` | 7 | 0 turns speculation off |
 | Listen address | `MK_HOST` | `--host` | 127.0.0.1 | `0.0.0.0` for other machines on the LAN (then also `MK_ALLOW_HOSTS`) |
 | Host names, web pages | `MK_ALLOW_HOSTS`, `MK_CORS_ORIGINS` | `--allow-host`, `--cors-origin` | none | a LAN name or a reverse proxy; a browser UI on another origin |
 | API key | `MK_API_KEY` | `--api-key` | none | other machines on the LAN: clients then send it as their API key |
@@ -71,7 +71,6 @@ on when the vision projector is found. These are the settings worth knowing:
 | Prefill chunk | `MK_PF_CAP` | (engine) | 2048; the launchers set 1024 above 96k context, `serve.bat` 512 above 240k with your own `MK_KV` | 1024 frees ~0.34 GB of VRAM (2026-10-11) |
 | Thinking off by default | `MK_CHAT_TEMPLATE_KWARGS` | `--chat-template-kwargs` | thinking on | `{"enable_thinking": false}` |
 | Python | `MK_PYTHON` | - | `python3` (Windows: `python`) | a virtual environment with jinja2 |
-| Lean build | `make MKFLAGS=` / `build.ps1 -MkFlags ""` | - | the served build | at most 4 drafts; its compile RAM was last measured before the served build was trimmed (~19 GB on 2026-10-17; the served build now peaks at 18.8 GiB) |
 
 Running `server/mk_server.py` directly instead of a launcher: its own defaults are more conservative (port 18080,
 context 32768, 4 drafts, `--kv auto`, exact reuse off, no images unless `--mmproj`). More than 4 drafts needs the q8_0
@@ -87,7 +86,6 @@ scripts/serve.sh 8081 64000                                     # port 8081, 64k
 MK_KV='K*=6,V*=5' MK_KV_WIN=2048 scripts/serve.sh 8080 262144   # preset D, the model's full context
 MK_HOST=0.0.0.0 MK_ALLOW_HOSTS=gpu-box scripts/serve.sh         # the LAN, reached as http://gpu-box:8080
 MK_CHAT_TEMPLATE_KWARGS='{"enable_thinking": false}' scripts/serve.sh   # thinking off unless a request asks
-MK_DRAFT=4 scripts/serve.sh                                     # a lean build (make MKFLAGS=)
 MK_PARK_MIB=4096 MK_KEEP_WARM_S=0 scripts/serve.sh              # less host memory, no keep-warm
 ```
 
@@ -234,7 +232,7 @@ These variables are read by the launchers themselves and turned into options:
 |---|---|---|---|
 | `MK_MODEL` | `$HOME/models/Qwen3.8-27B-UD-Q4_K_XL.gguf`; Windows `%USERPROFILE%\models\Qwen3.8-27B-UD-Q4_K_XL.gguf` | the GGUF (`-m`). Under WSL2 keep it on the Linux filesystem: files on a Windows drive (`/mnt/c/...`) load several times slower | deb1b62, 2026-10-16 |
 | `MK_HOST` | `127.0.0.1` | listen address (`--host`); `0.0.0.0` for the LAN | deb1b62, 2026-10-16 |
-| `MK_DRAFT` | `7` | drafts per cycle (`-d`); a lean build takes at most 4 | deb1b62, 2026-10-16 |
+| `MK_DRAFT` | `7` | drafts per cycle (`-d`) | deb1b62, 2026-10-16 |
 | `MK_EXACT_REUSE` | on | `0` leaves out `--exact-reuse`; any other value keeps it | deb1b62, 2026-10-16 |
 | `MK_MMPROJ` | serve.sh: the first of `<model folder>/mmproj-BF16.gguf`, `$HOME/models/mmproj-BF16.gguf`, `$HOME/models/mmproj-Qwen3.8-27B-BF16.gguf` that exists; serve.bat: `<model folder>\mmproj-BF16.gguf` | the vision projector (`--mmproj`). Images are on when the file and the vision library (`libqwen38vision.so` / `qwen38vision.dll`) exist. Off: `MK_MMPROJ=` (set and empty) in serve.sh, `MK_MMPROJ=off` in serve.bat | deb1b62, 2026-10-16 |
 | `MK_IMAGE_MAX_TOKENS` | the projector's (4096) | `--image-max-tokens`, with images on | deb1b62, 2026-10-16 |
@@ -273,7 +271,7 @@ limits in [SERVER.md](SERVER.md#limits).
 | `--cors-origin`, `--cors-origins ORIGIN` | `MK_CORS_ORIGINS` | none | web origins (`scheme://host[:port]`) whose pages may call the server (CORS headers, preflights; `*` is refused); pages of other origins get a 403. Clients that are not web pages send no Origin and are not affected | - | 5aab531, 2026-10-19 |
 | `--api-key KEY` | `MK_API_KEY` | none | every request but `/health` and CORS preflights must carry the key (`Authorization: Bearer KEY` or `x-api-key: KEY`); others get a 401 | - | 2026-10-31 |
 | `-c`, `--ctx` | - | `32768` (launchers 120000); with `--agents` `0` (with `--parallel` 32768) | context in tokens, at most the model's full context of 262,144 (more: the engine refuses to start); with `--agents` each slot's, 0 = the most that fits | - | upstream (4d92fd2) |
-| `-d`, `--draft` | - | `4` (launchers 7) | MTP drafts per cycle: 0-7 with the served build, 0-4 with the lean build; more than 4 needs the q8_0 cache | drafts only | upstream (4d92fd2) |
+| `-d`, `--draft` | - | `4` (launchers 7) | MTP drafts per cycle: 0-7; more than 4 needs the q8_0 cache | drafts only | upstream (4d92fd2) |
 | `--draft-vocab` | - | `draft_vocab_32k.bin` in the repo | the draft head's vocabulary (the 32k most frequent tokens; tokens of the current conversation are added) | drafts only | upstream (4d92fd2) |
 | `--mtp FILE` | `MK_MTP` (engine) | the model file's MTP layer | the MTP draft layer from another GGUF of the same model (checked against it) | drafts only | f334fd0, 2026-10-18 |
 | `--no-mtp` | `MK_NO_MTP=1` (engine) | off | no MTP layer: plain decoding at depth 0, no MTP weights or KV slot | drafts only | f334fd0, 2026-10-18 |
@@ -365,10 +363,10 @@ on (even `0`). The measurement and test switches are in [their own section](#mea
 |---|---|---|---|---|---|
 | `MK_POLICY` | empty: the defaults | the draft-depth policy as `key=value,...` ([keys](#mk_policy-keys)); the CLI's `--policy` sets it per job | drafts only | option | 74ae97c, 2026-10-11 |
 | `MK_DRAFT_Q4` | `1` | the draft head reads a Q4_K copy of its lm_head rows, built at load (+90 MiB of VRAM, +0.83 s of load); `0`: lm_head itself. Short greedy replies +2.1% tok/s, long context no measurable change (2026-10-17) | drafts only | served | d40a48b, 2026-10-17 (on by default since 8fee261) |
-| `MK_MTP_Q4` | `1` | the MTP layer's matrices stored wider than Q4_K are re-quantized to Q4_K at load (-107 MiB, greedy +1.5%, 2026-10-12). Builds with more than 4 drafts always do it (IQ4_NL too) and refuse `0` / `ab` ([why](ENGINE.md#the-gguf)). On the lean build `0`: as stored; `ab`: both copies, the policy key `mtpq` picks one | drafts only | served | 8d4c18b, 2026-10-12 |
+| `MK_MTP_Q4` | `1` | the MTP layer's matrices stored wider than Q4_K are re-quantized to Q4_K at load (-107 MiB, greedy +1.5%, 2026-10-12), IQ4_NL too. Always on: `0` (as stored) and `ab` (both copies) were removed with the dp4a-verify build and are refused ([why](ENGINE.md#the-gguf)) | drafts only | served | 8d4c18b, 2026-10-12 |
 | `MK_MTP` | unset | the MTP layer from another GGUF of the same model (as `--mtp`; the CLI's and server's options win) | drafts only | option | f334fd0, 2026-10-18 |
 | `MK_NO_MTP` | unset | `1`: no MTP layer, plain decoding at depth 0 (as `--no-mtp`) | drafts only | option | f334fd0, 2026-10-18 |
-| `MK_MTP_KVC` | `1` (builds with more than 4 drafts) | the MTP catch-up rows before the last 5 compute K / V only; `0`: the full pass. +0.9% at 38k, +0.7% at 101.6k (2026-10-14) | same (identical drafts) | served | 455017a, 2026-10-14 |
+| `MK_MTP_KVC` | `1` | the MTP catch-up rows before the last 5 compute K / V only; `0`: the full pass. +0.9% at 38k, +0.7% at 101.6k (2026-10-14) | same (identical drafts) | served | 455017a, 2026-10-14 |
 
 ### MK_POLICY keys
 
@@ -382,17 +380,15 @@ keeps its distribution). The defaults were tuned on replayed logs and live A/B r
 | `dmin` | `1` | the least drafts for `depth=2` | 74ae97c, 2026-10-11 |
 | `stop` | 0.4 from draft 2 on | stop drafting after a draft when the running product of the MTP's top-1 probabilities falls below this (every draft) | 74ae97c, 2026-10-11 |
 | `drop` | none (the deepest draft: `droplast`) | drop a draft whose running product falls below this (every draft) | 74ae97c, 2026-10-11 |
-| `stopK`, `dropK` | - | the same for draft K alone (K = 1-7 on the served build, 1-4 on the lean build), e.g. `drop4=0.4` | 74ae97c, 2026-10-11 |
-| `droplast` | `0.4` | (builds with more than 4 drafts) drop the deepest draft below this | 408fa84, 2026-10-13 |
-| `g7` | `1` | (builds with more than 4 drafts) the gates for depths above 5: stop after drafts 2-4 below 0.25, drop draft 5 below 0.3, stop after drafts 5-6 below 0.3, never drop the deepest draft. Any explicit `stop` / `drop` key turns it off. +2.0% at 38k and +4.1% at 101.6k greedy, together with `MK_MTP_KVC` (2026-10-14) | 313a6a1, 2026-10-14 |
-| `dctx` | off | (builds with more than 4 drafts) from position N on, at most 4 drafts | f02f8b4, 2026-10-13 |
+| `stopK`, `dropK` | - | the same for draft K alone (K = 1-7), e.g. `drop4=0.4` | 74ae97c, 2026-10-11 |
+| `droplast` | `0.4` | drop the deepest draft below this | 408fa84, 2026-10-13 |
+| `g7` | `1` | the gates for depths above 5: stop after drafts 2-4 below 0.25, drop draft 5 below 0.3, stop after drafts 5-6 below 0.3, never drop the deepest draft. Any explicit `stop` / `drop` key turns it off. +2.0% at 38k and +4.1% at 101.6k greedy, together with `MK_MTP_KVC` (2026-10-14) | 313a6a1, 2026-10-14 |
+| `dctx` | off | from position N on, at most 4 drafts | f02f8b4, 2026-10-13 |
 | `chain` | `1` | what the gates compare: `1` the running product of the top-1 probabilities, `0` each draft's own top-1 probability, `2` with sampled drafts the product of the drafted tokens' own probabilities (drop gates off) | 74ae97c, 2026-10-11 |
 | `h1` | `1` | when sampling, draft by sampling the MTP head (`0`: its top-1 token) | 74ae97c, 2026-10-11 |
-| `mtpq` | - | (lean build) with `MK_MTP_Q4=ab`: `1` the re-quantized MTP layer, `0` the stored one (from the next prefill) | 8d4c18b, 2026-10-12 |
 | `dq4` | - | with the draft head's Q4_K copy (`MK_DRAFT_Q4`, on by default): `1` the copy, `0` lm_head (from the next launch) | d40a48b, 2026-10-17 |
 
-The policy before the gates was `depth=0,drop=0,stop=0,chain=0,h1=0`. On the lean build the defaults are
-`stop` 0.4 after drafts 2-4 and `drop` 0.4 for the 4th draft.
+The policy before the gates was `depth=0,drop=0,stop=0,chain=0,h1=0`.
 
 ### Prefill
 
@@ -428,7 +424,7 @@ These switch single decode kernels back to an earlier form, for A/B measurements
 |---|---|---|---|---|---|
 | `MK_SLOT_RESERVE_MIB` | `1536` | device memory left free when the slots take the most context that fits (`-c 0`), for the prefill and the runtime | - | option | f09ef59, 2026-10-28 |
 | `MK_SLOT_CK` | `2` | DeltaNet checkpoints per slot (where a slot's next prompt resumes when it diverges inside the slot's sequence) | same with exact reuse | option | f09ef59, 2026-10-28 |
-| `MK_PAR_RMAX` | unset | a value up to the build's `MK_MAXT`: batched slot passes of `MK_MAXT` rows instead of the build's `MK_PAR_RMAX` (16). The engine prints which it runs at load (`parallel slots: batched passes of ...`) | same | debug | f09ef59, 2026-10-28 |
+| `MK_PAR_RMAX` | unset | a value up to 8: batched slot passes of 8 rows (the verify pass's width) instead of the build's `MK_PAR_RMAX` (16). The engine prints which it runs at load (`parallel slots: batched passes of ...`) | same | debug | f09ef59, 2026-10-28 |
 
 ### Memory and host store
 
@@ -470,52 +466,47 @@ time to ready from 30.1 / 59.7 s to 8.5 / 12.2 s (2026-10-14). The next three ar
 
 ## Compile-time flags
 
-### The served build and the lean build
+### The served build
 
 `make` and `build.ps1` compile the engine with `MKFLAGS`, whose default is the served configuration:
 
 ```text
-MKFLAGS = -DMK_WV=1 -DMK_MAXT=8 -DMK_WV_Q6F=1 -DMK_K5=1
+MKFLAGS = -DMK_WV_Q6F=1 -DMK_K5=1
 ```
 
-- **Served build** (the default): wide verify (`MK_WV=1`: the verify pass on int8 tensor cores), up to 7 drafts
-  (`MK_MAXT=8`), every Q6_K matrix on the tensor-core path (`MK_WV_Q6F=1`) and the split DeltaNet barrier (`MK_K5=1`).
-  `MK_C1` and `MK_EGRESS` follow `MK_WV`, so they are on too. ptxas peaked at 18.8 GiB of RAM for it on
-  Linux and natively on Windows (2026-10-30; [BUILDING.md](BUILDING.md#requirements)).
-- **Lean build** (`make MKFLAGS=`, `.\build.ps1 -MkFlags ""`): every flag at its default, so the dp4a verify path and
-  at most 4 drafts (run it with `MK_DRAFT=4` / `-d 4`). ptxas needed ~19 GB (2026-10-17, before the served build was
-  trimmed; not measured since).
+The engine always runs wide verify (the verify pass on int8 tensor cores, up to 7 drafts) with the per-chunk ffn_down
+waits and the host egress ([ENGINE.md](ENGINE.md)); the served flags add every Q6_K matrix on the tensor-core path
+(`MK_WV_Q6F=1`) and the split DeltaNet barrier (`MK_K5=1`). ptxas peaked at 18.8 GiB of RAM for it on Linux and
+natively on Windows (2026-10-30; [BUILDING.md](BUILDING.md#requirements)). A running server reports its flags in
+`/props` (`build_info`).
 
-Both builds give the same output at every draft depth, but not the same output as each other: the tensor-core verify
-sums in another order than the dp4a path. When the wide-verify flags were first served (2026-10-13, 72a58cd, 7 drafts)
-they decoded 17.6% faster greedy, 19.5% faster sampled with thinking and 9.2% faster at 101.6k context than the build
-before them at 4 drafts (999fc68). A running server reports its flags in `/props` (`build_info`).
+When wide verify was first served (2026-10-13, 72a58cd, 7 drafts) it decoded 17.6% faster greedy, 19.5% faster sampled
+with thinking and 9.2% faster at 101.6k context than the dp4a-verify build before it at 4 drafts (999fc68). That build
+(`make MKFLAGS=`, `MK_WV=0 MK_MAXT=5`) stayed available until 2026-11-01 and was removed then, with the `MK_WV`,
+`MK_MAXT`, `MK_C1` and `MK_EGRESS` flags: it was neither released nor gated, and it rounded differently from the served
+build.
 
 ### Engine -D flags
 
 | Flag | Default | Served | What it does | Output | Status | Since |
 |---|---|---|---|---|---|---|
-| `MK_WV` | `0` | `1` | wide verify: the main-pass matrix products run as int8 tensor-core GEMMs on a weight layout made at load, at every token count | changes (another summation order; still depth-invariant) | served | 44e319f, 2026-10-13 |
-| `MK_MAXT` | `5` | `8` | most tokens of one verify pass, 1 + drafts: 5 allows 4 drafts, 6-8 (needs `MK_WV=1`) up to 7. Above 5, every ffn_down runs on the tensor-core path | changes | served | 408fa84, 2026-10-13 |
-| `MK_WV_Q6F` | `0` | `1` | every main-layer Q6_K matrix fragment-ordered on the tensor-core path (needs `MK_WV=1`, `MK_MAXT` > 5): ms per cycle -1.5% at 101.6k, -2.6% at 38k (q8_0, 2026-10-14) | changes (KL 0.00119 mixed after it) | served | f30440d, 2026-10-14 |
+| `MK_WV_Q6F` | `0` | `1` | every main-layer Q6_K matrix fragment-ordered on the tensor-core path: ms per cycle -1.5% at 101.6k, -2.6% at 38k (q8_0, 2026-10-14) | changes (KL 0.00119 mixed after it) | served | f30440d, 2026-10-14 |
 | `MK_K5` | `0` | `1` | the DeltaNet projection -> core grid barrier becomes a split barrier: the 48 heads go to the first 48 blocks that finish, which load their state and replay accepted drafts before they wait. Needs `MK_GSYNC=0`. +1.11% at 38k, +0.75% at 101.6k (2026-10-17) | same | served | 4f2d6f9, 2026-10-17 |
-| `MK_C1` | `MK_WV` | `1` | per-chunk waits instead of a grid barrier between the ffn gate / up and ffn_down phases (needs `MK_WV`): +0.41% at 38k, +0.59% at 101.6k, +0.44% short (2026-10-20) | same | served | e7fec18, 2026-10-20 (on by default since c4210da) |
-| `MK_EGRESS` | `MK_WV` | `1` | each launch's control block reaches the host through mapped memory, barrier counts carry across launches, draft-vocabulary uploads run asynchronously (+2 MiB): +0.74..+1.34% on Linux over two holds, +0.8..+1.0% native Windows (2026-10-20) | same | served | 816aced, 2026-10-20 (on by default since 7322fbd) |
 | `MK_K7` | `1` | `1` | the DeltaNet state laid out so that each warp access is contiguous: the core phase 26.7 -> 18.3 us per call (2026-10-15); `0`: upstream's layout | same | served | 38d0c26, 2026-10-15 |
 | `MK_K6_LD` | `1` | `1` | Q8_0 weight tiles loaded 16 bytes at a time plus one shuffle: the attention projection of the Q8_0-v layers 96 -> 84 us (2026-10-15) | same | served | 38d0c26, 2026-10-15 |
-| `MK_W48` | `1` | `1` | (`MK_MAXT` > 5) decode attention for 6-8 tokens in one pass over all 48 query rows instead of two head-group passes: 101.6k at 7 drafts 41.2 -> 38.0 ms per cycle on q8_0 (2026-10-13) | same | served | 9dede7f, 2026-10-13 |
+| `MK_W48` | `1` | `1` | decode attention for 6-8 tokens in one pass over all 48 query rows instead of two head-group passes: 101.6k at 7 drafts 41.2 -> 38.0 ms per cycle on q8_0 (2026-10-13) | same | served | 9dede7f, 2026-10-13 |
 | `MK_W48S` | `1` | `1` | the one-pass attention keeps its per-call scalars in shared memory (fewer register spills) | same | served | 6cc40a7, 2026-10-14 |
-| `MK_MTP_KVC` | `1` | `1` | compiles the K / V-only MTP catch-up rows (`MK_MTP_KVC` env, builds with `MK_WV` and `MK_MAXT` > 5) | same | served | 455017a, 2026-10-14 |
+| `MK_MTP_KVC` | `1` | `1` | compiles the K / V-only MTP catch-up rows (`MK_MTP_KVC` env) | same | served | 455017a, 2026-10-14 |
 | `MK_DA_ROUTE` | `1` | `1` | decode attention chunks of one K / V tile (contexts up to 640) on the simpler kernel: short-context decode +0.4-0.5% (2026-10-12) | same | served | c482b97, 2026-10-12 |
 | `MK_DA_Q4` | `1` | `1` | low-bit `MK_KV` layers on the pipelined decode attention (q4 budgets were 9.8-18.4% faster at 101.6k than on the earlier kernel, 2026-10-12) | same | served | 6287651, 2026-10-12 |
 | `MK_FD_NOINL` | `0x1c` | `0x1c` | bit mask of the token counts whose ffn_down rows run out of line (T 2-4); inline they spilled and the phase ran 0.17-0.25 ms per pass slower (2026-10-12) | same | served | baf2d52, 2026-10-12 |
 | `MK_NSEQ` | `4` | `4` | the most parallel slots the engine opens (`--agents` 1 to this): the lanes of a batched launch, each with its own views of the row buffers | same | served | f09ef59, 2026-10-28 |
-| `MK_PAR_RMAX` | `16` | `16` | rows of a batched slot pass in builds with `MK_WV`, `MK_EGRESS` and more than 4 drafts (16 beat 24 at 3-4 slots: 345 vs 322 tok/s at 4, temperature 0.6, 2026-10-28); other builds batch `MK_MAXT` rows. The wide pass also needs every main matrix but ffn gate / up in the wide-verify layout and enough SMs | same | served | f09ef59, 2026-10-28 |
+| `MK_PAR_RMAX` | `16` | `16` | rows of a batched slot pass (16 beat 24 at 3-4 slots: 345 vs 322 tok/s at 4, temperature 0.6, 2026-10-28); with `MK_WV_OUT` or a value up to 8 the passes are 8 rows. The wide pass also needs every main matrix but ffn gate / up in the wide-verify layout and enough SMs | same | served | f09ef59, 2026-10-28 |
 | `MK_K2_TB` | `8` | `8` | tokens per batch of the split-K residual combine (8 beat 4 by 0.5-0.8 us per call at 38k, 2026-10-15) | same | option | e374f27, 2026-10-15 |
 | `MK_K6_DEF`, `MK_K8_DEF`, `MK_K8_NT` | `4`, `6`, `4` | same | the defaults of the `MK_K6`, `MK_K8`, `MK_K8_NT` environment variables | - | option | 38d0c26, 2026-10-15 |
 | `MK_GSYNC` | `0` | `0` | the grid barrier's form: `0` upstream's; `1`-`3` flag-broadcast and relaxed-polling variants, measured slower (0.61-0.94 us against 0.51-0.55 us per barrier, 2026-10-15). `MK_K5` needs `0`; the barrier benchmark (`MK_GSB`) runs every form in any build | same | slower | e374f27, 2026-10-15 |
 | `MK_WV_FMK` | `1` | `1` | Q4_K / Q5_K main-pass matrices fragment-ordered; `0`: tile-major whole blocks (decode -5.8% at 0 drafts, no gain at 4, 2026-10-13) | not checked | slower | 408fa84, 2026-10-13 |
-| `MK_WV_OUT` | `0` | `0` | (`MK_MAXT` > 5) the out / ssm_out matrices of the offset types (Q6_K, Q3_K, IQ3_S) on the tensor-core path at every T: +1.4% per cycle at 38k, no change at 101.6k (2026-10-14) | changes (KL 0.00116 mixed) | slower | 911d288, 2026-10-14 |
+| `MK_WV_OUT` | `0` | `0` | the out / ssm_out matrices of the offset types (Q6_K, Q3_K, IQ3_S) on the tensor-core path at every T: +1.4% per cycle at 38k, no change at 101.6k (2026-10-14) | changes (KL 0.00116 mixed) | slower | 911d288, 2026-10-14 |
 | `MK_AQ_EARLY` | `0` | `0` | low-bit decode attention issues its K / V copies at the top of each interval: 2% slower per cycle at 101.6k (2026-10-13) | same | slower | 5532c21, 2026-10-13 |
 | `MK_XP_SM` | `0` | `0` | low-bit tile expansion: rows per tile done by the softmax warps (`0`: all 12 other warps); no speed difference (2026-10-13) | same | option | 9deb9c0, 2026-10-13 |
 | `MK_PF_FRAG_G` | `-1` | `-1` | prefill GEMMs: the MMA group of a stage after which the next stage's scales and fragments are made (`-1`: the kernel's own) | not checked | option | a742642, 2026-10-14 |
@@ -527,8 +518,7 @@ before them at 4 drafts (999fc68). A running server reports its flags in `/props
 | `MK_KV_EMU` | `0` | `0` | accuracy build: `MK_KV_EMU_SPEC` rounds chosen KV layers to a lower-bit grid inside the q8_0 layout, so formats can be scored per layer before kernels exist (CLI `--kld-specs`) | changes | debug | 8e8457b, 2026-10-11 |
 | `MKV_NO_VIT` | unset | unset on x86-64 | vision library without the AVX2 / FMA encoder (libmtmd only); the Makefile sets it on other CPUs | changes (image rows) | option | 1c154db, 2026-10-16 |
 
-`MK_MAXT` must be 5, or 6-8 with `MK_WV=1`; `MK_WV_Q6F` needs `MK_WV=1` and `MK_MAXT` > 5; `MK_K5` needs `MK_GSYNC=0`;
-`MK_C1` needs `MK_WV`. A combination outside these rules stops the compile with an `#error`.
+`MK_K5` needs `MK_GSYNC=0`; the compile stops with an `#error` otherwise.
 
 ### Make and build.ps1 variables
 
@@ -574,7 +564,7 @@ Generation job (the command line's job, and the defaults of every `--batch` line
 | `-p TEXT`, `-f FILE` | a prime-number coding prompt | the prompt (wrapped in the chat template unless `--raw`) | upstream (4d92fd2) |
 | `--prompt-ids FILE` | - | the prompt as whitespace-separated token ids (checked against the vocabulary) | upstream (4d92fd2) |
 | `-n N` | `256` | tokens to generate | upstream (4d92fd2) |
-| `-d N` | `2` | drafts per cycle: 0-7 on the served build (more than 4 needs `--kv q8`), 0-4 on the lean build | upstream (4d92fd2) |
+| `-d N` | `2` | drafts per cycle: 0-7 (more than 4 needs `--kv q8`) | upstream (4d92fd2) |
 | `--raw` | off | the prompt as given, without the chat template | upstream (4d92fd2) |
 | `--think [xhigh\|medium\|low]` | off; `xhigh` when given without a value | thinking on; `xhigh` and `low` add the template's reasoning-effort system line, `medium` adds none | upstream (4d92fd2) |
 | `--turn2 TEXT`, `--turn2-file FILE` | - | a second user turn appended after the first reply (the follow-up path) | upstream (4d92fd2) |
@@ -682,10 +672,10 @@ code:
 |---|---|
 | `MK_BUILD_COMMIT`, `MK_BUILD_FLAGS` | written by the build into `build/mk_build_info.h` (`build_win\` on Windows): the commit (with `-dirty` for local changes) and `MKFLAGS`. The server reports them as `/props` `build_info` |
 | `MK_MAX_GRID` | constant 128: the most blocks of the persistent kernel; a GPU with more SMs runs 128 |
-| `MK_BAR_LT`, `MK_EPOCH`, `MK_C1E` | helper macros of the barrier counters (`MK_EGRESS`, `MK_C1`) |
+| `MK_BAR_LT`, `MK_EPOCH`, `MK_C1E` | helper macros of the barrier counters that run on across launches (egress, C1) |
 | `MK_GLU_MIX_PAIRS`, `MK_GLU_ATTR`, `MK_GLU_GO` | macro lists of the fused gate / up weight-type pairs |
 | `MK_STR`, `MK_STR2` | stringify helpers |
-| `MTP_KVC` | derived: `MK_MTP_KVC` and `MK_MAXT` > 5 and `MK_WV` and not `MK_KV_EMU` |
+| `MTP_KVC` | derived: `MK_MTP_KVC` and not `MK_KV_EMU` |
 | `MK_STATE`, `MK_LOAD_`, `MK_BENCH` | prefixes in the state-file key's list of ignored variables (`MK_STATE_WARM_MS`, the `MK_LOAD_*` family). No variable named `MK_BENCH...` is read anywhere |
 | `environ` | a Windows compatibility name (`compat_win32.h`) |
 | `_CRT_SECURE_NO_WARNINGS`, `_CRT_NONSTDC_NO_WARNINGS` | MSVC warning switches in `build.ps1` |

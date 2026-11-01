@@ -13,7 +13,7 @@ REM   MK_HOST             listen address (default 127.0.0.1; 0.0.0.0 for other m
 REM   MK_ALLOW_HOSTS      host names clients use besides localhost, IP addresses and MK_HOST (comma-separated; * = any)
 REM   MK_CORS_ORIGINS     web origins whose pages may call the server (comma-separated; see scripts/serve.sh)
 REM   MK_API_KEY          require this key on every request but /health (clients send it as their API key); default none
-REM   MK_DRAFT            MTP drafts per cycle (default 7; a build.ps1 -MkFlags "" build takes at most 4)
+REM   MK_DRAFT            MTP drafts per cycle (default 7)
 REM   MK_EXACT_REUSE=0    turn exact reuse off (see scripts/serve.sh)
 REM   MK_SIDE_MAX         side requests up to this many prompt tokens (default 8192; 0 = off; see scripts/serve.sh)
 REM   MK_PARK_MIB         host memory for parked conversations (default 8192 MiB; 0 = off; see scripts/serve.sh)

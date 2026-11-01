@@ -57,7 +57,7 @@ python3 server/mk_server.py -m Qwen3.8-27B-UD-Q4_K_XL.gguf -c 120000 --kv q8 -d 
 | port | 8080 (first argument) | 18080 (`--port`) |
 | context | 120,000 tokens (second argument) | 32,768 (`-c`) |
 | KV cache | q8_0; a low-bit preset with `MK_KV` / `MK_KV_WIN`; `serve.bat` preset F above 240k unless `MK_KV` is set | `--kv auto`: fp16 when it fits, else q8_0 |
-| MTP drafts per cycle | 7 (`MK_DRAFT`; a lean build takes at most 4) | 4 (`-d`) |
+| MTP drafts per cycle | 7 (`MK_DRAFT`) | 4 (`-d`) |
 | exact reuse | on (`MK_EXACT_REUSE=0` turns it off) | off (`--exact-reuse` turns it on) |
 | prefill chunk | 1,024 tokens above 96k context, else 2,048 (`MK_PF_CAP`); `serve.bat` 512 above 240k with your own `MK_KV` | 2,048 |
 | images | on when the mmproj file and the vision library are found | `--mmproj FILE` |
