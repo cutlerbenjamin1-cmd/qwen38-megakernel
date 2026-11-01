@@ -145,8 +145,10 @@ around the row reader). Q8_0 `ssm_alpha` /
 `ssm_beta` (UD) stay int8 with their block scales and the kernels apply the norm weight on the fly; other types are
 dequantized to F32 at load and folded with the norm weight into fp32 rows (the same values; `MK_AB_F32=1` forces this
 path). The exact re-encodes keep every weight's value (both formats store a small integer times the same fp16 `d` and an
-integer sub-block scale), and the loader checks each re-encoded or re-laid-out row bit for bit against ggml's
-dequantization of the original. A file with any other type is refused, naming the first tensor that does not match.
+integer sub-block scale), and the loader checks each re-encoded row (to Q6_K or Q8_0) and each native Q3_K / IQ3_S row
+bit for bit against ggml's dequantization of the original. The other re-layouts (Q6_K, Q8_0, IQ4_XS, IQ4_NL, the
+wide-verify tiles) move bytes without a check at load; `MK_WDIGEST=1` hashes the loaded weights, to compare two
+loaders. A file with any other type is refused, naming the first tensor that does not match.
 Which files that covers: [Model files](#model-files).
 
 The engine reads the file with its own parser (`gguf.h`, mmap), independently of libllama's loader (which reads only
