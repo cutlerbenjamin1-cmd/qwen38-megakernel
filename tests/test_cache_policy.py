@@ -17,7 +17,7 @@ THINK = base.TEMPLATE.replace("assistant\n{% endif %}",  # (enable_thinking: the
 
 
 class SideRuleTests(base._HttpCase):
-    """S1: with parking on, a request without tools and without an earlier assistant reply is a side request whatever
+    """with parking on, a request without tools and without an earlier assistant reply is a side request whatever
     its max_tokens; one with tools still needs 0 < max_tokens <= SIDE_REPLY_MAX"""
 
     LONG = base.HostCacheTests.LONG
@@ -36,8 +36,8 @@ class SideRuleTests(base._HttpCase):
                 self.chat(http_, msgs, **kw)
         return srv, self.quiet(run)
 
-    # request shapes of the 1021a harness captures (notes/hpol/survey.md), shortened to the test tokenizer (streamed or
-    # not makes no difference to the rule: sent unstreamed here)
+    # request shapes captured from the agent harnesses, shortened to the test tokenizer (streamed or not makes no
+    # difference to the rule: sent unstreamed here)
     ONE_SHOTS = {
         "goose session name (no max_tokens)": ([{"role": "system", "content": "Generate a short title."},
                                                 {"role": "user", "content": "---BEGIN USER MESSAGES--- fix it"}], {}),
@@ -70,7 +70,7 @@ class SideRuleTests(base._HttpCase):
             srv, log = self.run_after_long(eng, ([{"role": "user", "content": "new task"}], {"tools": TOOLS, **kw}))
             self.assertEqual([o[0] for o in eng.ops], ["park"], (kw, log))
             self.assertIn("parked the cached conversation (a new conversation)", log)
-        eng = side._SideEngine(["a", "b"])  # (with tools and a bounded reply: a side request, as before)
+        eng = side._SideEngine(["a", "b"])  # (with tools and a bounded reply: a side request)
         srv, log = self.run_after_long(eng, ([{"role": "user", "content": "new task"}],
                                              {"tools": TOOLS, "max_tokens": 8}))
         self.assertEqual([o[0] for o in eng.ops], ["side_begin", "park", "side_end_park"], log)
@@ -104,7 +104,7 @@ class SideRuleTests(base._HttpCase):
             log = self.quiet(lambda: (self.chat(http_, [{"role": "user", "content": first[0]}], tools=first[1]),
                                       self.chat(http_, c1, tools=tools), self.chat(http_, c2, tools=tools)))
             self.assertEqual([o[0] for o in eng.ops], want, (first[1] is not None, log))
-        eng = base._StoreEngine(["a", "b"])  # (parking off: as before, a later turn is no side request)
+        eng = base._StoreEngine(["a", "b"])  # (parking off: a later turn is no side request)
         srv, http_ = self.serve_store(eng, park_mib=0)
         self.quiet(lambda: (self.chat(http_, [{"role": "user", "content": self.LONG}], tools=TOOLS),
                             self.chat(http_, c2)))
@@ -116,7 +116,7 @@ class SideRuleTests(base._HttpCase):
         srv, log = self.run_after_long(eng, (msgs, kw), side_max=0)  # (--side-max 0: no side requests, a park)
         self.assertEqual([o[0] for o in eng.ops], ["park"], log)
         eng = side._SideEngine(["a", "b"])
-        srv, http_ = self.serve_store(eng, park_mib=0)  # (--park-mib 0: every short first turn, as before)
+        srv, http_ = self.serve_store(eng, park_mib=0)  # (--park-mib 0: every short first turn is a side request)
         self.quiet(lambda: (self.chat(http_, [{"role": "user", "content": self.LONG}], tools=TOOLS),
                             self.chat(http_, [{"role": "user", "content": "a new task"}], tools=TOOLS)))
         self.assertEqual(self.side_ops(eng), ["side_begin", "side_end"])
@@ -140,7 +140,7 @@ class SideRuleTests(base._HttpCase):
 
 
 class EditedHistoryTests(base._HttpCase):
-    """S5: a request that repeats the cached conversation up to its first reply and diverges later continues that
+    """a request that repeats the cached conversation up to its first reply and diverges later continues that
     conversation with edited history: nothing is parked; a new conversation (another first message) is parked"""
 
     chat, quiet = base.HostCacheTests.chat, base.HostCacheTests.quiet
@@ -223,7 +223,7 @@ class EditedHistoryTests(base._HttpCase):
 
 
 class DebrisTests(base._HttpCase):
-    """S3: a summary request (no tools) that replaces a conversation with tools parks it with low priority, and the
+    """a summary request (no tools) that replaces a conversation with tools parks it with low priority, and the
     summary's own conversation is low too when the compacted conversation replaces it; low entries go before real
     parked conversations"""
 

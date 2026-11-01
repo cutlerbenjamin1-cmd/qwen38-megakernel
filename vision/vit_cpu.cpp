@@ -231,7 +231,7 @@ inline float hmax(__m256 v) {
 
 // e^x of one float, bit for bit glibc's expf (2.27 and later: sysdeps/ieee754/flt-32/e_expf.c from Arm's
 // optimized-routines, computed as its x86-64 FMA variant does; checked against glibc 2.39 on all 2^32 inputs). The C
-// libraries' expf differ in the last bit (glibc vs Microsoft's UCRT made the g++ and MSVC builds' rows differ by ~1e-5),
+// libraries' expf differ in the last bit (glibc vs Microsoft's UCRT would make the g++ and MSVC builds' rows differ by ~1e-5),
 // so the encoder calls no libm function whose result is not exactly specified (sqrt is); this one keeps the g++ rows.
 inline double fma_sd(double a, double b, double c) {
     return _mm_cvtsd_f64(_mm_fmadd_sd(_mm_set_sd(a), _mm_set_sd(b), _mm_set_sd(c)));

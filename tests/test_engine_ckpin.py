@@ -1,4 +1,4 @@
-"""Tests of server/mk_server.py's pinned checkpoints without a GPU (TODO #19 S2): the end of a prompt's system message
+"""Tests of server/mk_server.py's pinned checkpoints without a GPU: the end of a prompt's system message
 (and where a new session left the cached one inside it) is pinned (Engine.ck_pin), so a new session of the same client
 resumes there although the pool thinned the conversation's older checkpoints or the conversation was parked; a parked
 conversation restored only for its system prompt stays parked. Fake engines and the test server come from

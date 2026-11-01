@@ -1,27 +1,26 @@
 #!/usr/bin/env python3
 """Does keying the sampling random numbers by position bias the engine's speculative sampling? A CPU replica of the
-sampled decode loop of qwen38_mk.cu: sample_targets (per-token rule with sampled drafts), sample_targets_blk (policy
-blk=1), main_control, the MTP draft chain with the confidence gates (the default gates at 7 drafts; chain=1 or chain=2)
-and draft_sample, with the device's counter-based urand (splitmix64) and its keys:
+sampled decode loop of qwen38_mk.cu: sample_targets (per-token rule with sampled drafts), main_control, the MTP draft
+chain with the confidence gates (the default gates at 7 drafts; chain=1 or chain=2) and draft_sample, plus a policy
+the engine does not have, blk=1 (block verification of sampled drafts), with the device's counter-based urand
+(splitmix64) and its keys:
   acceptance of row i (position n + i): urand(seed, 2 (n + i)); residual / bonus draw: urand(seed, 2 (n + i) + 1);
   blk eta_i: urand(seed, 2 (n + i - 1)); a draft at absolute position x: urand(seed ^ 0xD1B54A32D192ED03, x).
-The "fix" configurations salt the blk etas and the drafts with the launch's start position (launch_salt in
-qwen38_mk.cu, the keys blk=1 uses since 2026-10-17); "tok_chain2_fix" is chain=2 without drop gates (the engine's
-behaviour since then).
+The "fix" configurations salt the blk etas and the drafts with the launch's start position (mix); "tok_chain2_fix" is
+chain=2 without drop gates (the engine's behaviour).
 
 Target p(x_t | x_(t-1)) and draft q(x_t | x_(t-1), depth in the chain) are synthetic Markov kernels over V tokens, so
 the exact law of the emitted sequence is known. Tests (chi-square goodness of fit, valid for any exact sampler):
   law:     per position t, the counts of x_t given x_(t-1) = a against p(. | a), summed over a.
   classes: (per-token rule only, where the class is fixed by the random numbers before t) the same for the positions
-           whose verified draft had been drafted before (a re-draft: today's keys reuse its number), for first drafts
+           whose verified draft had been drafted before (a re-draft: position keys reuse its number), for first drafts
            and for rows without a draft.
 Results on 2026-10-17 (200k seeds per configuration; 1M for blk_pos / blk_fix / tok_chain2_fix): the per-token rule
 with position keys (tok_pos, the default) fits everywhere, the re-draft class included (396k positions, p = 0.28);
 blk=1 with position keys is biased (blk_pos_ng, no gates: p = 4e-10; with the default gates the effect is below what
 1M seeds resolve) and fits with the salted keys; chain=2 with a drop gate is biased (tok_chain2: p = 2e-7;
 tok_chain2_d1: total variation up to 0.07) and fits without drop gates.
-Policy blk=1 (sample_targets_blk, launch_salt) was removed from the engine on 2026-10-28 (within noise); the blk
-configurations stay here as the record of this analysis.
+The blk configurations are the record of this analysis.
 usage: spec_rng_sim.py [--seeds N] [--configs a,b,..] [--L 12] [--V 8]   (needs scipy; ~20 s per 100k seeds and configuration)"""
 import argparse
 import math
@@ -233,14 +232,14 @@ def gof(counts, probs):
 
 
 CONFIGS = {
-    "tok_pos": dict(blk=0, fix=0, chain2=0, gates=1),    # default policy, today's keys
+    "tok_pos": dict(blk=0, fix=0, chain2=0, gates=1),    # default policy, position keys
     "tok_fix": dict(blk=0, fix=1, chain2=0, gates=1),    # default policy, launch-salted keys
-    "blk_pos": dict(blk=1, fix=0, chain2=0, gates=1),    # policy blk=1, today's keys
+    "blk_pos": dict(blk=1, fix=0, chain2=0, gates=1),    # policy blk=1, position keys
     "blk_fix": dict(blk=1, fix=1, chain2=0, gates=1),    # policy blk=1, launch-salted keys (the fix)
-    "blk_pos_ng": dict(blk=1, fix=0, chain2=0, gates=0),  # blk=1 without gates (fixed depth 7), today's keys
+    "blk_pos_ng": dict(blk=1, fix=0, chain2=0, gates=0),  # blk=1 without gates (fixed depth 7), position keys
     "blk_fix_ng": dict(blk=1, fix=1, chain2=0, gates=0),  # blk=1 without gates, the fix
     "tok_chain2": dict(blk=0, fix=0, chain2=1, gates=1),  # policy chain=2 (drop gate on the draft's own q')
-    "tok_chain2_fix": dict(blk=0, fix=0, chain2=1, gates=3),  # chain=2 with the drop gates off (the engine's fix)
+    "tok_chain2_fix": dict(blk=0, fix=0, chain2=1, gates=3),  # chain=2 with the drop gates off (the engine's policy)
     "tok_d1": dict(blk=0, fix=0, chain2=0, gates=2),      # no stops, drop draft 1 below 0.5 (chain=1: top-1 q')
     "tok_chain2_d1": dict(blk=0, fix=0, chain2=1, gates=2),  # the same with chain=2 (the draft's own q')
 }

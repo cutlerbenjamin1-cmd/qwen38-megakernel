@@ -1,4 +1,4 @@
-"""API completeness of server/mk_server.py without a GPU (round 1019b, review chunk 3's C3-7 and gaps G1, G2, G4-G7):
+"""API completeness of server/mk_server.py without a GPU:
 tool calls whose values hold tool-call markup, tool-call arguments streamed as they are generated (OpenAI and Anthropic
 shapes, the official SDKs' stream accumulators when installed), Anthropic typed tools and unknown blocks, the context
 overflow error, reasoning format and template defaults, llama-server's extra request fields, chunked request bodies."""
@@ -38,7 +38,7 @@ def _accumulate(deltas):
 
 
 class ToolCallParserTests(unittest.TestCase):
-    """C3-7: a value runs to its </parameter>; the incremental parser's decisions do not depend on the pieces"""
+    """a value runs to its </parameter>; the incremental parser's decisions do not depend on the pieces"""
 
     @classmethod
     def setUpClass(cls) -> None:
@@ -46,7 +46,7 @@ class ToolCallParserTests(unittest.TestCase):
 
     def test_a_value_may_hold_tool_call_markup(self) -> None:
         mk = self.mk
-        # (review chunk 3's probe input: was no call, the markup returned as text)
+        # (a value that holds a <tool_call> tag: the call is parsed, nothing is left as text)
         probe = "<tool_call>\n<function=f>\n<parameter=x>\n<tool_call>\n</parameter>\n</function>\n</tool_call>"
         calls = mk.parse_tool_calls(probe, [])
         self.assertEqual([(c["function"]["name"], json.loads(c["function"]["arguments"])) for c in calls], [("f", {"x": "<tool_call>"})])
@@ -114,7 +114,7 @@ class ToolCallParserTests(unittest.TestCase):
 
 
 class ToolCallStreamTests(_HttpCase):
-    """G2: the stream's tool calls as they are generated, == the non-streamed reply's"""
+    """the stream's tool calls as they are generated, == the non-streamed reply's"""
 
     def _openai(self, pieces, body):
         _, http_ = self.serve(_ScriptEngine(pieces))
@@ -195,7 +195,7 @@ class ToolCallStreamTests(_HttpCase):
 
 
 class AnthropicBlockTests(_HttpCase):
-    """G1: Anthropic typed tools become functions, unknown content blocks are skipped (as llama-server), documents with
+    """Anthropic typed tools become functions, unknown content blocks are skipped (as llama-server), documents with
     a text source become text; each kind is a one-time console warning"""
 
     def test_typed_tools(self) -> None:
@@ -247,7 +247,7 @@ class AnthropicBlockTests(_HttpCase):
             "anthropic-block-web_search_tool_result", "anthropic-doc-base64"])
 
     def test_system_messages_inside_the_conversation(self) -> None:
-        # (Claude Code 2.1 sends its reminders as a system message after the first user message: was a 400)
+        # (Claude Code 2.1 sends its reminders as a system message after the first user message)
         body = {"system": [{"type": "text", "text": "S"}], "messages": [
             {"role": "user", "content": [{"type": "text", "text": "a"}, {"type": "text", "text": "b"}]},
             {"role": "system", "content": [{"type": "text", "text": "reminder", "cache_control": {"type": "ephemeral"}}]},
@@ -302,7 +302,7 @@ def _post(port, path, body, headers=None):
 
 
 class ContextOverflowTests(_HttpCase):
-    """G5: a prompt longer than the context: llama-server's exceed_context_size_error with n_prompt_tokens / n_ctx, and
+    """a prompt longer than the context: llama-server's exceed_context_size_error with n_prompt_tokens / n_ctx, and
     Anthropic's 'prompt is too long' on /v1/messages; streams too (the error comes before the stream starts)"""
 
     def test_openai_and_anthropic_shapes(self) -> None:
@@ -326,7 +326,7 @@ class ContextOverflowTests(_HttpCase):
         self.assertEqual(status, 200, data)
         status, data = _post(http_.port, "/v1/chat/completions", {"messages": [{"role": "user", "content": fit[0]["content"] + "x"}]})
         self.assertEqual(json.loads(data)["error"]["n_prompt_tokens"], 84)
-        # other 400s keep their type, now with llama-server's code field
+        # other 400s keep their type, with llama-server's code field
         status, data = _post(http_.port, "/v1/chat/completions", {"messages": msgs, "n": 2})
         self.assertEqual((status, json.loads(data)["error"]["code"], json.loads(data)["error"]["type"]), (400, 400, "invalid_request_error"))
 
@@ -349,7 +349,7 @@ THINK = TEMPLATE.replace("assistant\n{% endif %}", "assistant\n{% if enable_thin
 
 
 class ReasoningFormatTests(_HttpCase):
-    """G6: --reasoning-format / reasoning_format (auto = deepseek = what the server always did), --chat-template-kwargs
+    """--reasoning-format / reasoning_format (auto = deepseek, the default), --chat-template-kwargs
     defaults under the request's"""
 
     PIECES = ["Hmm", ".</think>", "\n\nFour"]
@@ -441,7 +441,7 @@ class _ProgressEngine(_ScriptEngine):
 
 
 class RequestFieldTests(_HttpCase):
-    """G7: llama-server's return_progress, timings_per_token and t_max_predict_ms; its other fields accepted when
+    """llama-server's return_progress, timings_per_token and t_max_predict_ms; its other fields accepted when
     harmless, a 400 when they would change the output"""
 
     def _stream(self, http_, body):
@@ -516,7 +516,7 @@ class RequestFieldTests(_HttpCase):
 
 
 class ChunkedBodyTests(_HttpCase):
-    """G4: Transfer-Encoding: chunked request bodies (Node fetch with a stream body, Go, proxies), decoded into a buffer
+    """Transfer-Encoding: chunked request bodies (Node fetch with a stream body, Go, proxies), decoded into a buffer
     capped at MK_MAX_BODY_MB; malformed framing is a 400 and the connection closes"""
 
     HEAD = b"POST /v1/chat/completions HTTP/1.1\r\nHost: x\r\nContent-Type: application/json\r\n"

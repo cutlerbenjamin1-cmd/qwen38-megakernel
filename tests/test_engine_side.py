@@ -1,4 +1,4 @@
-"""Tests of server/mk_server.py's side conversations without a GPU (TODO #18): a side request's own conversation is parked
+"""Tests of server/mk_server.py's side conversations without a GPU: a side request's own conversation is parked
 after its reply (Engine.side_end_park), a later bounded request that continues it runs beside the live conversation again
 (Engine.side_unpark), and those entries are evicted before any other parked conversation. Fake engines and the test
 server come from test_mk_server.py."""

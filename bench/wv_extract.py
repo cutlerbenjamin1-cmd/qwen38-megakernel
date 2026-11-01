@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Copy today's dp4a GEMV device code verbatim from ../qwen38_mk.cu into wv_ref.cuh for wvgemm_bench.cu.
+"""Copy the engine's dp4a GEMV device code verbatim from ../qwen38_mk.cu into wv_ref.cuh for wvgemm_bench.cu.
 
 Segments are located by anchors, not line numbers, so the copy follows edits of the engine source. The bench's
 exactness and speed references are therefore the engine's own rows_* / accR code, not a re-typed replica.

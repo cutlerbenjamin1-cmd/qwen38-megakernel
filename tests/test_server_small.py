@@ -1,6 +1,7 @@
-"""Tests of server/mk_server.py's small fixes without a GPU: an exclusive listening port (Windows), a console line per
-token-count request, no decode rate for a one-token reply, Codex's reasoning efforts max / ultra, and Qwen3's soft
-switches (/no_think, /think, an empty <think></think>). Fake engines and the test server come from test_mk_server.py."""
+"""Tests of server/mk_server.py's smaller behaviours without a GPU: an exclusive listening port (Windows), a console
+line per token-count request, no decode rate for a one-token reply, Codex's reasoning efforts max / ultra, and Qwen3's
+soft switches (/no_think, /think, an empty <think></think>). Fake engines and the test server come from
+test_mk_server.py."""
 import http.client
 import http.server
 import json
@@ -102,7 +103,7 @@ class ThinkingTests(base._HttpCase):
         want = srv.render({"messages": msgs, "reasoning_effort": "xhigh"})[0]
         for eff in ("max", "ultra"):
             self.assertEqual(srv.render({"messages": msgs, "reasoning_effort": eff})[0], want, eff)
-        with self.assertRaises(self.mk.BadRequest):  # (other unknown values: the template's own error, as before)
+        with self.assertRaises(self.mk.BadRequest):  # (other unknown values: the template's own error)
             srv.render({"messages": msgs, "reasoning_effort": "extreme"})
 
     def test_soft_switches_set_the_requests_thinking(self) -> None:

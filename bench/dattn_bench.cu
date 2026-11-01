@@ -242,7 +242,7 @@ __device__ __forceinline__ void kv_stage(uint8_t * dst, const int8_t * Kq, const
 // ATT_BUCKET, and the host never lets one launch's rows straddle such a boundary (att_cap_T). So the
 // chunk boundaries below any query position p (and the float summation order of its attention) depend
 // on p alone, not on how many tokens the cycle verifies: greedy output is independent of the draft depth.
-// Same tiles per item as the previous ceil(L / 20) split for L > 1280; one tile per item up to 640.
+// Same tiles per item as a ceil(L / 20) split for L > 1280; one tile per item up to 640.
 __device__ __forceinline__ void attn_dims(int L_ctx, int & nch, int & cs) {
     cs = ATP * max(1, (L_ctx + ATT_BUCKET - 1) / ATT_BUCKET);
     nch = max(1, (L_ctx + cs - 1) / cs);
@@ -340,7 +340,7 @@ __device__ __forceinline__ void attn_core_t(const LayerW & W, int slot, int n) {
         float2 rc[2][8];
         load8(W.qn + lane * 8, qw);
         // Unconditional loads (rows >= R and lanes >= 8 load valid, unused data): conditionally assigned arrays
-        // were carried across the item loop in local memory (~1.5 KB of mk_cycle's stack frame, which the driver
+        // would be carried across the item loop in local memory (~1.5 KB of mk_cycle's stack frame, which the driver
         // reserves for all 1,536 thread slots of every SM).
 #pragma unroll
         for (int k2 = 0; k2 < 2; k2++) {
@@ -355,7 +355,7 @@ __device__ __forceinline__ void attn_core_t(const LayerW & W, int slot, int n) {
         for (int k2 = 0; k2 < 2; k2++) {
             const int r = warp + 16 * k2;
             if (r < R) {
-                // a copy, not a pointer into qv: a pointer made ptxas keep qv / qw / rc in local memory (~2 KB of
+                // a copy, not a pointer into qv: a pointer makes ptxas keep qv / qw / rc in local memory (~2 KB of
                 // mk_cycle's 2.8 KB stack frame over the 10 attn_core_t instances, reserved for 1,536 threads per SM)
                 float v[8];
 #pragma unroll
@@ -542,9 +542,7 @@ __device__ __forceinline__ void attn_core_t(const LayerW & W, int slot, int n) {
 
 // ---------------------------------------------------------------------------------------------------------------------
 // Decode attention on the all-q8 cache: attn_core_t's per-row arithmetic (bit-identical partials, so also T-invariant),
-// restructured for long contexts (one 32-position tile per SM every ~4.8 us before: 5 dependent stages and 5 block
-// barriers per tile, ~290 GB/s of q8 KV at 101k; this kernel: ~600 GB/s for 3-5 query tokens, ~740 GB/s = the DRAM
-// stream rate for 1-2). Microbenchmark: bench/dattn_bench.cu.
+// restructured for long contexts. Microbenchmark: bench/dattn_bench.cu.
 // - Three-deep software pipeline with ONE block barrier per tile: interval j computes S(j) = Q K(j)^T, the online softmax
 //   of tile j - 1 and O = O * alpha + P(j - 2) V(j - 2) on specialised warps, and issues the next copies:
 //     warps 0-3   S for positions 8 w .. 8 w + 7, all row tiles (one K fragment conversion feeds the MT chains)
@@ -917,7 +915,7 @@ __device__ __forceinline__ void attn_core_q8_t(const LayerW & W, int slot, int n
                 }
             }
             // ---- copies: K(jt + 2) into the stage of K(jt - 1), V(jt + 1) into the stage of V(jt - 3) (both read in
-            // interval jt - 1), issued by warps 4-15 (the S warps carry the longest MMA chains: -5% per tile at T >= 3);
+            // interval jt - 1), issued by warps 4-15 (the S warps carry the longest MMA chains);
             // then wait for K(jt + 1) and V(jt)
             if (jt + 1 < ntl && warp >= 4)
                 aq_issue<NT - 128, MIX>(tid - 128, kring + ((jt + 2) % NSK) * AQ_STG, grow + (jt + 2) * TP, tnp(jt + 2),

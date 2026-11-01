@@ -65,10 +65,9 @@ long long max_pixels_env() {
 }
 
 // the encoder's default thread count: every logical CPU but two (8 or more; else all but one). The cpu backend's workers
-// are pinned and meet at a barrier after every step, so a single other busy thread on one of their CPUs doubles the
-// encode time: next to the server's keep-warm load, a 220-token video frame pair took 1.14-1.17 s with 32 threads and
-// 0.63-0.68 s with 30 on a 16-core / 32-thread Ryzen (2026-10-18), while an idle machine encodes as fast with 30 as with
-// 32 (0.57 vs 0.60 s). The rows do not depend on the thread count.
+// are pinned and meet at a barrier after every step, so a single other busy thread on one of their CPUs (e.g. the
+// server's keep-warm load) about doubles the encode time, while an idle machine encodes as fast with two CPUs fewer.
+// The rows do not depend on the thread count.
 int default_threads() {
     const int hw = (int) std::max(1u, std::thread::hardware_concurrency());
     return hw >= 8 ? hw - 2 : std::max(1, hw - 1);
