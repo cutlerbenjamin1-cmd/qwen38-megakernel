@@ -5893,7 +5893,7 @@ void reencode_iq4nl_q80(const uint8_t * src, uint8_t * out, int64_t K) {
 }
 
 // Q4_0 row (18 B blocks: fp16 d | 16 bytes, element j in the low nibble of byte j and element j + 16 in its high nibble,
-// value d * (q - 8)) -> Q8_0 with the same d and q - 8 as int8: the same values (an MTP block stored as Q4_0, MK_MTP_Q4=0)
+// value d * (q - 8)) -> Q8_0 with the same d and q - 8 as int8: the same values (Q4_0 tensors outside the MTP block)
 void reencode_q40_q80(const uint8_t * src, uint8_t * out, int64_t K) {
     for (int64_t b = 0; b < K / 32; b++) {
         const uint8_t * s = src + b * 18;
@@ -6940,24 +6940,14 @@ struct MKEngine::Impl {
     static bool shape2(const std::vector<uint64_t> & ne, uint64_t k, uint64_t n) { return gguf::shape_is(ne, {k, n}); }
     int n_conv = 0;
     double conv_s = 0;
-    // MK_MTP_Q4: the MTP draft block's (blk.64 + nextn.eh_proj) matrices stored wider than Q4_K (Q5_K, Q6_K, Q8_0;
+    // The MTP draft block's (blk.64 + nextn.eh_proj) matrices stored wider than Q4_K (Q5_K, Q6_K, Q8_0, Q4_0, IQ4_NL;
     // UD-Q4_K_XL: all of them, Q4_K_M: eh, v, ffn_down) are re-quantised to Q4_K at load (ggml_quantize_chunk, no
-    // imatrix). Lossy, but only the drafts can change: they are verified by the exact main model, so the output (greedy
-    // ids, the sampled distribution) is unchanged and only acceptance moves. Each MTP pass streams ~0.1 GB less.
-    // 0 off, 1 on (default), ab: both copies on the device and the policy key mtpq=0|1 picks one (A/B tests).
-    // Always on, IQ4_NL too (the dp4a kernels read none of these types; 0 / ab are refused).
-    int mtp_q4 = 1;
+    // imatrix): the dp4a kernels read none of those types. Lossy, but only the drafts can change: they are verified by
+    // the exact main model, so the output (greedy ids, the sampled distribution) is unchanged and only acceptance moves.
+    // Each MTP pass streams ~0.1 GB less.
     bool req_q4 = false; // want(): re-quantise the current tensor to Q4_K (set while the MTP block loads)
     int n_req = 0;
     double req_s = 0;
-    struct MtpW { LayerW L; Mat eh; };
-    MtpW mtp_set[2]{}; // MK_MTP_Q4=ab: [0] as stored in the file, [1] re-quantised
-    void set_mtp_q4(int on) {
-        if (mtp_q4 != 2) throw std::runtime_error("policy mtpq needs MK_MTP_Q4=ab");
-        hw.L[NL] = mtp_set[on ? 1 : 0].L;
-        hw.eh = mtp_set[on ? 1 : 0].eh;
-        CK(cudaMemcpyToSymbol(cW, &hw, sizeof(ModelW)));
-    }
 
     // MK_DRAFT_Q4 (default 1): the draft head's base rows (the draft vocabulary, --draft-vocab) re-quantised from lm_head's
     // Q6_K to a Q4_K copy at load (ggml_quantize_chunk, no imatrix; +94 MB of VRAM): each draft streams 0.69x the head's
@@ -7011,7 +7001,7 @@ struct MKEngine::Impl {
             thread_local std::vector<float> f;
             f.resize((size_t) K);
             tr->to_float(t.data + (size_t) r * rs_from, f.data(), K);
-            ggml_quantize_chunk(GGML_TYPE_Q4_K, f.data(), out + (size_t) r * rs_to, 0, 1, K, nullptr); // lossy by design (mtp_q4)
+            ggml_quantize_chunk(GGML_TYPE_Q4_K, f.data(), out + (size_t) r * rs_to, 0, 1, K, nullptr); // lossy by design (the MTP block only)
         });
     }
     static bool requant_type(uint32_t t) {
@@ -7029,7 +7019,7 @@ struct MKEngine::Impl {
     } rq_th;
     bool rq_bg = false;
     void rq_start() {
-        rq_bg = has_mtp && mtp_q4 != 0 && !(getenv("MK_LOAD_RQBG") && atoi(getenv("MK_LOAD_RQBG")) == 0);
+        rq_bg = has_mtp && !(getenv("MK_LOAD_RQBG") && atoi(getenv("MK_LOAD_RQBG")) == 0);
         if (!rq_bg) return;
         std::vector<const gguf::Tensor *> ts;
         const gguf::File & mf = mtpf ? *mtpf : file;
@@ -7064,7 +7054,7 @@ struct MKEngine::Impl {
         const bool to_f32 = to == T_F32 && t.type != gguf::F32;
         const bool to_q4 = !to_f32 && req_q4 && requant_type(t.type);
         const bool to_q6 = !to_f32 && !to_q4 && reenc3 && (t.type == gguf::Q3_K || t.type == gguf::IQ3_S);
-        // native IQ4_NL unless MK_IQ4NL_Q8; Q4_0 (an MTP block, MK_MTP_Q4=0 / ab) always (the kernels do not read it)
+        // native IQ4_NL unless MK_IQ4NL_Q8; Q4_0 (outside the MTP block) always (the kernels do not read it)
         const bool to_q8 = !to_f32 && !to_q4 && ((t.type == gguf::IQ4_NL && getenv("MK_IQ4NL_Q8")) || t.type == gguf::Q4_0);
         if (!to_f32 && !to_q4 && !to_q6 && !to_q8) return s; // anything the kernels cannot read is refused by up_mat / need()
         const ggml_type from = (ggml_type) t.type;
@@ -7671,8 +7661,7 @@ struct MKEngine::Impl {
         };
         if (const char * e = getenv("MK_MTP_Q4")) {
             if (strcmp(e, "1"))
-                throw std::runtime_error(std::string("MK_MTP_Q4=") + e + " was removed from this build: the MTP block is always re-quantised to "
-                                         "Q4_K (MK_MTP_Q4=0 / ab and the policy key mtpq: builds with MK_MAXT 5 only)");
+                throw std::runtime_error(std::string("MK_MTP_Q4=") + e + " was removed: the MTP block is always re-quantised to Q4_K");
         }
         if (const char * e = getenv("MK_DRAFT_Q4")) {
             if (strcmp(e, "0") && strcmp(e, "1")) throw std::runtime_error("MK_DRAFT_Q4: 0 or 1");
@@ -7684,7 +7673,7 @@ struct MKEngine::Impl {
         for (int i = 0; i < (has_mtp ? NLA : NL); i++) { // (no MTP block: hw.L[NL] stays empty)
             LayerW & L = hw.L[i];
             const bool mtp = i == NL;
-            req_q4 = mtp && mtp_q4 != 0;
+            req_q4 = mtp;
             wv_lay = !mtp;
             L.attn = mtp || ((i + 1) % 4 == 0);
             L.attn_norm = up_f32(blk(i, "attn_norm.weight"), D);
@@ -7787,24 +7776,10 @@ struct MKEngine::Impl {
                           : MK_WV_OUT ? "ffn_down, out, ssm_out: every type; elsewhere Q6_K / Q3_K / IQ3_S stay on dp4a"
                                       : "ffn_down: every type; elsewhere Q6_K / Q3_K / IQ3_S stay on dp4a", MAXT);
         if (has_mtp) {
-            req_q4 = mtp_q4 != 0;
+            req_q4 = true;
             hw.eh = up_mat(blk(NL, "nextn.eh_proj.weight"), 2 * D, D);
             req_q4 = false;
             needq(blk(NL, "nextn.eh_proj.weight"), hw.eh.type);
-            if (mtp_q4 == 2) { // A/B: the file's MTP matrices as well (the norms are shared)
-                mtp_set[1] = {hw.L[NL], hw.eh};
-                MtpW & a = mtp_set[0];
-                a.L = hw.L[NL];
-                a.L.q = up_mat(blk(NL, "attn_q.weight"), D, QG);
-                a.L.k = up_mat(blk(NL, "attn_k.weight"), D, KVD);
-                a.L.v = up_mat(blk(NL, "attn_v.weight"), D, KVD);
-                a.L.o = up_mat(blk(NL, "attn_output.weight"), VD, D);
-                a.L.fg = up_mat(blk(NL, "ffn_gate.weight"), D, FF);
-                a.L.fu = up_mat(blk(NL, "ffn_up.weight"), D, FF);
-                a.L.fd = up_mat(blk(NL, "ffn_down.weight"), FF, D);
-                a.eh = up_mat(blk(NL, "nextn.eh_proj.weight"), 2 * D, D);
-                mem_mark("MTP block, file types (MK_MTP_Q4=ab)");
-            }
             hw.enorm = up_f32(blk(NL, "nextn.enorm.weight"), D);
             hw.hnorm = up_f32(blk(NL, "nextn.hnorm.weight"), D);
             hw.shnorm = up_f32(blk(NL, "nextn.shared_head_norm.weight"), D);
@@ -10843,7 +10818,7 @@ void MKEngine::set_policy(const std::string & spec) {
         else if (k == "blk") {
             if (std::stoi(v)) throw std::runtime_error("policy blk=" + v + " was removed (block verification of sampled drafts; blk=0 is the only value)");
         }
-        else if (k == "mtpq") throw std::runtime_error("policy mtpq was removed from this build: the MTP block is always re-quantised to Q4_K");
+        else if (k == "mtpq") throw std::runtime_error("policy mtpq was removed: the MTP block is always re-quantised to Q4_K");
         else if (k == "dq4") p_->set_draft_q4(std::stoi(v)); // MK_DRAFT_Q4=1 only; from the next launch
         else throw std::runtime_error("policy: unknown key " + k);
     }
