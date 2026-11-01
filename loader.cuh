@@ -1,8 +1,8 @@
-// Host side of the model load (included by qwen38_mk.cu inside its anonymous namespace): the phase clock, parallel
+// Host side of the model load (included by engine.cu inside its anonymous namespace): the phase clock, parallel
 // read-ahead of the GGUF and reusable host buffers. Nothing here changes the bytes the loader produces.
 #pragma once
 
-// (<condition_variable>, <memory>, <mutex>: included by qwen38_mk.cu at file scope; this header sits inside its anonymous namespace)
+// (<condition_variable>, <memory>, <mutex>: included by mk_shared.cuh at file scope; this header sits inside an anonymous namespace)
 
 using lclk = std::chrono::steady_clock;
 inline double lsec(lclk::time_point t) { return std::chrono::duration<double>(lclk::now() - t).count(); }

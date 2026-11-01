@@ -36,8 +36,6 @@ __device__ __forceinline__ float mag23(unsigned w, int k) { return __int_as_floa
 
 // the weight types the wv path serves (the others stay on dp4a at every T: per tensor T-invariant)
 __host__ __device__ constexpr bool wv_type(int t) { return t == T_Q4K || t == T_Q5K || t == T_IQ4X || t == T_IQ4NL || t == T_Q8_0; }
-// fragment-ordered (FM) types; the other wv types are tile-major whole blocks
-__host__ __device__ constexpr bool wv_fm(int t) { return t == T_IQ4X || t == T_Q4K || t == T_Q5K; }
 // per-16 weight scales (the ffn_down offset types): split MMAs only
 __host__ __device__ constexpr bool wv_s16(int t) { return t == T_Q6K || t == T_Q3K; }
 
@@ -244,7 +242,6 @@ template <> struct WV<T_Q6K> {
 //   of chunk n >> 2 (the split md / mx tables of the X16 fill);
 //   q32 phases: m16n8k16 per 16-chunk over 8 tokens: the non-split md table + the fill's per-chunk qsum table (mx4).
 // (Prefill: mmh's FM6 stage reads the same units, prefill_gemm.cuh.)
-constexpr int Q6F_UNIT = 3360, Q6F_D = 256, Q6F_LO = 288, Q6F_HI = 2336;
 struct Q6FRaw { int4 sc[2]; int dd; int2 q[2][4]; int hi[2][4]; };
 __device__ __forceinline__ void q6f_load(Q6FRaw & r, const Mat & m, int tile, int sb, int g, int tq) {
     const uint8_t * u = m.w + ((size_t) tile * (m.K >> 8) + sb) * Q6F_UNIT;
@@ -772,8 +769,6 @@ __device__ __forceinline__ WvAcc<WvCfg<T, X16>::NG> wv_tile_any(const Mat & m, i
 // phase's dp4a items (alpha / beta, the hybrid's Q6_K / Q3_K / IQ3_S matrices: gemv_pairs over the low global warps),
 // get fewer tiles. Every output depends only on its own row and token (T-invariant per tensor).
 
-constexpr int WV_S = 4; // split-K chunks of out / ffn_down (fixed for every T)
-
 // the hybrid's dp4a matrices on the wv fill (rows_* XP = 2). No Q6_K case here or in resid_dp / rows16_dp_g
 // (every main-layer Q6_K is FM: the loader places it and refuses anything else outside the wv layout)
 template <int T, int IT, class Out>
@@ -1090,7 +1085,6 @@ __device__ __forceinline__ void glu_store(int j, const float (&act)[T]) {
 // of chunks 0 .. WV_S - 1; mk_cycle zeroes it). Cumulative, never reset within a launch: the next edge's adds come only
 // after the PH_FFN_DOWN grid barrier, which every consumer reaches after its wait, so a count of G e is reached exactly
 // when edge e's producers have all arrived.
-constexpr int C1_W0 = 2 * GS_GO, C1_WORDS = C1_W0 + WV_S * GS_GO; // (cB.bar words incl. gsync's count / go lines)
 static_assert((FF / 16) % WV_S == 0, "gate / up tiles per ffn_down chunk");
 static_assert(SM_TOTAL + 32 <= 99 * 1024, "mk_cycle's dynamic + static shared memory (+ s_c1n)");
 __shared__ unsigned s_c1n;

@@ -46,18 +46,26 @@ tools/vit_check: vision/vit_check.cpp vision/vit_cpu.o
 tools/vision_ref: tools/vision_ref.cpp logit_stats.h
 	g++ -O2 -std=c++17 -pthread $(VISION_INC) $< $(VISION_LIBS) -o $@
 
-# the engine's compile flags, rewritten only when they change: another MKFLAGS or ARCH rebuilds qwen38_mk.o
+# the engine's compile flags, rewritten only when they change: another MKFLAGS or ARCH rebuilds the engine's objects
 build/nvflags: FORCE
 	@mkdir -p build
 	@echo '$(NVCC) $(NVFLAGS)' > $@.tmp
 	@cmp -s $@.tmp $@ && rm -f $@.tmp || mv $@.tmp $@
 
-# ptxas register / spill report for every phase function goes to ptxas.log
-qwen38_mk.o: qwen38_mk.cu qwen38_mk.h gguf.h prefill.cuh prefill_gemm.cuh prefill_attn.cuh loader.cuh wv.cuh wv_host.cuh build/nvflags
+# the device code and its launchers; ptxas register / spill report for every phase function goes to ptxas.log
+qwen38_mk.o: qwen38_mk.cu mk_shared.cuh mk_launch.h qwen38_mk.h gguf.h prefill.cuh prefill_gemm.cuh prefill_attn.cuh wv.cuh wv_dev.cuh \
+		build/nvflags
 	$(NVCC) $(NVFLAGS) -I$(LLAMA)/ggml/include -c qwen38_mk.cu -o $@ 2> ptxas.log || (cat ptxas.log; false)
 
-qwen38_mk: qwen38_mk.o main.cu logit_stats.h
-	$(NVCC) -O3 -std=c++17 -arch=$(ARCH) -I$(LLAMA)/include -I$(LLAMA)/ggml/include main.cu qwen38_mk.o \
+# the host side (no device code: a change here does not rebuild qwen38_mk.o); the same flags, so the shared definitions agree
+HOST_SRC = engine.cu
+HOST_HDR = mk_shared.cuh mk_launch.h qwen38_mk.h gguf.h loader.cuh wv_host.cuh
+HOST_OBJ = $(HOST_SRC:.cu=.o)
+$(HOST_OBJ): %.o: %.cu $(HOST_HDR) build/nvflags
+	$(NVCC) $(NVFLAGS) -I$(LLAMA)/ggml/include -c $< -o $@
+
+qwen38_mk: qwen38_mk.o $(HOST_OBJ) main.cu logit_stats.h
+	$(NVCC) -O3 -std=c++17 -arch=$(ARCH) -I$(LLAMA)/include -I$(LLAMA)/ggml/include main.cu qwen38_mk.o $(HOST_OBJ) \
 		-L$(LLAMA)/build/bin -lllama -lggml-base -Xlinker -rpath -Xlinker $(abspath $(LLAMA)/build/bin) -o $@
 
 # the build's commit and engine flags (capi.cpp mk_build_info, the server's /props); rewritten only when they change
@@ -69,8 +77,8 @@ build/mk_build_info.h: FORCE
 	@cmp -s $@.tmp $@ && rm -f $@.tmp || mv $@.tmp $@
 
 # engine + tokenizer as a shared library with a C API (capi.cpp), used by server/mk_server.py
-libqwen38mk.so: qwen38_mk.o capi.cpp qwen38_mk.h build/mk_build_info.h
-	$(NVCC) -O3 -std=c++17 -arch=$(ARCH) -shared -Xcompiler -fPIC -Ibuild -I$(LLAMA)/include -I$(LLAMA)/ggml/include capi.cpp qwen38_mk.o \
+libqwen38mk.so: qwen38_mk.o $(HOST_OBJ) capi.cpp qwen38_mk.h build/mk_build_info.h
+	$(NVCC) -O3 -std=c++17 -arch=$(ARCH) -shared -Xcompiler -fPIC -Ibuild -I$(LLAMA)/include -I$(LLAMA)/ggml/include capi.cpp qwen38_mk.o $(HOST_OBJ) \
 		-L$(LLAMA)/build/bin -lllama -lggml-base -Xlinker -rpath -Xlinker $(abspath $(LLAMA)/build/bin) -o $@
 
 tools/vocab_freq: tools/vocab_freq.cpp
@@ -115,7 +123,7 @@ gate: qwen38_mk libqwen38mk.so
 	scripts/gate.sh $(if $(MK_MODEL),-m $(MK_MODEL)) $(GATE_ARGS)
 
 clean:
-	rm -f qwen38_mk libqwen38mk.so qwen38_mk.o ptxas.log tools/vocab_freq tools/llama_ref libqwen38vision.so tools/mkv_cli tools/vision_ref tools/vit_check vision/vit_cpu.o tests/gguf_fuzz \
+	rm -f qwen38_mk libqwen38mk.so qwen38_mk.o $(HOST_OBJ) ptxas.log tools/vocab_freq tools/llama_ref libqwen38vision.so tools/mkv_cli tools/vision_ref tools/vit_check vision/vit_cpu.o tests/gguf_fuzz \
 		bench/wvgemm_bench bench/dattn_bench
 
 .PHONY: all vision clean exactness check gate FORCE

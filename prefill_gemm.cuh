@@ -20,9 +20,6 @@
 #ifndef MK_PF_FRAG_G
 #define MK_PF_FRAG_G -1 // (tuning) the MMA group of a stage after which the next stage's scales + fragments are made; -1: frag_g
 #endif
-#ifndef MK_PF_INFCHK
-#define MK_PF_INFCHK 0 // debug builds: 1 = count the prefill GEMMs' fp16 overflows (chk_*; the served build has none of it)
-#endif
 
 namespace pf {
 
@@ -32,9 +29,6 @@ namespace pf {
 // the MMAs) that are inf / NaN when added to the fp32 accumulators, kind 1 = non-finite fp32 outputs. Input sites (the
 // fp16 stores of GEMM inputs, saturated to +-65504): kind 0 = |v| > 65504 (inf included), kind 1 = NaN (stored as
 // -65504 by the clamp).
-enum { CHK_Q, CHK_K, CHK_V, CHK_O, CHK_QKV, CHK_GATE, CHK_SOUT, CHK_GU, CHK_UP, CHK_DOWN, CHK_EH, CHK_HEAD, // GEMMs
-       CHK_IN_NORM, CHK_IN_DN, CHK_IN_MTP, CHK_IN_ATTN, CHK_IN_GLU, CHK_SITES };                            // inputs
-constexpr int CHK_LAYERS = 66; // 64 trunk layers, 64 = the MTP block, 65 = the output head
 __device__ unsigned long long chk_cnt[CHK_LAYERS][CHK_SITES][2];
 __device__ int chk_layer, chk_site;
 __device__ __forceinline__ void chk_add(int site, int kind, unsigned n) {
@@ -46,16 +40,8 @@ __device__ __forceinline__ void chk_clamp(float v, int site) { // v: about to be
 }
 #endif
 
-constexpr int BM = 128, BN = 128, BK = 64;
-constexpr int TQ4K = 12, TQ5K = 13, TQ6K = 14, TQ80 = 8, TIQ4 = 23, TIQ4NL = 20, TQ3K = 11, TIQ3S = 21;
 // kvalues_iq4nl + 128 as bytes (the Q8_0 path's offset)
 constexpr unsigned IQ4U_T0 = 0x3F2D1801u, IQ4U_T1 = 0x766A5D4Fu, IQ4U_T2 = 0xA6998D81u, IQ4U_T3 = 0xF1D9C5B5u;
-
-struct WMat { // device view of one weight matrix (mirrors Mat in qwen38_mk.cu)
-    const uint8_t * w;
-    const __half * d;
-    int type, K, N, rb, nd;
-};
 
 // Raw bytes of one stage (64-group p of super-block sb) per weight row, copied as 16 B chunks:
 //   Q4_K: [hdr 16 | qs 32]                    src: blk + {0, 16 + 32p}
@@ -111,15 +97,6 @@ __device__ __forceinline__ void ldsm_x4(unsigned (&r)[4], unsigned addr) {
 }
 
 constexpr unsigned M4 = 0x0F0F0F0Fu;
-
-enum { OUT_STORE = 0, OUT_ADD = 1 };
-
-struct Out {
-    float * y; // y[tok * ldy + row]
-    int ldy;
-    int mode;
-    __half * yh; // fused gate / up (mmh<.., true>): yh[tok * ldy + row] = silu(gate) * up, fp16 in hperm order
-};
 
 // Element e of a 16-group sits at slot hperm(e): 4 t + {0, 1} -> 2 t + {0, 1}, 4 t + {2, 3} ->
 // 8 + 2 t + {0, 1}.  With that order a weight word (elements 4 t4 .. 4 t4 + 3) gives the A fragment

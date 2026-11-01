@@ -6,29 +6,6 @@
 
 #include "prefill_gemm.cuh"
 
-struct PBufs {
-    int cap;      // token capacity of a chunk (multiple of 128)
-    float * x;    // [cap][D] residual stream
-    float * xm;   // [cap][D] MTP stream
-    float * rs;   // [cap] RMS scale of the last normed input
-    __half * xh;  // [cap][FF] fp16 GEMM input, elements of each 16-group in pf::hperm order
-    __half * xh2; // [cap][FF] fp16 silu(gate) * up (ffn_down input), same order
-    float * y0;   // [cap][FF]  qkv | q+gate | ffn gate | logits
-    float * y1;   // [cap][FF]  z | k,v | ffn up
-    float * y2;   // [cap][VD]  delta-net / attention output
-    __half * dq;  // [cap][QKV] conv'd + normalised q | k | v (fp16)
-    float * gb;   // [cap][2 * NVH] log g | beta
-    float * ab;   // [AB_SPLITS][cap][2 * NVH] alpha | beta pre-activations (split-K partials)
-    float * h;    // [cap + 1][D] final normed hidden of positions n0 - 1 .. n0 + T - 1
-    __half * qh;  // [cap][NH][HD] attention queries (normed, rotated, pre-scaled)
-    int * tok;    // [cap]
-    int * erow;   // [cap] input-embedding row of each token in emb (MKImage rows), -1: its token_embd row
-    const float * emb; // [rows][D] the prefill's image rows (mapped pinned host memory; null until the first image)
-    int * amax;   // [cap] argmax output (scoring)
-    int wsrow;    // MK_EXACT: the MK_KV_WIN ring / main split per 16-row query tile (kv_ws of its last row, as decode
-                  // takes it per row), not per chunk (kv_ws(n0 + T)): a row's keys then do not depend on its chunk
-};
-
 __constant__ PBufs cP;
 
 // The megakernel TU is built with -dlcm=cg (plain loads become strong L2 loads, which are very

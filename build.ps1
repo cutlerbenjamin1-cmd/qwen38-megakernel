@@ -69,23 +69,35 @@ function Copy-LlamaDlls([string] $dir) {
 New-Item -ItemType Directory -Force build_win | Out-Null
 if (& $want "engine") {
     Run "cl.exe" ($cl + @("/c", "compat_win32.cpp", "/Fobuild_win\compat_win32.obj"))
-    # ptxas register / spill report for every phase function goes to ptxas.log (as with make)
-    $nv = @("-O3", "-std=c++17", "-arch=$Arch", "-lineinfo", "-Xptxas", "-dlcm=cg", "-Xptxas", "-v", "-Xcompiler", $hostFlags) +
-          ($MkFlags -split "\s+" | Where-Object { $_ }) + $llInc + @("-c", "qwen38_mk.cu", "-o", "build_win\qwen38_mk.obj")
-    # the 20-minute compile is skipped when the object is newer than every engine source and was built with these flags
-    $obj, $stamp = "build_win\qwen38_mk.obj", "build_win\qwen38_mk.flags"
-    $newest = (Get-ChildItem *.cu, *.cuh, *.h | Measure-Object -Property LastWriteTime -Maximum).Maximum
-    $fresh = (Test-Path $obj) -and (Test-Path $stamp) -and ((Get-Content $stamp -Raw).Trim() -eq ($nv -join " ")) -and
-             ((Get-Item $obj).LastWriteTime -gt $newest)
-    if ($fresh) {
-        Write-Host "qwen38_mk.obj is up to date"
-    } else {
+    $nvBase = @("-O3", "-std=c++17", "-arch=$Arch", "-lineinfo", "-Xptxas", "-dlcm=cg", "-Xptxas", "-v", "-Xcompiler", $hostFlags) +
+              ($MkFlags -split "\s+" | Where-Object { $_ }) + $llInc
+    # an object is rebuilt unless it is newer than its sources (the Makefile's lists) and was built with these flags: a
+    # change on the host side does not redo the device TU's 20-minute compile
+    function Build-Cu([string] $src, [string[]] $deps, [string] $log) {
+        $name = [IO.Path]::GetFileNameWithoutExtension($src)
+        $obj, $stamp = "build_win\$name.obj", "build_win\$name.flags"
+        $nv = $nvBase + @("-c", $src, "-o", $obj)
+        $newest = (Get-Item (@($src) + $deps) | Measure-Object -Property LastWriteTime -Maximum).Maximum
+        $fresh = (Test-Path $obj) -and (Test-Path $stamp) -and ((Get-Content $stamp -Raw).Trim() -eq ($nv -join " ")) -and
+                 ((Get-Item $obj).LastWriteTime -gt $newest)
+        if ($fresh) {
+            Write-Host "$name.obj is up to date"
+            return
+        }
         Remove-Item $stamp -ErrorAction SilentlyContinue
         $t0 = Get-Date
-        Run $nvcc $nv "ptxas.log"
+        Run $nvcc $nv $log
         Set-Content -Encoding ascii $stamp ($nv -join " ")
-        Write-Host ("qwen38_mk.cu compiled in {0:n0} s" -f ((Get-Date) - $t0).TotalSeconds)
+        Write-Host ("$src compiled in {0:n0} s" -f ((Get-Date) - $t0).TotalSeconds)
     }
+    # the device code and its launchers; ptxas register / spill report for every phase function goes to ptxas.log (as with make)
+    Build-Cu "qwen38_mk.cu" @("mk_shared.cuh", "mk_launch.h", "qwen38_mk.h", "gguf.h", "compat_win32.h", "prefill.cuh",
+                              "prefill_gemm.cuh", "prefill_attn.cuh", "wv.cuh", "wv_dev.cuh") "ptxas.log"
+    # the host side, same flags (the shared definitions must agree)
+    $hostSrc = @("engine.cu")
+    $hostHdr = @("mk_shared.cuh", "mk_launch.h", "qwen38_mk.h", "gguf.h", "compat_win32.h", "loader.cuh", "wv_host.cuh")
+    foreach ($s in $hostSrc) { Build-Cu $s $hostHdr "" }
+    $engineObj = @("build_win\qwen38_mk.obj") + ($hostSrc | ForEach-Object { "build_win\" + [IO.Path]::GetFileNameWithoutExtension($_) + ".obj" })
     Write-Def "capi.cpp" "mk_" "qwen38mk.dll" "build_win\qwen38mk.def"
     # the build's commit and engine flags for capi.cpp's mk_build_info (the server's /props)
     $commit = "unknown"
@@ -102,9 +114,9 @@ if (& $want "engine") {
     $link = @("-O3", "-std=c++17", "-arch=$Arch", "-Xcompiler", $hostFlags) + $llInc
     # /EHc-: libllama's extern "C" API throws C++ exceptions, and under nvcc's -EHsc MSVC drops capi.cpp's catches around
     # its calls (/EHs does not undo the c; cl warns D9025)
-    Run $nvcc ($link + @("-Xcompiler", "/EHc-", "-shared", "-Ibuild_win", "capi.cpp", "build_win\qwen38_mk.obj", "build_win\compat_win32.obj") +
+    Run $nvcc ($link + @("-Xcompiler", "/EHc-", "-shared", "-Ibuild_win", "capi.cpp") + $engineObj + @("build_win\compat_win32.obj") +
                $llLib + @("-Xlinker", "/DEF:build_win\qwen38mk.def", "-o", "qwen38mk.dll"))
-    Run $nvcc ($link + @("main.cu", "build_win\qwen38_mk.obj", "build_win\compat_win32.obj") + $llLib + @("-o", "qwen38_mk.exe"))
+    Run $nvcc ($link + @("main.cu") + $engineObj + @("build_win\compat_win32.obj") + $llLib + @("-o", "qwen38_mk.exe"))
     Copy-LlamaDlls $PSScriptRoot
 }
 if (& $want "tools") {
