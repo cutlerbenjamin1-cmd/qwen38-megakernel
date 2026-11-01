@@ -20,7 +20,7 @@ How to read them:
   over total time) are given next to them.
 - **VRAM** is `nvidia-smi`'s memory used on the whole card, other processes included, unless a row says otherwise.
   GiB = MiB / 1,024.
-- **Other engines** are only compared where we ran them ourselves on this machine: llama.cpp b12024 (tuned) for speed,
+- **Other engines** are only compared where they ran on this machine: llama.cpp b12024 (tuned) for speed,
   llama.cpp b10246 as the accuracy reference, and upstream open-jet at 72ba4a7.
 
 Contents: [headline numbers](#headline-numbers) - [against llama.cpp, 2026-10-31](#against-llamacpp-2026-10-31) -
@@ -121,9 +121,8 @@ Notes:
 - **The questions:** llama.cpp got the same 229 at both depths (GSM8K 50 / 50, MMLU-Pro 45 / 70, ARC-C 47 / 50, MATH-500
   28 / 40 and 9 / 10 with thinking on, HumanEval 38 / 41, NIAH 9 / 9, LongBench v2 3 / 12), in 2,563 s instead of b11548's
   2,727. This engine's 230 are [the 2026-10-30 run's](#full-run-2026-10-30).
-- **Passes repeated:** a first pass on this day decoded ~20% slower with the same draft acceptance, the rate climbing
-  during each request; after a reboot the machine measured as above and the pass was repeated. The 6-draft pass was
-  repeated after a browser opened during it.
+- **Passes repeated:** a first pass ran ~20% slow (same draft acceptance, the rate climbing within each request) and
+  was repeated after a reboot; the 6-draft pass was repeated after outside load during it.
 - **Conditions:** fans at 97-98%; GPU 48-73 C and SM clock 1,815-2,025 MHz at the start and end of each pass; memory
   clock 9,851 MHz. llama.cpp ran natively on Windows, this engine under WSL2.
 
