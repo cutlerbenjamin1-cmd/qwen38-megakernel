@@ -8176,6 +8176,12 @@ struct MKEngine::Impl {
         for (cudaEvent_t e : pf_gev) cudaEventDestroy(e);
         for (void * p : allocs) use_pool ? cudaFreeAsync(p, 0) : cudaFree(p);
         if (!allocs.empty()) pool_trim(); // (a caller's retry finds the VRAM free)
+        // a constructor that threw while the weights loaded: wv_dev_done did not give back the staging buffer (192 MiB) and
+        // the gather tables (cudaMalloc, outside allocs)
+        if (stg_d) cudaFree(stg_d);
+        for (void * t : wv_tabs) cudaFree(t);
+        stg_d = nullptr;
+        wv_tabs.clear();
         if (embd_host) cudaFreeHost(embd_host);
         if (emb_host) cudaFreeHost(emb_host);
         if (err_host) cudaFreeHost(const_cast<int *>(err_host));
