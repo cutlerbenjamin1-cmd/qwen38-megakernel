@@ -4,6 +4,11 @@ Every number here was measured on one machine: an RTX 3090 (24 GB, 480 W limit),
 Windows 11 with WSL2, CUDA 13.2, with unsloth's `Qwen3.8-27B-UD-Q4_K_XL.gguf` unless a section says otherwise. Each
 result carries its date and the commit it was measured on.
 
+Bit-level results are tied to the GPU's SM count: the kernel runs one block per SM and some sums are split by the grid
+(lm_head's per-block softmax sums; without exact reuse, the prefill attention's last-wave split, `a2_plan`). A GPU
+with another SM count (the 3090 has 82, an RTX 4090 128) can differ in the last bits and, at near-ties, in greedy
+tokens, so its replies are not expected to match these runs token for token.
+
 How to read them:
 - **Sessions.** The same binary runs several percent faster or slower from one session to the next with GPU temperature
   and clocks (up to ~11% between sessions on 2026-10-12). Absolute numbers are only compared within one session;
@@ -452,6 +457,18 @@ What it costs (2026-10-14): a follow-up turn re-reads the previous reply (11.6k-
 short set and 99.121% / 0.00231 at 32k with exact reuse, 98.654% / 0.00116 and 99.023% / 0.00232 without. The CLI
 measurements in [against llama.cpp](#against-llamacpp) run without exact reuse (the CLI's default); the launchers'
 server runs with it.
+
+### fp16 range in the prefill GEMMs
+
+The prefill GEMMs add two 64-wide k stages (128 products) in fp16 before the fp32 accumulators, and store their inputs
+as fp16 clamped to +-65504. A debug build with `MK_PF_INFCHK=1` (73fd978; compiled out of the served build) counts,
+per layer and GEMM, the fp16 partial sums that are inf / NaN, the non-finite outputs, and the inputs the clamp
+saturates or turns from NaN into -65504.
+
+| prompt | result | date |
+|---|---|---|
+| a 38,048- and a 101,583-token prompt, `-d 7`, q8_0 KV | every counter 0, in every layer | 2026-10-17 |
+| positive control: an 81-token prompt with a NaN image row | every counter fires; the engine stops with "no finite logit" | 2026-10-17 |
 
 ### Against llama.cpp
 

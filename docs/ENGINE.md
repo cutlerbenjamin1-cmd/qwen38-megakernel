@@ -82,6 +82,12 @@ likely tokens (`logit_stats.h`); `--kld` compares an engine with such a file (`-
 or the prefill kernels for the unscored prompt and the decode kernel for the scored positions (`mixed`, what a
 generation runs).
 
+The prefill and decode kernels do not compute identical arithmetic: the prefill DeltaNet scan (`pk_dn_scan`) feeds the
+recurrent state to fp16 tensor-core MMAs and uses `__expf`, decode's `dn_core` keeps it in fp32 and uses `expf`, and the
+two attention paths fold their partial sums in different orders. A position's state and KV rows therefore differ in
+the last bits depending on which path computed them, which is why exact reuse prefills a reply's rows again instead of
+keeping the decoded ones.
+
 Speculative verification is exact: greedy output is the main model's greedy choice at every draft depth, and with
 sampling a draft is accepted with probability p(draft) and a rejected one is resampled from the rest of the
 distribution, so the sampled distribution is the same as without drafts (chi-square and PIT tests).
