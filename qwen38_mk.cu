@@ -10482,7 +10482,9 @@ struct MKEngine::Impl {
             Blob & b;
             bool keep = false;
             ~Rel() {
-                if (!keep) I.hs_release(b);
+                if (keep) return;
+                if (cudaStreamSynchronize(0) != cudaSuccess) cudaGetLastError(); // (no copy into its chunks still in flight)
+                I.hs_release(b);
             }
         } rel{*this, e.blob};
         e.book = book_get();
@@ -11722,6 +11724,7 @@ void MKEngine::side_drop() {
     Impl & I = *p_;
     if (!I.sw_on) return;
     I.sw_on = false;
+    if (cudaStreamSynchronize(0) != cudaSuccess) cudaGetLastError(); // (a failed call's copies into sw_blob land first)
     I.hs_release(I.sw_blob);
     reset();
 }
