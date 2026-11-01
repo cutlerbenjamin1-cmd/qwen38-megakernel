@@ -1,6 +1,7 @@
-// Definitions both sides of the engine need (qwen38_mk.cu: device code + launchers; engine.cu: host side): build settings,
-// model dimensions, device buffer layouts, launch parameters. Namespace mk on the host side; the device TU defines
-// MK_SHARED_NS empty, keeping them in its anonymous namespace with its kernels (the two sides exchange no C++ types).
+// Definitions both sides of the engine need (qwen38_mk.cu: device code + launchers; engine.cu and the Makefile's other
+// HOST_SRC files: host side): build settings, model dimensions, device buffer layouts, launch parameters. Namespace mk
+// on the host side; the device TU defines MK_SHARED_NS empty, keeping them in its anonymous namespace with its kernels
+// (the two sides exchange no C++ types).
 #pragma once
 
 #include <cuda_fp16.h>
@@ -82,13 +83,51 @@ extern char ** environ; // (state files: the MK_* settings in the key)
 #ifndef MK_K8_NT
 #define MK_K8_NT 4
 #endif
+// Not compile-time switches (the served behaviour is built in): a -D for one of these names stops the build.
+#if defined(MK_WV)
+#error "MK_WV is built in (its served value): drop -DMK_WV"
+#elif defined(MK_MAXT)
+#error "MK_MAXT is built in (its served value): drop -DMK_MAXT"
+#elif defined(MK_C1)
+#error "MK_C1 is built in (its served value): drop -DMK_C1"
+#elif defined(MK_EGRESS)
+#error "MK_EGRESS is built in (its served value): drop -DMK_EGRESS"
+#elif defined(MK_WV_Q6F)
+#error "MK_WV_Q6F is built in (its served value): drop -DMK_WV_Q6F"
+#elif defined(MK_K5)
+#error "MK_K5 is built in (its served value): drop -DMK_K5"
+#elif defined(MK_GSYNC)
+#error "MK_GSYNC is built in (its served value): drop -DMK_GSYNC"
+#elif defined(MK_K7)
+#error "MK_K7 is built in (its served value): drop -DMK_K7"
+#elif defined(MK_W48)
+#error "MK_W48 is built in (its served value): drop -DMK_W48"
+#elif defined(MK_DA_ROUTE)
+#error "MK_DA_ROUTE is built in (its served value): drop -DMK_DA_ROUTE"
+#elif defined(MK_DA_Q4)
+#error "MK_DA_Q4 is built in (its served value): drop -DMK_DA_Q4"
+#elif defined(MK_AQ_EARLY)
+#error "MK_AQ_EARLY is built in (its served value): drop -DMK_AQ_EARLY"
+#elif defined(MK_XP_SM)
+#error "MK_XP_SM is built in (its served value): drop -DMK_XP_SM"
+#elif defined(MK_K6_LD)
+#error "MK_K6_LD is built in (its served value): drop -DMK_K6_LD"
+#elif defined(MK_W48S)
+#error "MK_W48S is built in (its served value): drop -DMK_W48S"
+#elif defined(MK_MTP_KVC)
+#error "MK_MTP_KVC is built in: drop -DMK_MTP_KVC (env MK_MTP_KVC=0 turns the K / V-only catch-up rows off)"
+#elif defined(MK_WV_FMK)
+#error "MK_WV_FMK is built in (its served value): drop -DMK_WV_FMK"
+#elif defined(MK_WV_OUT)
+#error "MK_WV_OUT is built in (its served value): drop -DMK_WV_OUT"
+#endif
 
 // A failed CUDA call prints its message and throws MKCudaError (the C API returns -1 with the message and resets
 // the engine, a slot call's slots at their next prompt; the server answers with an HTTP error and keeps serving). A
 // sticky error (the context is unusable: a faulting kernel, illegal address, trap, ECC, ...) cannot be recovered
 // in-process: every later CUDA call fails too, so the process exits with code 4 after the message (the launcher / user
 // restarts it).
-[[noreturn]] static void mk_cuda_fail(cudaError_t e, const char * expr, const char * file, int line) {
+[[noreturn]] inline void mk_cuda_fail(cudaError_t e, const char * expr, const char * file, int line) {
     char msg[768];
     snprintf(msg, sizeof msg, "CUDA error %s at %s:%d: %s", expr, file, line, cudaGetErrorString(e));
     fprintf(stderr, "%s\n", msg);
@@ -461,12 +500,16 @@ struct Out {
 };
 } // namespace pf
 
-// What the two sides exchange as bytes or must agree on (struct sizes, build settings): the host refuses a device object
-// built with other settings (mkl::abi_sig) instead of reading garbage.
+// What the two sides exchange as bytes or must agree on (struct sizes, build settings, GPU architectures): the host
+// refuses a device object built with other settings (mkl::abi_sig) instead of reading garbage.
 constexpr unsigned long long mk_abi_sig() {
     const unsigned long long v[] = {sizeof(ModelW), sizeof(Bufs), sizeof(PBufs), sizeof(Launch), sizeof(Ctl), sizeof(pf::WMat),
                                     sizeof(pf::Out), NVIEW, MAXT, RMAX, NSEQ, MK_SPEC_LOG, MK_TEST_NAN, MK_TEST_SLOTS_FAIL, MK_KV_EMU,
-                                    MK_PF_INFCHK};
+                                    MK_PF_INFCHK,
+#ifdef __CUDA_ARCH_LIST__
+                                    __CUDA_ARCH_LIST__, // (nvcc: the -arch list, e.g. 860)
+#endif
+    };
     unsigned long long h = 0xcbf29ce484222325ull;
     for (unsigned long long x : v) h = (h ^ x) * 0x100000001b3ull;
     return h;

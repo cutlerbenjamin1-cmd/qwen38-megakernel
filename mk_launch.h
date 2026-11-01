@@ -1,5 +1,6 @@
 // mk_launch.h: the device TU's (qwen38_mk.cu) kernel launchers, kernel handles and __constant__ / __device__ symbol copies
-// for the host TU (engine.cu). Only types with external linkage cross it: engine structs go as const void *.
+// for the host files (engine.cu and the Makefile's other HOST_SRC files). Only types with external linkage cross it:
+// engine structs go as const void *.
 #pragma once
 
 #include <cuda_runtime.h>

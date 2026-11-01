@@ -39,6 +39,7 @@ def chat(p):
 
 def code_text(n_tok):
     src = ""
+    # the context prompt is the current text of these files: it changes whenever they do
     for f in ["qwen38_mk.cu", "prefill.cuh", "prefill_gemm.cuh"]:
         src += open(os.path.join(MKDIR, f)).read() + "\n"
     return src[: int(n_tok * CHARS_PER_TOK)]

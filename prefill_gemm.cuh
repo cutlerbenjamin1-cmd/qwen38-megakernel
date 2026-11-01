@@ -4,8 +4,8 @@
 //
 // X is fp16 [tok][K] with the elements of every 16-group permuted (hperm) so that the 4-byte weight
 // words give m16n8k16 A fragments directly.  W stays Q4_K / Q5_K (GGUF layout), Q6_K (210-byte
-// repack, see qwen38_mk.cu), Q8_0 (unit repack), IQ4_XS (272-byte block pairs, indices in Q4_K order) or
-// IQ4_NL (Q4_K-shaped 144-byte repack) and is dequantised to fp16 in registers.
+// two-stream repack: layout in qwen38_mk.cu, made by loader.cu), Q8_0 (unit repack), IQ4_XS (272-byte block pairs,
+// indices in Q4_K order) or IQ4_NL (Q4_K-shaped 144-byte repack) and is dequantised to fp16 in registers.
 // Tile: 128 weight rows x 128 tokens per CTA, 8 warps of 16 rows x 128 tokens.  K is staged 64 at a
 // time (one 64-group of a super-block: two 32-element sub-blocks) through a cp.async pipeline with
 // one block barrier per stage (Q5_K / IQ4_NL: per two stages, see pf_wown); per-row sub-block scales
