@@ -12013,9 +12013,9 @@ int MKEngine::Impl::step_live(std::vector<int> & out) {
 #else
     const int T = att_cap_T(c.n, 1 + nd_avail);
 #endif
-    // Draft depth (an upper bound: the on-device gate may stop drafting earlier). Default (depth 0):
-    // after a cycle that rejected a draft, draft one token less (but at least 3), since a deeper draft
-    // is then unlikely to be accepted; the full depth again after a fully accepted cycle.
+    // Draft depth (an upper bound: the on-device gate may stop drafting earlier), by Policy::depth (default 1: the
+    // full depth). Depth 0: after a cycle that rejected a draft, draft one token less (but at least 3), since a deeper
+    // draft is then unlikely to be accepted; the full depth again after a fully accepted cycle.
     const int top = depth_top(c.n); // n_draft (MK_MAXT > 5: at most 4 from Policy::dctx on)
     int nd = top;
     if (pol.depth == 0) nd = (!all_acc && top > 3) ? top - 1 : top;

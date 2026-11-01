@@ -3,7 +3,7 @@
 //   Y[tok][row] (+)= sum_k W[row][k] * X[tok][k]
 //
 // X is fp16 [tok][K] with the elements of every 16-group permuted (hperm) so that the 4-byte weight
-// words give m16n8k16 A fragments directly.  W stays Q4_K / Q5_K (GGUF layout), Q6_K (224-byte
+// words give m16n8k16 A fragments directly.  W stays Q4_K / Q5_K (GGUF layout), Q6_K (210-byte
 // repack, see qwen38_mk.cu), Q8_0 (unit repack), IQ4_XS (272-byte block pairs, indices in Q4_K order) or
 // IQ4_NL (Q4_K-shaped 144-byte repack) and is dequantised to fp16 in registers.
 // Tile: 128 weight rows x 128 tokens per CTA, 8 warps of 16 rows x 128 tokens.  K is staged 64 at a

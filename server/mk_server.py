@@ -2764,8 +2764,8 @@ class Server:
 
         Loading allocates the weights and the KV cache, but the first kernel launches still need
         device memory of their own. When the context is too large for that, loading succeeds, /health
-        answers, and the first request ends the process with a CUDA out-of-memory (CK exits), which
-        the client sees as a dropped connection. Warming up here moves that failure to startup.
+        answers, and then requests fail with a CUDA out-of-memory error. Warming up here moves that
+        failure to startup.
         The prompt must be at least two tokens: only then does prefill take the batched path, whose
         buffers are allocated on first use."""
         toks = self.eng.tokenize("Hello, how are you today?")
