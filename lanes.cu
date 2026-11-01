@@ -150,21 +150,21 @@ auto MKEngine::Impl::ck_new_slots(int n) -> std::vector<CkSlot> {
     return v;
 }
 
-size_t MKEngine::Impl::lane_kv_bytes(int lctx) const {
+size_t MKEngine::Impl::lane_kv_bytes(int lctx) const { // (+ dalloc's 16 B per buffer: kc, vc, ksc, vsc, 2 per ring)
     const size_t srows = (size_t) NKV * (lctx + KV_PAD);
-    size_t b = 0;
+    size_t b = 4 * 16;
     for (int w = 0; w < 2; w++)
         for (int sl = 0; sl < kv_slots; sl++) {
             b += srows * ((size_t) HD * hb.kvb[w][sl] / 8 + (HD / 32) * sizeof(__half));
-            if (hb.kvrp[w][sl]) b += (size_t) NKV * hb.kvrc * (HD + (HD / 32) * sizeof(__half));
+            if (hb.kvrp[w][sl]) b += (size_t) NKV * hb.kvrc * (HD + (HD / 32) * sizeof(__half)) + 2 * 16;
         }
     return b;
 }
 
-size_t MKEngine::Impl::lane_bytes(int lctx) const {
+size_t MKEngine::Impl::lane_bytes(int lctx) const { // (slots_open's device buffers of a lane, + 16 B each)
     return lane_kv_bytes(lctx) + sizeof(float) * ((size_t) 48 * CONV_RING * QKV + (size_t) 48 * KV_RING * KVGB +
            (size_t) 48 * NVH * 128 * 128 + (size_t) NKV * MAX_CH * AR * 256 + (size_t) NKV * MAX_CH * AR * 2 +
-           (size_t) H_RING * D + D);
+           (size_t) H_RING * D + D) + sizeof(float2) * (size_t) MAXT * (2 * TOPK_MAX + 1) + sizeof(Ctl) + 10 * 16;
 }
 
 int MKEngine::Impl::slots_open(int n, int lctx) {
@@ -227,15 +227,20 @@ int MKEngine::Impl::slots_open(int n, int lctx) {
     }
 #endif
     CK(cudaDeviceSynchronize());
+    // the slots' device bytes at c positions each: the lanes, + the RoPE rows when the engine's table is too short
+    auto slots_need = [&](int c) {
+        const size_t rope = c + KV_PAD > hb.ctx ? (size_t) (c + KV_PAD) * 32 * sizeof(float2) + 16 : 0;
+        return (size_t) n * lane_bytes(c) + rope;
+    };
     if (lctx <= 0) {
         size_t free_b = 0, total_b = 0;
         CK(cudaMemGetInfo(&free_b, &total_b));
         const size_t reserve = (size_t) (getenv("MK_SLOT_RESERVE_MIB") ? atol(getenv("MK_SLOT_RESERVE_MIB")) : 1536) << 20;
-        const size_t avail = free_b > reserve ? (free_b - reserve) / n : 0;
+        const size_t avail = free_b > reserve ? free_b - reserve : 0;
         int lo = 0, hi = lmax;
         while (lo < hi) {
             const int mid = (lo + hi + 1) / 2;
-            if (lane_bytes(mid) <= avail) lo = mid;
+            if (slots_need(mid) <= avail) lo = mid;
             else hi = mid - 1;
         }
         lctx = lo / ATT_BUCKET * ATT_BUCKET;
@@ -247,8 +252,7 @@ int MKEngine::Impl::slots_open(int n, int lctx) {
     // positions beside a ctx 8192 engine on a 24 GB GPU: ~26 GB of it, Windows commit down to 0 free, 2026-11-01).
     // MK_SLOT_SPILL=1: no check (the driver decides).
     if (!(getenv("MK_SLOT_SPILL") && atoi(getenv("MK_SLOT_SPILL")) != 0)) {
-        const size_t need = (size_t) n * lane_bytes(lctx) +
-                            (lctx + KV_PAD > hb.ctx ? (size_t) (lctx + KV_PAD) * 32 * sizeof(float2) : 0); // (+ the RoPE rows)
+        const size_t need = slots_need(lctx);
         size_t free_b = 0, total_b = 0;
         CK(cudaMemGetInfo(&free_b, &total_b));
         if (use_pool) {

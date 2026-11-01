@@ -1221,6 +1221,7 @@ MKEngine::Impl::Impl(const std::string & path, int ctx_, int ndraft_, const std:
                 vbytes[w] += srows * HD * hb.kvb[w][s] / 8;
                 n4 += hb.kvb[w][s] != 8 || (w == 0 ? hb.kvr[s] : hb.kvrv[s]);
             }
+        const size_t ab0 = alloc_bytes; // (alloc_bytes - ab0: the cache's device bytes, rings included)
         hb.kc = q8 ? (void *) dalloc<int8_t>(vbytes[0]) : (void *) dalloc<__half>(rows * HD);
         hb.vc = q8 ? (void *) dalloc<int8_t>(vbytes[1]) : (void *) dalloc<__half>(rows * HD);
         hb.ksc = q8 ? dalloc<__half>(rows * (HD / 32)) : nullptr;
@@ -1273,6 +1274,13 @@ MKEngine::Impl::Impl(const std::string & path, int ctx_, int ndraft_, const std:
         }
         const double gb = q8 ? (vbytes[0] + vbytes[1] + 2.0 * rows * (HD / 32) * 2 + ring_bytes) / 1e9 : rows * HD * 4.0 / 1e9;
         fprintf(stderr, "[mk] KV cache %s, %.2f GB for %d positions\n", q8 ? (n4 ? "q8_0 + q4 (MK_KV)" : "q8_0") : "fp16", gb, ctx);
+        // a sysmem-fallback driver puts a cache past the free memory in system memory instead of failing
+        if (alloc_bytes - ab0 > free_b)
+            fprintf(stderr,
+                    "[mk] warning: the KV cache takes %.2f GB of device memory, %.2f GB was free: with the CUDA "
+                    "sysmem fallback (Windows, WSL2) the rest sits in system memory, read over PCIe (much slower; "
+                    "a smaller context fits)\n",
+                    (alloc_bytes - ab0) / 1e9, free_b / 1e9);
         if (n4) {
             std::string k, v, kr, vr;
             for (int s = 0; s < N_ATT_SLOTS; s++) {
