@@ -8462,6 +8462,9 @@ struct MKEngine::Impl {
             pf_init();
         }
         ck_make_plan();
+        if (exact && stg_n < 2)
+            fprintf(stderr, "[mk] warning: MK_EXACT with MK_PF_CAP %d: no staging slots for checkpoints inside a prefill, so "
+                            "none are saved (a reuse prefills from position 0); MK_PF_CAP >= 384 keeps them\n", hp.cap);
         {
             auto _ = lc.scope("upload tail (wait)");
             upl.finish();
@@ -11419,7 +11422,7 @@ int MKEngine::prefill(const std::vector<int> & tokens, const std::vector<int> & 
             p_->st_how = 1;
         } else {
         if (p_->stg_n < 2) { // too few staging slots (MK_PF_CAP below ~340): two pf_runs around ck_exact, other positions ignored
-            if (!end_save) {
+            if (ck_exact > n0 && ck_exact < hend) { // (never with MK_EXACT: its ck_exact joined cks, which this path ignores)
                 p_->pf_run(std::vector<int>(head.begin(), head.begin() + (ck_exact - n0)), n0, nullptr, nullptr, 0, nullptr, er);
                 stop_if_cancelled();
                 c.dn_c = ck_exact;
