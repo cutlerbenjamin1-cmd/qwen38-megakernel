@@ -423,6 +423,7 @@ These switch single decode kernels back to an earlier form, for A/B measurements
 | Variable | Default | What it does | Output | Status | Since |
 |---|---|---|---|---|---|
 | `MK_SLOT_RESERVE_MIB` | `1536` | device memory left free when the slots take the most context that fits (`-c 0`), for the prefill and the runtime | - | option | f09ef59, 2026-10-28 |
+| `MK_SLOT_SPILL` | `0` | `1`: no check that the slots fit in the free device memory (plus the memory pool's unused reserve) before they are allocated. Without it a `-c` that does not fit is refused at once, naming what it needs and what is free; with it a Windows / WSL2 driver's CUDA sysmem fallback (on by default) puts the rest in system memory (charged to Windows commit; the KV cache is then read over PCIe) | same | option | e50b885, 2026-11-01 |
 | `MK_SLOT_CK` | `2` | DeltaNet checkpoints per slot (where a slot's next prompt resumes when it diverges inside the slot's sequence) | same with exact reuse | option | f09ef59, 2026-10-28 |
 | `MK_PAR_RMAX` | unset | a value up to 8: batched slot passes of 8 rows (the verify pass's width) instead of the build's `MK_PAR_RMAX` (16). The engine prints which it runs at load (`parallel slots: batched passes of ...`) | same | debug | f09ef59, 2026-10-28 |
 

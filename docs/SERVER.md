@@ -427,7 +427,9 @@ MK_AGENTS=4 scripts/serve.sh 8080 0                                        # the
   | UD-Q4_K_XL | q8_0 | 2 x 65,280 | 4 x 29,440 |
   | UD-Q4_K_XL | preset D' | 2 x 83,840 | 4 x 35,840 |
 
-  A prompt that does not fit its slot gets the usual 400. The KV cache is q8_0 (`--kv f16` is refused at startup); the
+  Slots that need more device memory than is free are refused at startup (the error names both; `MK_SLOT_SPILL=1`
+  skips the check, and a Windows / WSL2 driver's sysmem fallback then puts the rest in system memory). A prompt that does
+  not fit its slot gets the usual 400. The KV cache is q8_0 (`--kv f16` is refused at startup); the
   presets (`MK_KV`, `MK_KV_WIN`) apply to every slot.
 - **The same replies:** a greedy reply is the one the request gets when it runs alone on the server, bit for bit,
   whatever runs beside it, its follow-up turns included. Each slot decodes as it decodes
