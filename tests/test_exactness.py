@@ -55,7 +55,8 @@ else:
 '''
 
 # the server's Python: answers /health and chat requests, reporting reused prompt tokens from a server's second request
-# on; STUB_BREAK=warm changes every reply after a server's first, STUB_BREAK=nocache reports no reuse
+# on; STUB_BREAK=warm changes every reply after a server's first, STUB_BREAK=nocache reports no reuse, STUB_BREAK=solo<n>
+# changes the replies of a server started with MK_PF_SOLO=n
 STUB_SERVER = r'''
 import hashlib, json, os, sys
 from http.server import BaseHTTPRequestHandler, HTTPServer
@@ -79,6 +80,7 @@ class H(BaseHTTPRequestHandler):
         key = os.environ.get("STUB_SALT", "") + json.dumps(json.loads(body), sort_keys=True)
         text = hashlib.sha256(key.encode()).hexdigest()[:24]
         if os.environ.get("STUB_BREAK") == "warm" and served[0] > 1: text += "!"
+        if os.environ.get("STUB_BREAK") == "solo" + os.environ.get("MK_PF_SOLO", "-"): text += "?"
         cached = 0 if served[0] == 1 or os.environ.get("STUB_BREAK") == "nocache" else 10
         self.send({"choices": [{"message": {"role": "assistant", "content": text}, "finish_reason": "stop"}],
                    "usage": {"completion_tokens": 7, "prompt_tokens_details": {"cached_tokens": cached}}})
@@ -122,8 +124,8 @@ class ExactnessScriptTests(unittest.TestCase):
     def test_every_check_passes_on_an_exact_build(self) -> None:
         rc, out = self.run_script("pass")
         self.assertEqual(rc, 0, out)
-        self.assertEqual(out.count("PASS "), 9, out)  # depth 2, mtp 2, chunks 2, server 3
-        self.assertIn("9 passed, 0 failed", out)
+        self.assertEqual(out.count("PASS "), 10, out)  # depth 2, mtp 2, chunks 2, server 3, agents 1
+        self.assertIn("10 passed, 0 failed", out)
 
     def test_a_depth_that_changes_the_ids_fails(self) -> None:
         rc, out = self.run_script("d4", "--legs", "depth,mtp", STUB_BREAK="d4")
@@ -158,6 +160,11 @@ class ExactnessScriptTests(unittest.TestCase):
         self.assertEqual(out.count("FAIL server, "), 3, out)
         self.assertIn("the warm server reused nothing (usage.prompt_tokens_details.cached_tokens 0), so warm == fresh proves nothing", out)
 
+    def test_a_prompt_fed_in_slot_chunks_that_answers_differently_fails(self) -> None:
+        rc, out = self.run_script("solo", "--legs", "agents", STUB_BREAK="solo100")
+        self.assertEqual(rc, 1, out)
+        self.assertIn("FAIL agents: the chunks prompt fed in slot prefill chunks of 100 (MK_PF_SOLO)", out)
+
     def test_a_failing_cli_is_reported_with_its_error(self) -> None:
         rc, out = self.run_script("fail", "--legs", "depth", STUB_FAIL="1")
         self.assertEqual(rc, 1, out)
@@ -169,10 +176,10 @@ class ExactnessScriptTests(unittest.TestCase):
         ref = os.path.join(self.tmp.name, "ref")
         rc, out = self.run_script("same", "--compare", ref)
         self.assertEqual(rc, 0, out)
-        self.assertIn("PASS compare: 19 of 19 results identical", out)
+        self.assertIn("PASS compare: 21 of 21 results identical", out)
         rc, out = self.run_script("other", "--compare", ref, STUB_SALT="x")
         self.assertEqual(rc, 1, out)
-        self.assertIn("FAIL compare: 0 of 19 results identical", out)
+        self.assertIn("FAIL compare: 0 of 21 results identical", out)
 
     def test_mtp_needs_the_depth_check(self) -> None:
         rc, out = self.run_script("bad", "--legs", "mtp")

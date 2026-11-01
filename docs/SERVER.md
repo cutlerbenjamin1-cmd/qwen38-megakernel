@@ -436,7 +436,8 @@ MK_AGENTS=4 scripts/serve.sh 8080 0                                        # the
   into its last reply resumes at a checkpoint inside its last prompt, as with
   [exact reuse](#exact-and-how-it-is-checked). A prompt that arrives while other slots decode is fed in chunks beside
   their cycles; with `MK_EXACT` its rows are those of the same prompt fed in one go (the engine computes every chunk
-  but the prompt's last with the batched prefill kernels, and those rows do not depend on where a chunk starts).
+  but the prompt's last with the batched prefill kernels and ends it on their 32-token scan grid, so its rows do not
+  depend on where the prompt is cut).
   Sampled replies (temperature above 0 with a `seed`) are reproducible alone, and beside other
   requests keep their distribution but not their tokens: speculative sampling's tokens depend on the draft schedule,
   and a slot's drafts depend on how many slots share the cycle (an engine limitation). Measured on 2026-10-28 (Q4_K_M;

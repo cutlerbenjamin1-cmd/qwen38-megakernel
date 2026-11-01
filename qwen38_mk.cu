@@ -6436,6 +6436,7 @@ struct MKEngine::Impl {
     // The caller (mk_server --exact-reuse) never appends to decoded rows: it restores the last checkpoint at or
     // before the divergence and prefills from there (the reply's rows were written by the decode kernels).
     bool exact = false;
+    bool exact_off_grid = false; // a batched prefill started off the grid (warned once)
     struct RingSide { int8_t * q; __half * s; size_t off; }; // device ring values / scales, offset in CkSlot::ring
     std::vector<RingSide> rsides[N_ATT_SLOTS];
     size_t ring_bytes_ck = 0;          // per checkpoint
@@ -11359,6 +11360,11 @@ int MKEngine::prefill(const std::vector<int> & tokens, const std::vector<int> & 
         p_->pf_to.store(to);
     }
     if (batched && (feed.size() >= 2 || rows_only)) {
+        if (p_->exact && n0 % 32 != 0 && !p_->exact_off_grid) {
+            p_->exact_off_grid = true;
+            fprintf(stderr, "[mk] warning: MK_EXACT: a prefill from position %d, off the 32-token scan grid: its rows depend on "
+                            "where it starts (not exact)\n", n0);
+        }
         // all but the last token in batched kernels; the last one goes through the megakernel,
         // which produces the first output token and the MTP drafts (rows_only: every token in batched kernels)
         const std::vector<int> head(feed.begin(), feed.end() - (rows_only ? 0 : 1));
@@ -11915,7 +11921,12 @@ int MKEngine::slot_prefill(int slot, int budget) {
             return;
         }
         if (L.pend.empty()) return;
-        const size_t n = std::min<size_t>(L.pend.size(), (size_t) budget);
+        size_t n = std::min<size_t>(L.pend.size(), (size_t) budget);
+        // MK_EXACT: a chunk before the last ends on the 32-token scan grid (the next grid point if the budget reaches none)
+        if (I.exact && n < L.pend.size()) {
+            const size_t s = I.seq.size(), e = (s + n) / 32 * 32;
+            n = e > s ? e - s : std::min(L.pend.size(), (s / 32 + 1) * 32 - s);
+        }
         const std::vector<int> chunk(L.pend.begin(), L.pend.begin() + n);
         L.pend.erase(L.pend.begin(), L.pend.begin() + n);
         try {

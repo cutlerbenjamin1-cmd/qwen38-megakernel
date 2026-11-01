@@ -224,9 +224,10 @@ engine calls behind each feature under
 - **Checkpoints:** DeltaNet state snapshots saved inside the batched prefill into a pool of `MK_CK_SLOTS` [8] slots
   in pinned host memory; a rewind restores the last one at or before a divergence and prefills from there. Pinned
   checkpoints (`MKEngine::ck_pin`) are never evicted from the pool and travel with a parked conversation.
-- **Exact reuse** (`MK_EXACT=1`): prefill rows that do not depend on where a chunk starts (attention over absolute
-  key segments, checkpoints on the absolute 32-token scan grid) and a draft vocabulary rebuilt as a fresh prefill
-  builds it, so a restored prefix plus a prefill equals a fresh prefill of the whole prompt, bit for bit.
+- **Exact reuse** (`MK_EXACT=1`): prefill rows that do not depend on where a chunk starts on the absolute 32-token
+  scan grid (attention over absolute key segments, checkpoints and slot prefill chunks on that grid) and a draft
+  vocabulary rebuilt as a fresh prefill builds it, so a restored prefix plus a prefill equals a fresh prefill of the
+  whole prompt, bit for bit.
 - **Host store:** pinned 32 MiB chunks (`MK_STORE_CHUNK_MIB`) up to a budget. `MKEngine::park` copies a sequence
   (KV rows, window rings, recurrent state, token sequence, image spans, draft vocabulary, its newest checkpoints and
   its pinned ones) and `unpark` makes the live engine that sequence again, bit for bit. `side_begin` / `side_end`

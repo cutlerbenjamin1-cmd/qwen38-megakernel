@@ -14,11 +14,12 @@ import urllib.request
 
 HERE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 WIN = os.name == "nt"
-LEGS = ("depth", "mtp", "chunks", "server")
+LEGS = ("depth", "mtp", "chunks", "server", "agents")
 PROMPTS = {"code": "Write a C++ function that parses a GGUF header.",
            "story": "Tell me a short story about a lighthouse keeper."}
 SAMPLED = ["--temp", "1", "--top-p", "0.95", "--top-k", "20", "--seed", "7"]
 CHUNKS = (2048, 1280, 768)  # MK_PF_CAP values: multiples of 128, all >= 640 (smaller caps take another end-snapshot path)
+SOLO = (100, 0)  # MK_PF_SOLO values: slot prefill chunks of 100 tokens (not a multiple of 32), the whole prompt
 # the server checks' system message: with exact reuse a request resumes at a checkpoint (a 64-token grid and each message
 # start), so the first turn must span several of them for the follow-up to reuse anything, as an agent's system prompt does
 SYSTEM = " ".join([
@@ -43,9 +44,11 @@ Checks the exactness claims of README.md ("Exact output") on this build:
           prefill chunk size (MK_PF_CAP)
   server  with --exact-reuse, a follow-up turn, an edited turn and a sampled follow-up (fixed seed) on a warm server
           equal the same request sent to a fresh server (and the warm server did reuse its cache)
+  agents  with --agents 1 (MK_EXACT), the chunks prompt fed in slot prefill chunks of 100 tokens (MK_PF_SOLO) gets the
+          greedy reply it gets fed whole
 Every result goes to <out>/exactness.json. --compare DIR then checks that another build's results (Windows against Linux,
 or the previous release) are identical. Needs the GPU to itself: one CLI process per depth, one without the MTP layer,
-one per chunk size, and four server starts."""
+one per chunk size, and six server starts."""
 
 
 class LegFailed(Exception):
@@ -119,10 +122,11 @@ SYS = {"role": "system", "content": SYSTEM}
 
 
 class Server:
-    """server/mk_server.py with exact reuse on --port; stops it (and waits for its exit) when the block ends"""
+    """server/mk_server.py with exact reuse on --port, more options and environment; stops it (and waits for its exit)
+    when the block ends"""
 
-    def __init__(self, chk, name):
-        self.chk, self.name = chk, name
+    def __init__(self, chk, name, args=(), env=None):
+        self.chk, self.name, self.args, self.env = chk, name, list(args), env or {}
         self.url = f"http://127.0.0.1:{chk.a.port}"
         self.log = chk.path(name, "log")
 
@@ -131,14 +135,14 @@ class Server:
         if port_open(a.port):
             raise LegFailed(f"{self.name}: port {a.port} is in use (--port)")
         cmd = [a.python, os.path.join(HERE, "server", "mk_server.py"), "-m", a.model, "--port", str(a.port), "-c", "32768",
-               "--kv", "q8", "-d", str(max(a.depths)), "--exact-reuse"]
+               "--kv", "q8", "-d", str(max(a.depths)), "--exact-reuse"] + self.args
         if a.draft_vocab:
             cmd += ["--draft-vocab", a.draft_vocab]
         env = {k: v for k, v in os.environ.items() if k != "MK_API_KEY"}  # (its own server: the requests carry no key)
         self.logf = open(self.log, "wb")
         try:
             self.p = subprocess.Popen(cmd, stdin=subprocess.DEVNULL, stdout=self.logf, stderr=subprocess.STDOUT,
-                                      env=dict(env, MK_KEEP_WARM_S="0"))
+                                      env={**env, "MK_KEEP_WARM_S": "0", **self.env})
         except OSError as e:
             self.logf.close()
             raise LegFailed(f"{self.name}: cannot start {a.python} ({e})")
@@ -337,6 +341,16 @@ class Check:
                                           f"{cached[k]!r}), so warm == fresh proves nothing")
             else:
                 self.verdict(fresh == warm[k], what, f"warm:  {warm[k]!r}\nfresh: {fresh!r}")
+
+    def agents(self):
+        msgs, got = [user(long_prompt())], {}
+        for n in SOLO:
+            with Server(self, f"agents_solo{n}", ["--agents", "1"], {"MK_PF_SOLO": str(n)}) as s:
+                got[n], _ = s.chat(msgs, {"temperature": 0})
+            self.rec[f"agents/solo {n}"] = got[n]
+        a, b = SOLO
+        self.verdict(got[a] == got[b], f"agents: the chunks prompt fed in slot prefill chunks of {a} (MK_PF_SOLO) gets the "
+                                       "greedy reply it gets fed whole", f"chunks of {a}: {got[a]!r}\nwhole: {got[b]!r}")
 
     def save(self):
         a = self.a

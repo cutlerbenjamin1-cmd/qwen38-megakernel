@@ -323,9 +323,9 @@ Read by the server only (there is no option for them):
 | `MK_MAX_BODY_MB` | `128` | largest request body in MB, Content-Length or chunked; larger ones get a 413 | 5a61fb6, 2026-10-17 |
 | `MK_MAX_IMAGES` | `32` | images per request; more get a 400 | 87ab132, 2026-10-17 |
 | `MK_MAX_VIDEO_FRAMES` | `256` | video frames per request, all of its videos (64 s at 4 fps) | 1ffaa76, 2026-10-18 |
-| `MK_PF_MIX` | `256` | `--agents`: rows of a waiting prompt fed in each decode cycle's pass beside the decoding slots (`mk_slots_step_mixed`), so they keep decoding while a long prompt is read; `0`: `MK_PF_CHUNK` tokens between the cycles. With `MK_EXACT` (the `--agents` default) the chunking changes no reply | 6fa95e9, 2026-10-28 |
-| `MK_PF_CHUNK` | `512` | `--agents` with `MK_PF_MIX=0`: prompt tokens fed between two decode cycles (`0`: the whole prompt, the other slots wait) | 6fa95e9, 2026-10-28 |
-| `MK_PF_SOLO` | `0` | `--agents`: prompt tokens fed per call while no slot decodes (`0`: the whole prompt) | 6fa95e9, 2026-10-28 |
+| `MK_PF_MIX` | `256` | `--agents`: rows of a waiting prompt fed in each decode cycle's pass beside the decoding slots (`mk_slots_step_mixed`), so they keep decoding while a long prompt is read; `0`: `MK_PF_CHUNK` tokens between the cycles. With `MK_EXACT` (the `--agents` default) a chunk before the prompt's last ends on the 32-token scan grid (up to 31 tokens off this budget) and the chunking changes no reply | 6fa95e9, 2026-10-28 |
+| `MK_PF_CHUNK` | `512` | `--agents` with `MK_PF_MIX=0`: prompt tokens fed between two decode cycles (`0`: the whole prompt, the other slots wait); with `MK_EXACT`, on the 32-token grid as `MK_PF_MIX` | 6fa95e9, 2026-10-28 |
+| `MK_PF_SOLO` | `0` | `--agents`: prompt tokens fed per call while no slot decodes (`0`: the whole prompt); with `MK_EXACT`, on the 32-token grid as `MK_PF_MIX` | 6fa95e9, 2026-10-28 |
 | `MK_IMAGE_MAX_PIXELS` | `100000000` | largest image or video frame in pixels, checked from the file header before decoding; also read by the vision library. The server reads it only with `--mmproj` | 8f24df3, 2026-10-17 |
 
 `MK_MAX_BODY_MB`, `MK_MAX_IMAGES`, `MK_MAX_VIDEO_FRAMES` and `MK_IMAGE_MAX_PIXELS` must be positive integers, the three

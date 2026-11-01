@@ -2463,7 +2463,8 @@ class SlotScheduler:
     (mk_slots_step_mixed, MK_PF_MIX rows, default 256; MK_PF_MIX=0: MK_PF_CHUNK tokens between the cycles, default 512,
     0: the whole prompt), so they keep decoding while a long prompt is read; while none decodes, MK_PF_SOLO tokens per call
     (default 0: the whole prompt). With MK_EXACT the chunks change no row (the engine feeds every chunk but a prompt's
-    last as batched rows), so a prompt that arrives while others decode gets the reply it gets alone. A closed job is dropped from the queue, its prefill abandoned at the next chunk, or its slot left out of the
+    last as batched rows, each ending on the 32-token scan grid: up to 31 tokens off the budget), so a prompt that
+    arrives while others decode gets the reply it gets alone. A closed job is dropped from the queue, its prefill abandoned at the next chunk, or its slot left out of the
     next cycle. Open-jet's SlotScheduler (--parallel / --agents), with jobs that can be closed at any point.
 
     With MK_EXACT (exact reuse; --agents sets it), a prompt never reuses the rows a slot decoded: those depend on how many
