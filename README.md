@@ -16,8 +16,8 @@ Built on the megakernel of [open-jet](https://github.com/L-Forster/open-jet) by 
 Speculative decoding is lossless in theory, but in practice verifying several tokens in one pass rounds differently from
 verifying one, so greedy output can change with the number of drafts; a reused cache, or the same source compiled by
 another compiler, can drift in the same way. This engine is built so that none of these changes the output, the
-release checks test it, and `scripts/exactness.py` runs the core checks on any build
-([checking a build](docs/BUILDING.md#checking-a-build)):
+release checks test it, and any build can run them (`scripts/exactness.py` the core checks, `scripts/gate.sh` all of
+them: [checking a build](docs/BUILDING.md#checking-a-build)):
 
 - **Drafting never changes the answer.** Greedy token ids are identical at 0, 4 and 7 drafts. With sampling, the
   output keeps the distribution of sampling without drafts (chi-square and PIT tests). The MTP layer only proposes
