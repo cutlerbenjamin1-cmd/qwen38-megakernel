@@ -5920,13 +5920,19 @@ class RowPool {
             ch_ = std::max<int64_t>(1, n / (8 * (int64_t) (nth_ + 1)));
             next_ = 0;
             active_ = nth_;
+            err_ = nullptr;
             gen_++;
         }
         cv_.notify_all();
         work();
-        std::unique_lock<std::mutex> l(mu_);
-        cvd_.wait(l, [&] { return active_ == 0; });
-        fn_ = nullptr;
+        std::exception_ptr err;
+        {
+            std::unique_lock<std::mutex> l(mu_);
+            cvd_.wait(l, [&] { return active_ == 0; });
+            fn_ = nullptr;
+            std::swap(err, err_);
+        }
+        if (err) std::rethrow_exception(err); // (the first row that threw, on any thread)
         return true;
     }
     ~RowPool() {
@@ -5943,14 +5949,25 @@ class RowPool {
     RowPool() {
         const char * e = getenv("MK_LOAD_POOL");
         nth_ = e && atoi(e) == 0 ? 0 : (int) std::max(1u, std::thread::hardware_concurrency()) - 1;
-        for (int i = 0; i < nth_; i++) th_.emplace_back([this] { loop(); });
+        try {
+            for (int i = 0; i < nth_; i++) th_.emplace_back([this] { loop(); });
+        } catch (...) { // (no more threads: the pool is the ones that started)
+            nth_ = (int) th_.size();
+        }
     }
+    // a row that throws stops the job: no more rows are handed out, run() rethrows its exception
     void work() {
-        for (;;) {
-            const int64_t r0 = next_.fetch_add(ch_);
-            if (r0 >= n_) return;
-            const int64_t r1 = std::min(n_, r0 + ch_);
-            for (int64_t r = r0; r < r1; r++) (*fn_)(r);
+        try {
+            for (;;) {
+                const int64_t r0 = next_.fetch_add(ch_);
+                if (r0 >= n_) return;
+                const int64_t r1 = std::min(n_, r0 + ch_);
+                for (int64_t r = r0; r < r1; r++) (*fn_)(r);
+            }
+        } catch (...) {
+            next_.store(n_);
+            std::lock_guard<std::mutex> l(mu_);
+            if (!err_) err_ = std::current_exception();
         }
     }
     void loop() {
@@ -5978,6 +5995,7 @@ class RowPool {
     int64_t n_ = 0, ch_ = 1;
     std::atomic<int64_t> next_{0};
     int active_ = 0;
+    std::exception_ptr err_; // (under mu_)
     uint64_t gen_ = 0;
     bool stop_ = false;
 };
@@ -5988,13 +6006,29 @@ void parallel_rows(int64_t n, F f) {
     const std::function<void(int64_t)> fn = [&](int64_t r) { f(r); };
     if (RowPool::get().run(n, fn)) return;
     int nt = std::max(1u, std::thread::hardware_concurrency());
+    std::atomic<bool> stop{false};
+    std::mutex mu;
+    std::exception_ptr err;
     std::vector<std::thread> th;
-    for (int i = 0; i < nt; i++) {
-        th.emplace_back([&, i] {
-            for (int64_t r = i; r < n; r += nt) f(r);
-        });
+    try {
+        for (int i = 0; i < nt; i++) {
+            th.emplace_back([&, i] {
+                try {
+                    for (int64_t r = i; r < n && !stop.load(std::memory_order_relaxed); r += nt) f(r);
+                } catch (...) {
+                    stop = true;
+                    std::lock_guard<std::mutex> l(mu);
+                    if (!err) err = std::current_exception();
+                }
+            });
+        }
+    } catch (...) { // (a thread could not be created: the started ones are joined before the error goes up)
+        stop = true;
+        for (auto & t : th) t.join();
+        throw;
     }
     for (auto & t : th) t.join();
+    if (err) std::rethrow_exception(err);
 }
 
 // GGUF Q6_K block (210 B: ql[128] | qh[64] | int8 scales[16] | fp16 d) from 256 integers q in [-32, 31],
@@ -7225,12 +7259,15 @@ struct MKEngine::Impl {
         }
         rq_th.t = std::thread([this, ts] {
             const auto t0 = lclk::now();
-            for (const gguf::Tensor * t : ts) {
-                int64_t rows = 1;
-                for (size_t d = 1; d < t->ne.size(); d++) rows *= (int64_t) t->ne[d];
-                std::vector<uint8_t> v(ggml_row_size(GGML_TYPE_Q4_K, (int64_t) t->ne[0]) * (size_t) rows);
-                requant_q4k(*t, v.data());
-                rq_res[t->name] = std::move(v);
+            try {
+                for (const gguf::Tensor * t : ts) {
+                    int64_t rows = 1;
+                    for (size_t d = 1; d < t->ne.size(); d++) rows *= (int64_t) t->ne[d];
+                    std::vector<uint8_t> v(ggml_row_size(GGML_TYPE_Q4_K, (int64_t) t->ne[0]) * (size_t) rows);
+                    requant_q4k(*t, v.data());
+                    rq_res[t->name] = std::move(v);
+                }
+            } catch (...) { // (want() requantizes a tensor with no result here itself)
             }
             rq_s = lsec(t0);
         });
@@ -8441,6 +8478,7 @@ struct MKEngine::Impl {
 
     // one line of load phases (MK_LOADLOG=1: every phase on its own line)
     void load_report(double pf_wait, size_t pf_bytes) {
+        if (rq_th.t.joinable()) rq_th.t.join(); // (rq_s is the thread's until it ends)
         const double tot = lsec(t_load);
         double known = pf_wait;
         double rep = 0;
