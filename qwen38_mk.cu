@@ -4139,6 +4139,7 @@ __device__ __noinline__ void attn_combine(int n, int ws, int slot) { // ws: the 
     const int tid = threadIdx.x, d = tid & 255, wh = (tid & 255) >> 5, hf = tid >> 8;
     // V stored rotated (MK_KV "r" on V): the head's output is rotated back (WHT, its own inverse) before the gate.
     // Both halves of the block run the same number of items (NH T is even), so the barriers below match.
+    static_assert(NH % 2 == 0, "attn_combine: both block halves need the same item count");
     const bool rotv = cB.kvq8 && cB.kvrv[slot];
     float * so = reinterpret_cast<float *>(smem) + hf * 256; // scratch (the attention phase's shared memory is free)
     for (int it = blockIdx.x * 2 + hf; it < NH * T; it += 2 * gridDim.x) {

@@ -160,7 +160,7 @@ constexpr int HMI = 1, HWR = 16 * HMI, HNWM = BM / HWR; // warp tiles: 8 warps o
 template <int NB> __host__ __device__ constexpr int hm_x() { return NB * 128; } // activation tile per stage: NB tokens x 64 halves, 16 B chunks XOR-swizzled
 template <int TYPE, int NB = BN> __host__ __device__ constexpr int hm_stage() { return HT<TYPE>::SR * BM + hm_x<NB>(); }
 // (A deeper cp.async pipeline for the narrow tiles, up to 8 stages, is no faster.)
-// At NB = 32 every type fits two CTAs per SM (<= 48 KB smem, <= 96 registers), at NB = 64 / 128 one.
+// At NB = 32 every type fits two CTAs per SM (<= 49,216 B smem, Q6_K's; <= 96 registers), at NB = 64 / 128 one.
 // Per-stage mbarriers (MBL) instead of the per-stage CTA barrier: full[b] completes when the 256 threads' copies of the
 // stage in buffer b have landed (cp.async.mbarrier.arrive), empty[b] when the 8 warps are done reading it; the copies run
 // two stages ahead (not three), so a warp waits for the others only to reuse the buffer of two stages back. Per
