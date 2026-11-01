@@ -1487,7 +1487,7 @@ SAMPLER_OFF = {"mirostat": _off(0), "typical_p": _off(1, True), "typ_p": _off(1,
                "min_tokens": _off(0), "n_probs": _off(0)}
 
 
-# llama-server's --reasoning-format values: auto = deepseek (reasoning_content, streamed too: what the server always did),
+# llama-server's --reasoning-format values: auto = deepseek (reasoning_content, streamed too: the default),
 # deepseek-legacy (the content keeps the thinking block too; a stream only there), none (the thinking stays in the content)
 REASONING_FORMATS = ("auto", "deepseek", "deepseek-legacy", "none")
 # the chat_template_kwargs the server hands to the template
@@ -2809,7 +2809,7 @@ class Server:
         a = self.args
         return self.parked is not None and a.side_max > 0 and a.park_mib > 0 and getattr(self.eng, "side_keep", False)
 
-    # ---- host cache: side requests (TODO #15) and parked conversations (#9), switched at request boundaries ----
+    # ---- host cache: side requests and parked conversations, switched at request boundaries ----
     def resume_point(self, seq, committed, cks, cached_spans, toks, spans):
         """how load_prompt would continue `toks` (image spans `spans`) on the cached `seq`: (common prefix, the image
         position that cut it or None, the position it resumes at, 'append' | 'checkpoint' | 'reset')"""
@@ -3211,7 +3211,7 @@ class Server:
         }
 
     def props(self):
-        """llama-server's GET /props fields we have, plus `engine` (engine_info)"""
+        """the fields of llama-server's GET /props that the server has, plus `engine` (engine_info)"""
         b = getattr(self.eng, "build", None) or {}
         params = {"temperature": DEF_TEMP, "top_k": DEF_TOP_K, "top_p": DEF_TOP_P, "min_p": DEF_MIN_P, "seed": -1,
                   "presence_penalty": 0.0, "frequency_penalty": 0.0, "max_tokens": -1, "n_predict": -1, "stop": [],
@@ -3228,7 +3228,7 @@ class Server:
         }
 
     def models(self):
-        """GET /v1/models: the one model, with llama-server's meta where we have it"""
+        """GET /v1/models: the one model, with llama-server's meta where the server has it"""
         meta = {"n_ctx": self.args.ctx}
         try:
             meta["size"] = os.path.getsize(self.args.model)
@@ -3246,7 +3246,7 @@ class Server:
                             "details": {"format": "gguf"}}]}
 
     def slots(self):
-        """GET /slots: the one slot (llama-server's fields we have)"""
+        """GET /slots: the one slot (the llama-server fields the server has)"""
         return [{"id": 0, "n_ctx": self.args.ctx, "is_processing": self.busy(),
                  "speculative": bool(getattr(self.eng, "has_mtp", True)) and bool(getattr(self.args, "draft", 0))}]
 
@@ -3396,7 +3396,7 @@ class Server:
         own control tokens (kept), and each piece between them is tokenized with its texts put back, as plain text where
         it has any (parse_special false: the piece is one run of text, as llama.cpp tokenizes the text between special
         tokens, so those texts never become control tokens). Pieces without any, and every prompt without such text
-        in its content, tokenize exactly as before."""
+        in its content, are tokenized with control-token text parsed as special tokens (Engine.tokenize's default)."""
         if not lit:
             return self.eng.tokenize(text)
         _, back, lt = lit
