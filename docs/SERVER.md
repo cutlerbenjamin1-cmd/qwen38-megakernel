@@ -69,8 +69,9 @@ The port opens before the model loads: until the load is done every request gets
 (`/health` answers 200 `{"status": "ok"}` once ready), and a port that is already taken fails at once instead of after
 the load. With the model on a local disk the server is ready in about 12 s under WSL2 (model on ext4) and about 7 s
 natively on Windows (NVMe). Under WSL2, keep the GGUF on the Linux filesystem: files on `/mnt/c` load several times
-slower. Before it listens, the server runs one prefill and one decode cycle, so a context too large
-for the card fails at startup rather than on the first request.
+slower. Before it listens, the server runs one prefill and one decode cycle, so a context too large for the card fails
+at startup rather than on the first request (on a driver with the CUDA sysmem fallback, Windows and WSL2, it runs,
+slowly, and the engine warns at load: [ENGINE.md](ENGINE.md#kv-cache)).
 
 ```sh
 curl -s http://127.0.0.1:8080/v1/chat/completions -H 'Content-Type: application/json' -d '{
