@@ -1,7 +1,6 @@
 # Windows build (the Makefile's targets with MSVC 2022 + nvcc): qwen38mk.dll (server engine), qwen38_mk.exe (CLI),
 # qwen38vision.dll (CPU image encoder), tools\*.exe. The engine is compiled with the same nvcc flags as the Makefile.
-#   .\build.ps1                         everything, the served configuration (MKFLAGS = wide verify, up to 7 drafts)
-#   .\build.ps1 -MkFlags ""             the lean engine (up to 4 drafts)
+#   .\build.ps1                         everything, the served configuration (MKFLAGS)
 #   .\build.ps1 -Targets vision         only the vision library + its tools (no CUDA compile)
 # -Llama: llama.cpp built with CMake (BUILD_SHARED_LIBS=ON; default ..\llama.cpp). -Cuda: the CUDA toolkit (default
 # $env:CUDA_PATH). -Arch: e.g. sm_86 (default: the first GPU's compute capability).
@@ -9,7 +8,7 @@ param(
     [string] $Llama = (Join-Path $PSScriptRoot "..\llama.cpp"),
     [string] $Cuda = $env:CUDA_PATH,
     [string] $Arch = "",
-    [string] $MkFlags = "-DMK_WV=1 -DMK_MAXT=8 -DMK_WV_Q6F=1 -DMK_K5=1",
+    [string] $MkFlags = "-DMK_WV_Q6F=1 -DMK_K5=1",
     [ValidateSet("all", "engine", "vision", "tools")] [string[]] $Targets = @("all")
 )
 $ErrorActionPreference = "Stop"

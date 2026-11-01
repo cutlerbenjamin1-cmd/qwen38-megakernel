@@ -197,7 +197,7 @@ __device__ __forceinline__ unsigned h2u(__half2 h) { return *reinterpret_cast<un
 // warps 0-3 compute the 64 gate rows of W (TYPE, LAY), warps 4-7 the 64 up rows of Wu (TYPE2, LAY2), each half with its
 // own stage layout (gate's weight bytes, then up's), copies, scales and fragments; the products, sums and the epilogue
 // are those of mmh<TYPE> + mmh<TYPE2> into fp32 + pk_glu: bit-identical.
-// LAY 1 (MK_WV): W (and W2) are stored in the wv layout of wv.cuh: units (16-row tile, super-block) of 16 x UB bytes.
+// LAY 1: W (and W2) are stored in the wv layout of wv.cuh: units (16-row tile, super-block) of 16 x UB bytes.
 // Q4_K / Q5_K / IQ4_XS are fragment-ordered there (FMT: a 16-B chunk of qh / qs holds 8 B of rows g and g + 8), IQ4_NL /
 // Q8_0 (and Q8_0's scales) are tile-major whole blocks (shared memory receives the same bytes as from the row-major layout).
 // FMT stage layout: the FM chunks land whole (one cp.async 16 each): per 16-row tile a 512-B region of qs (Q5_K: and qh)
@@ -261,7 +261,7 @@ template <int TYPE, int LAY, int ROWS, bool TW2, int HB, int TB, bool OWN = fals
     static constexpr int WIT = OWN ? (CPT + 31) / 32 : (WCH + 255) / 256;
     static constexpr int WITS = !WCHS ? 1 : OWN ? (CPTS + 31) / 32 : (WCHS + 255) / 256;
     static constexpr int UB = FM6 ? F6U : 16 * (TYPE == TIQ4 ? 136 : BLK); // LAY: bytes per (tile, super-block) unit
-    // LAY 1 offset types (MK_MAXT > 5 ffn_down): value blocks and meta entries are tile-major, so the row's stream advances by
+    // LAY 1 offset types (ffn_down): value blocks and meta entries are tile-major, so the row's stream advances by
     // 16 entries per block (VST: value bytes per super-block, EST: meta bytes per Q6_K / Q3_K block pair or IQ3_S block)
     static constexpr int VST = LAY ? 16 * BLK : BLK, EST = LAY ? 16 * (TYPE == TIQ3S ? 16 : 36) : (TYPE == TIQ3S ? 16 : 36);
     static_assert(!FMT || SBR || FHO + ROWS * 16 <= SR * ROWS, "FMT stage layout fits the stage's weight part");

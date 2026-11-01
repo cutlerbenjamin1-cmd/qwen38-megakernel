@@ -200,7 +200,7 @@ class MKEngine {
     int position() const;
 
     // Parallel slots (open-jet's slot API): n persistent sequences (lanes) of ctx positions each (0: the most that fit),
-    // decoded together by batched launches; returns ctx. MK_WV=1 MK_MAXT > 5 builds, the plain q8 KV cache, a model whose
+    // decoded together by batched launches; returns ctx. Needs the plain q8 KV cache and a model whose
     // delta-net projections are all in the wv layout (plain Q4_K_M). The draft vocabulary is the base list from then on.
     // slot_begin: the slot takes the prompt (sampling as set_sampling), reusing the longest prefix it can (a truncate of
     // emitted tokens, else its newest checkpoint before the divergence); returns the reused tokens, slot_prefill feeds

@@ -1,4 +1,4 @@
-// wv host side: load-time re-layout of the main-pass matrices (MK_WV builds; see wv.cuh). Included by qwen38_mk.cu inside
+// wv host side: load-time re-layout of the main-pass matrices (see wv.cuh). Included by qwen38_mk.cu inside
 // its anonymous namespace, after parallel_rows.
 #pragma once
 
@@ -11,7 +11,7 @@
 size_t wv_relayout(int type, int N, int K, int rb, const uint8_t * w, const uint8_t * meta, size_t meta_n, uint8_t * out,
                    uint8_t * out_meta) {
     const int nb = K / 256;
-#if MK_MAXT > 5 && MK_WV_Q6F
+#if MK_WV_Q6F
     if (type == T_Q6K) { // FM Q6_K (wv.cuh "FM Q6_K"): units of Q6F_UNIT bytes, the meta stream inline
         const int mrow = nb * Q6_META;
         parallel_rows(N / 16, [&](int64_t tile) {
@@ -80,7 +80,7 @@ size_t wv_relayout(int type, int N, int K, int rb, const uint8_t * w, const uint
                     memcpy(dst + (((size_t) tile * nbk + i) * 16 + rr) * BS, src + ((size_t) tile * 16 + rr) * rowb + (size_t) i * BS, BS);
         });
     };
-    // Q4_K / IQ4_NL 144, Q5_K 176, Q8_0 256 (+ 16-B scale entries); MK_MAXT > 5 ffn_down: Q6_K 192 / Q3_K 96 (+ 36-B meta
+    // Q4_K / IQ4_NL 144, Q5_K 176, Q8_0 256 (+ 16-B scale entries); ffn_down: Q6_K 192 / Q3_K 96 (+ 36-B meta
     // pairs), IQ3_S 96 (+ 16-B meta per block)
     const int BS = type == T_Q8_0 ? 256 : type == T_Q5K ? 176 : type == T_Q6K ? Q6_BLK : type == T_Q3K || type == T_IQ3S ? Q3_BLK : 144;
     const int MB = type == T_Q6K || type == T_Q3K ? 2 * Q6_META : 16;
@@ -149,7 +149,7 @@ __global__ void wv_tm_dev(const uint32_t * __restrict__ src, uint32_t * __restri
         dst[i] = src[(tile * 16 + rr) * rowbw + (int64_t) b * bsw + j];
     }
 }
-#if MK_MAXT > 5 && MK_WV_Q6F
+#if MK_WV_Q6F
 // one thread per (tile, super-block, row of the tile): that row's bytes of the Q6F_UNIT unit (wv_relayout's Q6_K loop)
 __global__ void wv_q6f_dev(const uint8_t * __restrict__ w, const uint8_t * __restrict__ meta, uint8_t * __restrict__ out, int N, int nb, int rb) {
     const int mrow = nb * Q6_META;
@@ -187,7 +187,7 @@ __global__ void wv_q6f_dev(const uint8_t * __restrict__ w, const uint8_t * __res
 inline bool wv_dev_ok(int type, int N, int K, int rb, size_t meta_n, std::map<int, WvProbe> & probes) {
     const int nb = K / 256;
     if (N % 16) return false;
-#if MK_MAXT > 5 && MK_WV_Q6F
+#if MK_WV_Q6F
     if (type == T_Q6K) return meta_n == (size_t) N * nb * Q6_META && nb % 2 == 0;
 #endif
     if (wv_fm(type)) {
@@ -210,7 +210,7 @@ inline cudaError_t wv_dev_launch(int type, int N, int K, int rb, const uint8_t *
                                  uint8_t * out_meta, cudaStream_t st, const WvProbe * pp) {
     const int nb = K / 256, TPB = 256;
     auto grid = [](int64_t n) { return (unsigned) std::max<int64_t>(1, std::min<int64_t>(4096, (n + 255) / 256)); };
-#if MK_MAXT > 5 && MK_WV_Q6F
+#if MK_WV_Q6F
     if (type == T_Q6K) {
         wv_q6f_dev<<<grid((int64_t) (N / 16) * nb * 16), TPB, 0, st>>>(sw, sm, out, N, nb, rb);
         return cudaGetLastError();

@@ -1,4 +1,4 @@
-// wv: int8 tensor-core verify GEMM (mma.m16n8k32, tokens on N) for the main-pass GEMV phases (MK_WV builds).
+// wv: int8 tensor-core verify GEMM (mma.m16n8k32, tokens on N) for the main-pass GEMV phases.
 // Included by qwen38_mk.cu inside its anonymous namespace, after the dp4a phases. Counterpart of the bench kernel
 // bench/wvgemm_bench.cu (k_wv<TYPE, T, X16, PF = 0>, -DWV_TILEMAJ=2), which checks
 // T = 1..8 bit-identical per row and errors vs fp64 at fp32-rounding level.
@@ -40,7 +40,7 @@ __host__ __device__ constexpr bool wv_type(int t) { return t == T_Q4K || t == T_
 // (MK_WV_FMK=0: Q4_K / Q5_K tile-major whole blocks instead: their prefill GEMMs read whole 16-B chunks, but the
 // decode GEMMs lose most of the wv gain (8-B loads at stride 32))
 __host__ __device__ constexpr bool wv_fm(int t) { return t == T_IQ4X || (MK_WV_FMK && (t == T_Q4K || t == T_Q5K)); }
-// per-16 weight scales (MK_MAXT > 5 ffn_down types): split MMAs only
+// per-16 weight scales (the ffn_down offset types): split MMAs only
 __host__ __device__ constexpr bool wv_s16(int t) { return t == T_Q6K || t == T_Q3K; }
 
 // unit (tile, super-block sb) of an FM matrix, BS bytes per row and super-block
@@ -198,8 +198,7 @@ template <> struct WV<T_Q8_0> { // repacked: per unit 32 B (A 16 | B 16); fp16 d
     static __device__ __forceinline__ void frag(const Raw & r, int k, int & w0, int & w1) { w0 = r.q[k].x; w1 = r.q[k].y; }
 };
 
-#if MK_MAXT > 5
-// Offset types (MK_MAXT > 5: every main-layer ffn_down is on wv, these too): tile-major whole value
+// Offset types (every main-layer ffn_down is on wv, these too): tile-major whole value
 // blocks (16 x BS bytes per unit) and a tile-major meta stream (Q6_K / Q3_K: the loader's 36-B block pairs, IQ3_S: 16 B per
 // block). Values are fed with offset 32 (MIN 2: the accumulator input is MAGIC - 32 qsum, wv_fill's min2 mx), so the
 // weight is fA q'. Q6_K / Q3_K carry per-16 scales (S16): split MMAs only (X16), where h = tq >> 1 is the thread's chunk.
@@ -387,7 +386,6 @@ template <> struct WV<T_IQ3S> {
         w1 = w[1];
     }
 };
-#endif
 
 // the thread's rows g (r0) and g + 8 (r1) of super-block sb of the tile
 template <int TYPE>
@@ -598,7 +596,7 @@ __device__ __forceinline__ void wv_sb(const typename WV<TYPE>::Raw & r0, const t
     for (int k = 0; k < 8; k++) {
         int a[4];
         float fA0, gA0, fA1, gA1;
-        if constexpr (W::MIN == 2) { // offset types (MK_MAXT > 5): the thread's tq / chunk h select its bytes / scales
+        if constexpr (W::MIN == 2) { // offset types: the thread's tq / chunk h select its bytes / scales
             W::frag2(r0, k, tq, a[0], a[2]);
             W::frag2(r1, k, tq, a[1], a[3]);
             W::wsc2(s0, k, tq >> 1, fA0);
@@ -792,7 +790,6 @@ __device__ __forceinline__ WvAcc<WvCfg<T, X16>::NG> wv_tile_any(const Mat & m, i
     if constexpr (!X16) // FM Q6_K in the q32 phases (m16n8k16 form; the phase's fill was q6)
         if (m.type == T_Q6K) return wv_tile<T_Q6K, T, false>(m, tile, sb0, nsb, ldu);
 #endif
-#if MK_MAXT > 5
     if constexpr (X16) { // ffn_down: the offset types too
         switch (m.type) {
             case T_Q6K: return wv_tile<T_Q6K, T, X16>(m, tile, sb0, nsb, ldu);
@@ -801,7 +798,6 @@ __device__ __forceinline__ WvAcc<WvCfg<T, X16>::NG> wv_tile_any(const Mat & m, i
             default: break;
         }
     }
-#endif
     switch (m.type) {
         case T_Q4K: return wv_tile<T_Q4K, T, X16>(m, tile, sb0, nsb, ldu);
         case T_Q5K: return wv_tile<T_Q5K, T, X16>(m, tile, sb0, nsb, ldu);
@@ -811,7 +807,7 @@ __device__ __forceinline__ WvAcc<WvCfg<T, X16>::NG> wv_tile_any(const Mat & m, i
     }
 }
 
-#if MK_MAXT > 5 && MK_WV_OUT
+#if MK_WV_OUT
 // MK_WV_OUT's out role (offset types only): its own wv_tile instances (ROLE 1). Sharing ffn_down's makes ptxas re-split the
 // registers around those calls (ffn_down's resid_wv<8, true> then spills 60 / 228 B instead of 16 / 40)
 template <int T>
@@ -1151,10 +1147,15 @@ __device__ __forceinline__ void glu_store(int j, const float (&act)[T]) {
     }
 }
 
-#if MK_C1
-// C1 (MK_C1): per-chunk readiness of cB.qa between ffn_gu_wv and ffn_down's resid_wv. Chunk kc's counter is the word
-// cB.bar + C1_W0 + GS_GO kc (own 128-byte line; zeroed with the barrier words before every launch, or with MK_EGRESS
-// running on from the count C1_BASE the previous launch left: MK_C1E adds it). Each of the chunk's G
+// C1: the ffn_gu -> ffn_down grid barrier is replaced by per-chunk waits. ffn_down (resid_wv) runs in WV_S split-K chunks of G = gridDim / WV_S blocks, and
+// chunk kc reads only the gate / up tiles 272 kc .. 272 kc + 271; ffn_gu_wv deals exactly those tiles to chunk kc's
+// blocks, each block counts its arrival on the chunk's counter, and resid_wv waits for its own chunk's G arrivals before
+// it reads cB.qa. Bitwise exact (the same tiles and arithmetic; only which block computes a gate / up tile and when
+// ffn_down starts change). Layers whose gate and up are both on dp4a at T <= 5 (ffn_gu: warp-cyclic rows, every block
+// feeds every chunk) keep the barrier.
+// Per-chunk readiness of cB.qa between ffn_gu_wv and ffn_down's resid_wv: chunk kc's counter is the word
+// cB.bar + C1_W0 + GS_GO kc (own 128-byte line; zeroed once with the barrier words, then running on from the count
+// C1_BASE the previous launch left: MK_C1E adds it). Each of the chunk's G
 // producer blocks release-adds 1 after its gate / up tiles (c1_arrive); the chunk's consumers (the same G blocks)
 // acquire-poll it until it reaches G x the number of split edges this launch has passed (s_c1n, thread 0 of each block
 // of chunks 0 .. WV_S - 1; mk_cycle zeroes it). Cumulative, never reset within a launch: the next edge's adds come only
@@ -1164,11 +1165,7 @@ constexpr int C1_W0 = 2 * GS_GO, C1_WORDS = C1_W0 + WV_S * GS_GO; // (cB.bar wor
 static_assert((FF / 16) % WV_S == 0, "gate / up tiles per ffn_down chunk");
 static_assert(SM_TOTAL + 32 <= 99 * 1024, "mk_cycle's dynamic + static shared memory (+ s_c1n)");
 __shared__ unsigned s_c1n;
-#if MK_EGRESS
 #define MK_C1E(x) (s_c1b + (x))
-#else
-#define MK_C1E(x) x
-#endif
 __device__ __forceinline__ void c1_arrive(int kc) {
     __syncthreads(); // (every warp's q16 stores of the block's tiles before thread 0's release)
     if (threadIdx.x == 0) asm volatile("red.release.gpu.global.add.u32 [%0], 1;" ::"l"(cB.bar + C1_W0 + GS_GO * kc) : "memory");
@@ -1184,21 +1181,15 @@ __device__ __forceinline__ void c1_wait(int kc, int G) {
     }
     __syncthreads();
 }
-#endif
 
 // FFN gate / up: warp item = tile j of gate and of up -> silu(g) * u quantised per 16-chunk (chunk j) for ffn_down.
-// c1 (MK_C1): the tiles of ffn_down chunk kc go to that chunk's blocks (resid_wv: G = gridDim / WV_S blocks per chunk;
+// c1: the tiles of ffn_down chunk kc go to that chunk's blocks (resid_wv: G = gridDim / WV_S blocks per chunk;
 // blocks past WV_S G take none), and each block arrives on its chunk's counter after its tiles (no grid barrier follows).
 template <int T>
-#if MK_C1
 __device__ __noinline__ void ffn_gu_wv(const LayerW & W, bool c1 = false) {
     const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5, tq = lane & 3;
     const int G1 = gridDim.x / WV_S, kc1 = blockIdx.x / G1;
     if (c1 && kc1 >= WV_S) return;
-#else
-__device__ __noinline__ void ffn_gu_wv(const LayerW & W) {
-    const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5, tq = lane & 3;
-#endif
 #if MK_WV_Q6F // (every main-layer Q6_K is FM: the q32 tiles need the per-chunk qsum table)
     const WvXS xs = wv_fill<T, false, U_D>(cB.qn, 0, true, nullptr, false, W.fg.type == T_Q6K || W.fu.type == T_Q6K);
 #else
@@ -1206,7 +1197,6 @@ __device__ __noinline__ void ffn_gu_wv(const LayerW & W) {
 #endif
     const float * s_rs = misc(nullptr);
     constexpr int NJ = FF / 16;
-#if MK_C1
     int t0 = NJ * blockIdx.x / gridDim.x, t1 = NJ * (blockIdx.x + 1) / gridDim.x;
     if (c1) {
         constexpr int NJC = NJ / WV_S;
@@ -1214,9 +1204,6 @@ __device__ __noinline__ void ffn_gu_wv(const LayerW & W) {
         t0 = NJC * kc1 + NJC * bi / G1;
         t1 = NJC * kc1 + NJC * (bi + 1) / G1;
     }
-#else
-    const int t0 = NJ * blockIdx.x / gridDim.x, t1 = NJ * (blockIdx.x + 1) / gridDim.x;
-#endif
     const bool gw = W.fg.fm, uw = W.fu.fm;
     for (int j = t0 + (NW - 1 - warp); j < t1; j += NW) {
         float act[T];
@@ -1254,9 +1241,7 @@ __device__ __noinline__ void ffn_gu_wv(const LayerW & W) {
         }
         glu_store<T>(j, act);
     }
-#if MK_C1
     if (c1) c1_arrive(kc1);
-#endif
 }
 
 // Output rows with the residual add (out: K = VD, ffn_down: K = FF, X16 = its per-16 activations), split-K WV_S chunks
@@ -1273,28 +1258,18 @@ __device__ __noinline__ void resid_wv(const Mat Wm, const QBuf in, const float *
     const int G = gridDim.x / WV_S, b = blockIdx.x;
     if (b >= WV_S * G) return;
     const int kc = b / G, bi = b - kc * G;
-#if MK_C1
     if (role & 2) c1_wait(kc, G); // (C1: ffn_down after ffn_gu_wv's c1 dealing, no grid barrier: this chunk's tiles of in)
-#endif
-#if MK_MAXT > 5
 #if MK_WV_Q6F
     const WvXS xs = wv_fill<T, X16, US>(in, US * kc, false, nullptr, X16 && wv_min2(Wm.type), !X16 && Wm.type == T_Q6K);
 #else
     const WvXS xs = wv_fill<T, X16, US>(in, US * kc, false, nullptr, X16 && wv_min2(Wm.type));
 #endif
-#else
-    const WvXS xs = wv_fill<T, X16, US>(in, US * kc, false);
-#endif
     constexpr int NTILE = D / 16;
     const int t0 = NTILE * bi / G, t1 = NTILE * (bi + 1) / G;
-#if MK_C1
     unsigned * cnt = cB.wvcnt + (role & 1) * (D / 32); // (role bit 1: the C1 wait above)
-#else
-    unsigned * cnt = cB.wvcnt + role * (D / 32);
-#endif
     float * x = cB.x;
     for (int tile = t0 + (NW - 1 - warp); tile < t1; tile += NW) {
-#if MK_MAXT > 5 && MK_WV_OUT
+#if MK_WV_OUT
         WvAcc<C::NG> a;
         if constexpr (OFF) a = wv_tile_off<T>(Wm, tile, CH * kc, CH, xs);
         else a = wv_tile_any<T, X16>(Wm, tile, CH * kc, CH, xs);
@@ -1364,11 +1339,11 @@ __device__ __noinline__ void resid_wv(const Mat Wm, const QBuf in, const float *
 }
 
 // out / ssm_out (K = VD) in the wv layout, residual add into x, re-quantised for the next normed consumer (role 0).
-// MK_WV_OUT (MK_MAXT > 5): the offset types run the split MMAs (X16, min2 fill): their per-16 weight scales need them, and
+// MK_WV_OUT: the offset types run the split MMAs (X16, min2 fill): their per-16 weight scales need them, and
 // the q32 activations fit the split view as they are (a block's two 16-chunks are units with the block's scale each)
 template <int T>
 __device__ __forceinline__ void resid_out_wv(const Mat & Wm, const float * wnext) {
-#if MK_MAXT > 5 && MK_WV_OUT
+#if MK_WV_OUT
     if (wv_min2(Wm.type) && !(MK_WV_Q6F && Wm.type == T_Q6K)) { // (MK_WV_Q6F: Q6_K runs the q32 FM tiles below)
         resid_wv<T, true, VD, true>(Wm, cB.qo, wnext, 0);
         return;
@@ -1902,16 +1877,11 @@ template <int T>
 __device__ __noinline__ void ffn_gu_ck(const LayerW & W) {
     using C = WvCfg<T, false>;
     const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5, tq = lane & 3;
-#if MK_C1
     const int G1 = gridDim.x / WV_S, kc1 = blockIdx.x / G1;
     if (kc1 >= WV_S) return;
     constexpr int NJC = FF / 16 / WV_S;
     const int bi = blockIdx.x - kc1 * G1;
     const int t0 = NJC * kc1 + NJC * bi / G1, t1 = NJC * kc1 + NJC * (bi + 1) / G1;
-#else
-    constexpr int NJ = FF / 16;
-    const int t0 = NJ * blockIdx.x / gridDim.x, t1 = NJ * (blockIdx.x + 1) / gridDim.x;
-#endif
     rs_rows<T>(cB.qn);
     const bool q6 = W.fg.type == T_Q6K || W.fu.type == T_Q6K;
     const int j = t0 + (NW - 1 - warp);
@@ -1956,9 +1926,7 @@ __device__ __noinline__ void ffn_gu_ck(const LayerW & W) {
         }
         glu_store<T>(j, act);
     }
-#if MK_C1
     c1_arrive(kc1);
-#endif
 }
 
 // out / ssm_out / ffn_down with the residual add, RT rows (resid_wv's split-K WV_S chunks; each chunk's K range in
@@ -1973,12 +1941,8 @@ __device__ __noinline__ void resid_wv_ck(const Mat Wm, const QBuf in, const floa
     const int G = gridDim.x / WV_S, b = blockIdx.x;
     if (b >= WV_S * G) return;
     const int kc = b / G, bi = b - kc * G;
-#if MK_C1
     if (role & 2) c1_wait(kc, G);
     unsigned * cnt = cB.wvcnt + (role & 1) * (D / 32);
-#else
-    unsigned * cnt = cB.wvcnt + role * (D / 32);
-#endif
     constexpr int NTILE = D / 16;
     const int t0 = NTILE * bi / G, t1 = NTILE * (bi + 1) / G;
     const int tile = t0 + (NW - 1 - warp);

@@ -83,46 +83,25 @@ extern char ** environ; // (state files: the MK_* settings in the key)
 #ifndef MK_DA_Q4
 #define MK_DA_Q4 1
 #endif
-// MK_WV=1: the main-pass GEMV phases run the int8 tensor-core verify GEMM (wv.cuh) on a load-time fragment-ordered
-// tile-major weight layout, at every T (T-invariant, not bit-identical to the dp4a GEMV). Default 0: the dp4a path.
-#ifndef MK_WV
-#define MK_WV 0
-#endif
+// wv: the main-pass GEMV phases run the int8 tensor-core verify GEMM (wv.cuh) on a load-time fragment-ordered
+// tile-major weight layout, at every T (T-invariant, not bit-identical to the dp4a GEMVs).
 // MK_WV_FMK (default 1): Q4_K / Q5_K main-pass matrices fragment-ordered like IQ4_XS. 0: tile-major whole blocks (the
 // prefill reads whole 16-B chunks, but decode is slower)
 #ifndef MK_WV_FMK
 #define MK_WV_FMK 1
 #endif
-// MK_WV_OUT (MK_MAXT > 5, default 0): out / ssm_out of the offset types (Q6_K / Q3_K / IQ3_S) in the wv layout too (tile-major,
+// MK_WV_OUT (default 0): out / ssm_out of the offset types (Q6_K / Q3_K / IQ3_S) in the wv layout too (tile-major,
 // as ffn_down's) on the split MMAs at every T, instead of dp4a resid32 (padded to 8 rows at T 6-7). Changes those matrices'
 // summation order (wv vs dp4a): opt-in, KLD-gated.
 #ifndef MK_WV_OUT
 #define MK_WV_OUT 0
 #endif
-// MK_WV_Q6F (MK_MAXT > 5, default 0): every main-layer Q6_K matrix fragment-ordered with its meta inline (wv.cuh "FM
+// MK_WV_Q6F (default 0): every main-layer Q6_K matrix fragment-ordered with its meta inline (wv.cuh "FM
 // Q6_K") and on wv at every T: out / ssm_out, gate / up, qkv / z, k / v leave dp4a (KLD-gated: new summation order),
 // ffn_down's Q6_K moves from tile-major to FM (bit-identical: the same integer chunk sums and float sequence).
 #ifndef MK_WV_Q6F
 #define MK_WV_Q6F 0
 #endif
-// MK_MAXT: the most tokens of one verify pass (1 + drafts). Default 5 (depth 4). 6..8 (depth 5..7) need MK_WV=1: the dp4a
-// ffn_down cannot hold T >= 6 rows, so every main-layer ffn_down runs on wv (its Q6_K / Q3_K / IQ3_S too, tile-major),
-// the conv ring has 16 slots, and the attention cores run two head-group passes at T >= 6 (48 query rows do not fit).
-#ifndef MK_MAXT
-#define MK_MAXT 5
-#endif
-#if MK_MAXT < 5 || MK_MAXT > 8 || (MK_MAXT > 5 && !MK_WV)
-#error "MK_MAXT must be 5, or 6..8 with MK_WV=1"
-#endif
-#if MK_WV_Q6F && MK_MAXT <= 5
-#error "MK_WV_Q6F needs MK_WV=1 and MK_MAXT > 5"
-#endif
-// MK_MAXT > 5 builds: every main-layer matrix of Q4_K, Q5_K, Q8_0, IQ4_NL, IQ4_XS (and Q6_K with MK_WV_Q6F) is in the wv
-// layout, so the T <= 5 dp4a GEMVs (gemv_pairs_any, resid_any, rows16_any) read the hybrid types and the MTP block only.
-// The MTP block is always re-quantised to Q4_K from Q5_K / Q6_K / Q8_0 / Q4_0 / IQ4_NL (MK_MTP_Q4=1), so their dispatch
-// drops Q5_K, Q8_0, IQ4_NL (and Q6_K with MK_WV_Q6F): ~185 k SASS instructions of mk_cycle's tree (ptxas time and
-// memory). The loader refuses any matrix these kernels would not read.
-#define DP4A_NARROW (MK_WV && MK_MAXT > 5)
 // MK_GSYNC: the grid barrier's form. 0 (default): upstream's (every block's thread 0 red.release-adds one word
 // and ld.acquire-polls that same word). 1: flag broadcast with relaxed polling (arrivals atom.acq_rel-add the count word;
 // the last arriver st.release-writes the generation to a separate "go" line; the others poll go with ld.relaxed and re-read
@@ -140,30 +119,6 @@ extern char ** environ; // (state files: the MK_* settings in the key)
 #endif
 #if MK_K5 && MK_GSYNC != 0
 #error "MK_K5 needs MK_GSYNC=0 (its split barrier is form 0's arrival / poll on the same counter)"
-#endif
-// MK_C1 (compile-time; on in every MK_WV build, 0 = the code without it): the ffn_gu -> ffn_down grid
-// barrier becomes per-chunk waits. ffn_down (resid_wv) runs in WV_S split-K chunks of G = gridDim / WV_S blocks, and
-// chunk kc reads only the gate / up tiles 272 kc .. 272 kc + 271; ffn_gu_wv deals exactly those tiles to chunk kc's
-// blocks, each block counts its arrival on the chunk's counter, and resid_wv waits for its own chunk's G arrivals before
-// it reads cB.qa. Bitwise exact (the same tiles and arithmetic; only which block computes a gate / up tile and when
-// ffn_down starts change). Layers whose gate and up are both on dp4a at T <= 5 (ffn_gu: warp-cyclic rows, every block
-// feeds every chunk) keep the barrier.
-#ifndef MK_C1
-#define MK_C1 MK_WV
-#endif
-#if MK_C1 && !MK_WV
-#error "MK_C1 needs MK_WV=1 (the split-K ffn_down it waits in)"
-#endif
-// MK_EGRESS (host egress; compile-time, on in every MK_WV build, 0 = the code
-// without it): block 0 copies
-// the launch's Ctl to a mapped host mirror after the launch's last grid barrier (step() reads the mirror instead of a
-// device-to-host copy), the barrier counts run on across launches (each launch starts from the counts the previous one
-// left, kept in cB.bar words; wrap-safe compares) so launch() zeroes them only once, and dv_add uploads asynchronously
-// from pinned staging on the launch stream. Bitwise exact (no device arithmetic changes). Aimed at the native Windows
-// build (fewer copy-engine switches per launch).
-// +16 B mk_cycle stack frame (+2 MiB local memory).
-#ifndef MK_EGRESS
-#define MK_EGRESS MK_WV
 #endif
 // MK_K2_TB: tokens per batch of resid_wv's last-arrival combine (their partial loads issued together)
 #ifndef MK_K2_TB
@@ -239,14 +194,17 @@ constexpr int D = 5120, FF = 17408, VOCAB = 248320, NL = 64, NLA = 65;
 constexpr int NH = 24, NKV = 4, HD = 256;
 constexpr int NKH = 16, NVH = 48, HK = 128;
 constexpr int QKV = 10240, VD = 6144, QG = 12288, KVD = 1024;
-constexpr int MAXT = MK_MAXT;
+// MAXT: the most tokens of one verify pass (1 + up to 7 drafts). The dp4a ffn_down cannot hold T >= 6 rows, so every
+// main-layer ffn_down runs on wv (its Q6_K / Q3_K / IQ3_S too, tile-major), the conv ring has 16 slots, and the
+// attention cores run two head-group passes at T >= 6 (48 query rows do not fit).
+constexpr int MAXT = 8;
 // batched launches (parallel slots) wider than a solo pass: RMAX rows over the lanes, the wv phases in K sub-chunk fills
 // (wv.cuh "batched passes wider than MAXT rows"); the row buffers hold RMAX rows
 #ifndef MK_PAR_RMAX
 // (16: 16-row passes are faster than 24-row ones at 3-4 lanes)
 #define MK_PAR_RMAX 16
 #endif
-#define MK_PAR_WIDE (MK_MAXT > 5 && MK_EGRESS && MK_WV && !MK_WV_OUT && MK_PAR_RMAX > MK_MAXT)
+#define MK_PAR_WIDE (!MK_WV_OUT && MK_PAR_RMAX > 8) // (8: MAXT, which the preprocessor cannot see)
 constexpr int RMAX = MK_PAR_WIDE ? MK_PAR_RMAX : MAXT;
 static_assert(RMAX % 8 == 0 && RMAX <= 32, "RMAX: whole 8-row lm_head passes, store_lane_t's 32 lanes");
 constexpr int MAXT_PF = 5; // rows of prefill-mode and scoring launches (T >= 6 runs only as a decode verify pass)
@@ -254,7 +212,7 @@ constexpr int NT = 512, NW = NT / 32;
 constexpr float EPS = 1e-6f;
 constexpr float ROPE_BASE = 10000000.0f;
 // conv ring: dn_proj writes positions n .. n + T - 1 while dn_core reads n - 3 .. n + T - 1 (T + 3 slots)
-constexpr int CONV_RING = MAXT > 5 ? 16 : 8, KV_RING = 16, H_RING = 16;
+constexpr int CONV_RING = 16, KV_RING = 16, H_RING = 16;
 static_assert(MAXT + 3 <= CONV_RING && 2 * MAXT - 1 <= KV_RING, "rings");
 // KV cache rows per kv head and RoPE table rows past the usable context (Bufs::ctx = ctx + KV_PAD): a decode launch at
 // position n writes K / V rows up to n + 2 MAXT - 2 (the MTP block's catch-up rows up to P <= n + MAXT, then its draft
@@ -315,9 +273,7 @@ struct Mat {
     const uint8_t * w;
     const __half * d; // per-row block scales for repacked Q6_K / Q8_0
     int type, K, N, rb, nd;
-#if MK_WV
     int fm; // 1: stored in the wv layout (wv.cuh; main-pass matrices of the wv types), read by the wv phases and mmh<.., 1>
-#endif
 };
 
 struct LayerW {
@@ -428,13 +384,9 @@ struct Bufs {
 #endif
     int dattn;   // decode attention of all-q8 slots: 1 attn_core_q8 (default), 0 attn_core_t (MK_DATTN=0)
     int mtp_win; // MK_MTP_WIN > 0: the MTP block's decode attention sees the last mtp_win positions only (drafts only)
-#if MK_MAXT > 5
     int mtp_kvc; // MK_MTP_KVC builds: K / V-only MTP catch-up rows (mtp_kv_pass) on (default), 0 with env MK_MTP_KVC=0
-#endif
-#if MK_WV
     float * wvpart;  // wv split-K partial sums [WV_S][MAXT][D] (resid_wv)
     unsigned * wvcnt; // [2][D / 32] arrivals per 32-row group (out, ffn_down); the last arrival resets it to 0
-#endif
     // runtime switches (env, read at init; uniform per launch, outside the inner loops; all bit-exact):
     int k1;          // K1, MK_K1 (default 1): dn_proj_wv deals the alpha / beta items to the warps without a qkv / z tile
     int k2;          // K2, MK_K2 (default 1): resid_wv's last-arrival combine issues MK_K2_TB tokens' partial loads together
@@ -443,9 +395,7 @@ struct Bufs {
     // (The host refuses bit 1.)
     int k6;
     int * err; // mapped host words, set only on failure: [0] no finite main logit / invalid token, [1] MTP catch-up out of range
-#if MK_EGRESS
     Ctl * ctl_eg; // mapped host copy of ctl, written by block 0 at the end of every launch (mk_egress)
-#endif
 };
 
 __constant__ ModelW cW;
@@ -628,9 +578,8 @@ extern __shared__ __align__(16) uint8_t smem[]; // dynamic shared memory of the 
 // own 128-byte line, cB.bar + GS_GO) and the others poll only go (1: relaxed polls, then one acquire re-read; 2: acquire
 // polls); 3 = form 0's arrival with relaxed polls and one acquire re-read. Both words start at 0 every launch.
 constexpr int GS_GO = 32;
-#if MK_EGRESS
-// MK_EGRESS: the counts run on across launches. Word BAR_BASE holds the barrier count at the end of the previous launch and
-// C1_BASE (MK_C1) the C1 chunk count (every chunk's counter advances alike); block 0 writes both after the launch's last
+// The barrier counts run on across launches. Word BAR_BASE holds the barrier count at the end of the previous launch and
+// C1_BASE the C1 chunk count (every chunk's counter advances alike); block 0 writes both after the launch's last
 // barrier (mk_egress), thread 0 of every block reads them at the start (s_bar0, s_c1b). A count wraps after ~10^5
 // launches: the waits compare wrap-safe (MK_BAR_LT); MK_EPOCH turns a launch-relative count into the absolute one.
 constexpr int BAR_BASE = GS_GO + 8, C1_BASE = GS_GO + 9;
@@ -638,10 +587,6 @@ __shared__ unsigned s_bar0, s_c1b;
 static_assert(SM_TOTAL + 32 <= 99 * 1024, "mk_cycle's dynamic + static shared memory (+ s_bar0, s_c1b)");
 #define MK_BAR_LT(v, e) ((int) ((v) - (e)) < 0)
 #define MK_EPOCH(e) ((e) + s_bar0)
-#else
-#define MK_BAR_LT(v, e) v < e
-#define MK_EPOCH(e) e
-#endif
 template <int V>
 __device__ __forceinline__ void gs_arrive_wait(unsigned epoch) {
     unsigned v;
@@ -793,7 +738,6 @@ __device__ __forceinline__ SX make_sx(uint8_t * /*sm*/, int U) {
     return s;
 }
 
-#if MK_WV
 // wv activation layout (wv.cuh, wv_fill): tokens per C-column group (8, or 4 for the per-16 split of X16), groups, rows
 template <int T, bool X16> struct WvCfg {
     static constexpr int TPG = X16 ? 4 : 8;
@@ -811,7 +755,6 @@ __device__ __forceinline__ SX wv_sx() {
     s.U = LDU;
     return s;
 }
-#endif
 
 __device__ __forceinline__ float * misc(uint8_t * /*sm*/) {
     uint8_t * const sm = smem; return reinterpret_cast<float *>(sm + SM_MISC); }
@@ -1338,11 +1281,7 @@ __device__ __forceinline__ void mrows(const Mat & m, int row0, const SX & s, flo
 // out(row0, acc) receives the reduced sums for rows row0, row0 + 1.
 template <int T, int IT, int TYPE, int XP = 0, class Out>
 __device__ __noinline__ void gemv_pairs(const Mat m, int lo, int hi, Out out) {
-#if MK_WV
     const SX sx = XP ? wv_sx<T, 32 * IT>() : make_sx(nullptr, 32 * IT); // activations already in shared memory
-#else
-    const SX sx = make_sx(nullptr, 32 * IT); // activations already in shared memory
-#endif
     const int W = nwarps(), gw = gwarp();
     const int first = lo + (((gw - lo) % W) + W) % W;
     for (int it = first; it < hi; it += W) {
@@ -1355,7 +1294,9 @@ __device__ __noinline__ void gemv_pairs(const Mat m, int lo, int hi, Out out) {
     }
 }
 
-// Runtime dispatch on a matrix's type (uniform across the grid; fewer types with DP4A_NARROW). Plain switches: a capturing
+// Runtime dispatch on a matrix's type (uniform across the grid). Every main-layer matrix of Q4_K, Q5_K, Q8_0, IQ4_NL,
+// IQ4_XS (and Q6_K with MK_WV_Q6F) is in the wv layout and the MTP block is re-quantised to Q4_K, so these read the
+// hybrid types and the MTP block only; the loader refuses any matrix they would not read. Plain switches: a capturing
 // lambda would take the address of the caller's locals and push them to local memory.
 // (mk_cycle's stack frame is the deepest call chain incl. the callees' spills: a spilling GEMV instantiation of any
 // type raises the local memory of the whole kernel, ~0.12 MiB per byte. A second out-of-line switch for the newer types
@@ -1364,15 +1305,8 @@ template <int T, int IT, class Out>
 __device__ __forceinline__ void gemv_pairs_any(const Mat & m, int lo, int hi, Out out) {
     switch (m.type) {
         case T_Q4K: gemv_pairs<T, IT, T_Q4K>(m, lo, hi, out); break;
-#if !DP4A_NARROW
-        case T_Q5K: gemv_pairs<T, IT, T_Q5K>(m, lo, hi, out); break;
-#endif
 #if !MK_WV_Q6F
         case T_Q6K: gemv_pairs<T, IT, T_Q6K>(m, lo, hi, out); break;
-#endif
-#if !DP4A_NARROW
-        case T_Q8_0: gemv_pairs<T, IT, T_Q8_0>(m, lo, hi, out); break;
-        case T_IQ4NL: gemv_pairs<T, IT, T_IQ4NL>(m, lo, hi, out); break;
 #endif
         case T_Q3K: gemv_pairs<T, IT, T_Q3K>(m, lo, hi, out); break;
         case T_IQ3S: gemv_pairs<T, IT, T_IQ3S>(m, lo, hi, out); break;
@@ -1683,15 +1617,8 @@ template <int T, int IT>
 __device__ __forceinline__ void resid_any(const Mat & W, const QBuf & in, float * x, bool add, const float * wnext, uint8_t * sm) {
     switch (W.type) {
         case T_Q4K: resid32<T, IT, T_Q4K>(W, in, x, add, wnext, sm); break;
-#if !DP4A_NARROW
-        case T_Q5K: resid32<T, IT, T_Q5K>(W, in, x, add, wnext, sm); break;
-#endif
 #if !MK_WV_Q6F
         case T_Q6K: resid32<T, IT, T_Q6K>(W, in, x, add, wnext, sm); break;
-#endif
-#if !DP4A_NARROW
-        case T_Q8_0: resid32<T, IT, T_Q8_0>(W, in, x, add, wnext, sm); break;
-        case T_IQ4NL: resid32<T, IT, T_IQ4NL>(W, in, x, add, wnext, sm); break;
 #endif
         case T_Q3K: resid32<T, IT, T_Q3K>(W, in, x, add, wnext, sm); break;
         case T_IQ3S: resid32<T, IT, T_IQ3S>(W, in, x, add, wnext, sm); break;
@@ -1753,11 +1680,7 @@ template <int T> struct LaneT { float v[T]; };
 template <int T, int TYPE, int XP = 0>
 __device__ __noinline__ LaneT<T> rows16(const Mat m, int j) {
     const int lane = threadIdx.x & 31;
-#if MK_WV
     const SX sx = XP ? wv_sx<T, U_D>() : make_sx(nullptr, U_D);
-#else
-    const SX sx = make_sx(nullptr, U_D);
-#endif
     const float * s_rs = misc(nullptr);
     constexpr int R = 2; // at every T (4 rows at T <= 2 spill 44-160 B)
     LaneT<T> res;
@@ -1783,15 +1706,8 @@ template <int T>
 __device__ __forceinline__ LaneT<T> rows16_any(const Mat & m, int j) {
     switch (m.type) {
         case T_Q4K: return rows16<T, T_Q4K>(m, j);
-#if !DP4A_NARROW
-        case T_Q5K: return rows16<T, T_Q5K>(m, j);
-#endif
 #if !MK_WV_Q6F
         case T_Q6K: return rows16<T, T_Q6K>(m, j);
-#endif
-#if !DP4A_NARROW
-        case T_Q8_0: return rows16<T, T_Q8_0>(m, j);
-        case T_IQ4NL: return rows16<T, T_IQ4NL>(m, j);
 #endif
         case T_Q3K: return rows16<T, T_Q3K>(m, j);
         case T_IQ3S: return rows16<T, T_IQ3S>(m, j);
@@ -1846,11 +1762,10 @@ __device__ __forceinline__ void store_pair_t(float * base, int stride, int idx, 
         if ((lane >> 1) == t) base[t * stride + idx + (lane & 1)] = ((lane & 1) ? a[1][t] : a[0][t]) * s_rs[t];
 }
 
-#if MK_WV
-// MK_WV builds: one store functor type for every gemv_pairs call site. A lambda per site would make one gemv_pairs instance per
-// (T, type, site): ~47% of the module's PTX, and ptxas's memory grows with it (> 25 GB for the merged MK_WV build).
+// One store functor type for every gemv_pairs call site. A lambda per site would make one gemv_pairs instance per
+// (T, type, site): ~47% of the module's PTX, and ptxas's memory grows with it (> 25 GB).
 // Rows t of base (or, ring >= 0, the conv ring rows (ring + t) % CONV_RING), scaled by
-// the RMS-norm scale s_rs[t]: the stores of dn_proj's / attn_proj's lambdas, the same values.
+// the RMS-norm scale s_rs[t] (dn_proj's and attn_proj's stores).
 struct PairOut {
     float * base;
     int stride, ring;
@@ -1867,7 +1782,6 @@ struct PairOut {
         }
     }
 };
-#endif
 
 // delta-net input projections: alpha/beta (fp32), qkv -> conv ring, z
 template <int T>
@@ -1919,20 +1833,8 @@ __device__ __noinline__ void dn_proj(const LayerW & W, int dl, int n, int dn_c, 
         for (int t = 0; t < T; t++) acc[t] = wsum(acc[t]) * s_rs[t];
         store_lane_t<T>(cB.ab + ch * RMAX * 2 * NVH, 2 * NVH, row, acc);
     }
-#if MK_WV
     gemv_pairs_any<T, 5>(W.qkv, n_ab, n_ab + n_qkv, PairOut{conv, QKV, n});
     gemv_pairs_any<T, 5>(W.gate, n_ab + n_qkv, n_ab + n_qkv + n_z, PairOut{cB.z, VD, -1});
-#else
-    gemv_pairs_any<T, 5>(W.qkv, n_ab, n_ab + n_qkv, [=](int r, const float (&a)[2][T]) {
-        const int lane = threadIdx.x & 31;
-#pragma unroll
-        for (int t = 0; t < T; t++)
-            if ((lane >> 1) == t)
-                conv[((n + t) % CONV_RING) * QKV + r + (lane & 1)] = ((lane & 1) ? a[1][t] : a[0][t]) * misc(nullptr)[t];
-    });
-    gemv_pairs_any<T, 5>(W.gate, n_ab + n_qkv, n_ab + n_qkv + n_z,
-                         [=](int r, const float (&a)[2][T]) { store_pair_t<T>(cB.z, VD, r, a); });
-#endif
     // Warm L2 with what dn_core will read, while the other blocks are still projecting:
     // the head's recurrent state (64 KB), its conv weights, older conv rows and replay entries.
     if (blockIdx.x < NVH) {
@@ -2831,15 +2733,9 @@ __device__ __noinline__ void attn_proj(const LayerW & W, int slot, int n, uint8_
     const SX sx = make_sx(sm, U_D);
     fill_xs<T>(cB.qn, 0, true, sx, misc(sm));
     const int nq = QG / 2, nk = KVD / 2;
-#if MK_WV
     gemv_pairs_any<T, 5>(W.q, 0, nq, PairOut{cB.qbuf, QG, -1});
     gemv_pairs_any<T, 5>(W.k, nq, nq + nk, PairOut{cB.kbuf, KVD, -1});
     gemv_pairs_any<T, 5>(W.v, nq + nk, nq + 2 * nk, PairOut{cB.vbuf, KVD, -1});
-#else
-    gemv_pairs_any<T, 5>(W.q, 0, nq, [=](int r, const float (&a)[2][T]) { store_pair_t<T>(cB.qbuf, QG, r, a); });
-    gemv_pairs_any<T, 5>(W.k, nq, nq + nk, [=](int r, const float (&a)[2][T]) { store_pair_t<T>(cB.kbuf, KVD, r, a); });
-    gemv_pairs_any<T, 5>(W.v, nq + nk, nq + 2 * nk, [=](int r, const float (&a)[2][T]) { store_pair_t<T>(cB.vbuf, KVD, r, a); });
-#endif
     // Warm L2 with what attn_core reads first: q/k norm weights, RoPE rows of the new positions,
     // and the first K / V tile of this block's attention item (positions < n).
     pf_block(W.qn, HD * 4);
@@ -3237,7 +3133,7 @@ __device__ __forceinline__ void aq_issue(int t, uint8_t * dk, const int8_t * Kq,
 // low-bit tiles staged in their packed layout and expanded to int8 once in shared memory (kv_row_expand: q = n - 2^(bits-1)
 // with the scale unchanged, by warps 4 - 15 one interval before the tile is read; the K pipeline is one stage deeper for
 // it), so the MMA path is the q8 one for every tile and the partials equal attn_core_t's for every MK_KV format.
-// T >= 6 (MK_MAXT > 5; both forms): 6 T > 32 query rows do not fit shared memory, so the items run twice, over query
+// T >= 6 (both forms): 6 T > 32 query rows do not fit shared memory, so the items run twice, over query
 // heads 0-2 and 3-5 of each kv head (HG = 3, partial rows ho T ..); the second pass re-reads K / V (MIX: and re-expands
 // the low-bit tiles) and skips the K / V store (the first pass of the same item, in the same block, wrote those rows, the
 // MK_KV_WIN ring's q8 copies included). Per-row arithmetic is unchanged.
@@ -3639,7 +3535,6 @@ __device__ __noinline__ void attn_core_q8m(const LayerW & W, int slot, int n) {
 }
 #endif
 
-#if MK_MAXT > 5
 #ifndef MK_W48
 #define MK_W48 1 // T >= 6: 1 = attn_core_w48 (one K / V read for all 6 T query rows), 0 = attn_core_q8_t's two head-group passes
 #endif
@@ -3690,7 +3585,7 @@ __device__ __forceinline__ void kv_slice_expand(uint8_t * st, int wn) {
     *reinterpret_cast<uint4 *>(row + 32 * wn + 16) = make_uint4(o[4], o[5], o[6], o[7]);
 }
 
-// T >= 6 (MK_MAXT > 5), MK_W48: decode attention over all R = 6 T <= 48 query rows of a kv head in ONE pass, so K / V are read
+// T >= 6, MK_W48: decode attention over all R = 6 T <= 48 query rows of a kv head in ONE pass, so K / V are read
 // once (attn_core_q8_t's two head-group passes read them twice). Shared memory: 48-row sQ, sS,
 // sP, 3 K and 3 V stages (99,072 B): V(t) is issued in interval t (not t - 1), lands by the end of t + 1, read in t + 2. MIX:
 // no expansion stage; the consumers expand in place right before use: S warp wn its K rows 8 wn .. 8 wn + 7 of K(jt)
@@ -4085,13 +3980,12 @@ __device__ __noinline__ void attn_core_w48m(const LayerW & W, int slot, int n) {
     attn_core_w48<T, true>(W, slot, n);
 }
 #endif
-#endif
 
 // q8 cache: the pipelined kernel when a chunk has more than one tile (L_ctx > ATT_BUCKET; MK_DA_ROUTE), attn_core_t for
 // one-tile chunks (the pipeline fill does not pay there) and with MK_DATTN=0. Every choice gives the same partials.
 template <int T>
 __device__ __noinline__ void attn_core(const LayerW & W, int slot, int n, uint8_t * /*sm*/) {
-    if constexpr (T > 5) { // MK_MAXT > 5 (q8 cache, checked by the host): the pipelined kernel at every context (MK_W48: one
+    if constexpr (T > 5) { // q8 cache (checked by the host): the pipelined kernel at every context (MK_W48: one
                            // pass over all 6 T rows, else two head-group passes); slots with a low-bit MK_KV side run the MIX
                            // form (the same partials per row)
 #if MK_W48
@@ -4305,8 +4199,8 @@ static_assert(MAXT * 16 * 32 * 12 <= SM_CAND && SM_LSE + MK_MAX_GRID * 8 <= SM_M
 // cB.pcnt plus its occurrences in ctl->tok[1 .. nx0 + t] (the drafts in row t's context; nx0: the drafts before row 0).
 // Every value is then the true logit minus the penalty (correctly rounded, no contraction: the same in any T).
 // misc() slots ([LM_WLSE, +2 * NW): per-warp lse), above the argmax lists [16, 16 + 2 NW MAXT) and s_last (LM_LAST)
-constexpr int LM_WLSE = MAXT > 5 ? 16 + 2 * NW * MAXT : 208, LM_LSE = LM_WLSE + 32, LM_BEST = LM_LSE + 1;
-constexpr int LM_LAST = MAXT > 5 ? LM_BEST + 1 : 200;
+constexpr int LM_WLSE = 16 + 2 * NW * MAXT, LM_LSE = LM_WLSE + 32, LM_BEST = LM_LSE + 1;
+constexpr int LM_LAST = LM_BEST + 1;
 static_assert(LM_LAST < 400 && (MAXT == 5 || LM_WLSE >= 16 + 2 * NW * MAXT), "lm_head misc slots (s_tok at 400)");
 constexpr int DQ4_RB = D / 256 * 144; // MK_DRAFT_Q4: bytes of one Q4_K lm_head row (ModelW::dq4)
 __device__ __forceinline__ float pen_logit(float a, float sc, int c, float pres, float freq) {
@@ -4717,9 +4611,7 @@ __device__ __noinline__ void sample_targets_ol(int mode, int top_k, float temp, 
 }
 
 // ---- main-model control (single thread) ----
-#if MK_WV
 #include "wv.cuh"
-#endif
 
 __device__ void main_control(int mode, int last, int T, const int * tgt, bool pen, bool mtp) {
     Ctl * c = cB.ctl;
@@ -4785,9 +4677,8 @@ __device__ void main_forward(const Launch & P, uint8_t * /*sm*/, unsigned & epoc
     for (int L = 0; L < NL; L++) {
         const LayerW & W = cW.L[L];
         const float * wnext = (L + 1 < NL) ? cW.L[L + 1].attn_norm : cW.onorm;
-#if MK_WV
         // wv phases where at least one matrix of the phase is in the wv layout (the others: dp4a, per tensor at every T).
-        // T >= 6 (MK_MAXT > 5): always the wv phase functions (their dp4a part runs the hybrid types, the only ones not in
+        // T >= 6: always the wv phase functions (their dp4a part runs the hybrid types, the only ones not in
         // the wv layout there), and every main-layer ffn_down is in the wv layout (the loader checks it).
         constexpr bool WIDE = T > 5;
         if (W.attn) {
@@ -4818,7 +4709,6 @@ __device__ void main_forward(const Launch & P, uint8_t * /*sm*/, unsigned & epoc
             gsync(epoch, PH_RESID_SOUT);
             dl++;
         }
-#if MK_C1
         // C1: no grid barrier between gate / up and ffn_down: each ffn_down chunk waits for its own gate / up tiles
         // (resid_wv role bit 1). Not with a dp4a ffn_gu (T <= 5, gate and up both off the wv layout).
         if (WIDE || ((W.fg.fm || W.fu.fm) && W.fd.fm)) {
@@ -4827,7 +4717,6 @@ __device__ void main_forward(const Launch & P, uint8_t * /*sm*/, unsigned & epoc
             gsync(epoch, PH_FFN_DOWN);
             continue;
         }
-#endif
         if constexpr (WIDE) ffn_gu_wv<T>(W);
         else if (W.fg.fm || W.fu.fm) ffn_gu_wv<T>(W);
         else ffn_gu<T>(W, sm);
@@ -4836,34 +4725,6 @@ __device__ void main_forward(const Launch & P, uint8_t * /*sm*/, unsigned & epoc
         else if (W.fd.fm) resid_wv<T, true, FF>(W.fd, cB.qa, wnext, 1);
         else resid_any<T, 17>(W.fd, cB.qa, cB.x, true, wnext, sm);
         gsync(epoch, PH_FFN_DOWN);
-#else
-        if (W.attn) {
-            attn_proj<T>(W, L / 4, n, sm);
-            gsync(epoch, PH_ATTN_PROJ);
-            attn_core<T>(W, L / 4, n, sm);
-            gsync(epoch, PH_ATTN_CORE);
-            attn_combine<T>(n, 0, L / 4);
-            gsync(epoch, PH_ATTN_COMB);
-            resid_any<T, 6>(W.o, cB.qo, cB.x, true, W.post_norm, sm);
-            gsync(epoch, PH_RESID_O);
-        } else {
-            dn_proj<T>(W, dl, n, dn_c, sm);
-#if MK_K5
-            k5_arrive(epoch, PH_DN_PROJ); // split barrier: dn_core waits after its replay (k5_wait)
-#else
-            gsync(epoch, PH_DN_PROJ);
-#endif
-            dn_core<T>(W, dl, n, dn_c, n_commit, sm);
-            gsync(epoch, PH_DN_CORE);
-            resid_any<T, 6>(W.sout, cB.qo, cB.x, true, W.post_norm, sm);
-            gsync(epoch, PH_RESID_SOUT);
-            dl++;
-        }
-        ffn_gu<T>(W, sm);
-        gsync(epoch, PH_FFN_GU);
-        resid_any<T, 17>(W.fd, cB.qa, cB.x, true, wnext, sm);
-        gsync(epoch, PH_FFN_DOWN);
-#endif
     }
     write_h_rows<T>(cB.x, cB.qn, cW.onorm, cB.h_hist, n, true, sm);
 
@@ -4872,16 +4733,12 @@ __device__ void main_forward(const Launch & P, uint8_t * /*sm*/, unsigned & epoc
     int tl = 0;
     const bool sampling = P.temp > 0.0f && !P.score;
     const bool pen = (P.pres != 0.f || P.freq != 0.f) && !P.score; // (the first token of a response has nothing to penalise)
-    // The wide pass (MK_MAXT > 5, T = MAXT): decode launches of P.T = 6 .. MAXT rows run as one MAXT-row pass; the rows
+    // The wide pass (T = MAXT): decode launches of P.T = 6 .. MAXT rows run as one MAXT-row pass; the rows
     // P.T .. MAXT - 1 are padding (stale ctl tokens: their K / V, conv, delta-net ring and h rows land at future
     // positions, rewritten before any real row reads them; real rows never attend to them, and the host keeps
     // positions n + 1 .. n + MAXT in one attention partition). Only rows < P.T reach the verify / control.
     // (Prefill and scoring launches stay at T <= 5: no FULL lm_head here.)
-#if MK_MAXT > 5
     const int Tr = T == MAXT ? P.T : T;
-#else
-    constexpr int Tr = T;
-#endif
     if (P.mode == MODE_DECODE || P.score) {
         if (sampling) am_last = lm_head<T, true>(0, false, sm, s_tok, nullptr, pen, P.pres, P.freq, 0);
         else if (P.score == 2) {
@@ -4991,7 +4848,6 @@ __device__ __noinline__ void mtp_pass(const Launch & PL, int li, int row0, bool 
             Ctl * c = cB.ctl;
             const float * mm = misc(sm);
             const float conf = __expf(mm[LM_BEST] - mm[LM_LSE]);
-#if MK_MAXT > 5
 #if MK_SPEC_LOG
             cB.dlog[k * (TOPK_MAX + 1) + TOPK_MAX] = make_float2(mm[LM_LSE], mm[LM_BEST]);
 #endif
@@ -5005,18 +4861,6 @@ __device__ __noinline__ void mtp_pass(const Launch & PL, int li, int row0, bool 
             // under q' (the distribution it was drawn from) instead of the draft head's top-1 probability
             const float chain = (k == 0 ? 1.f : c->dchain) * (P.gate_chain == 2 && P.spec_smp ? dq_prob(cB.dq + k * TOPK_MAX, dt) : conf);
             const float f = P.gate_chain ? chain : conf;
-#else
-            const float chain = (k == 0 ? 1.f : c->dchain) * conf;
-#if MK_SPEC_LOG
-            cB.dlog[k * (TOPK_MAX + 1) + TOPK_MAX] = make_float2(mm[LM_LSE], mm[LM_BEST]);
-#endif
-            const float f = P.gate_chain ? chain : conf;
-            // (draft_sample reads lm_head's shared-memory copy of tl: the same values, without the L2 round trips)
-            c->tok[1 + k] = P.spec_smp ? draft_sample_ol(P.top_k, P.temp, P.top_p, P.min_p, P.seed,
-                                                         reinterpret_cast<const float2 *>(sm + SM_CAND),
-                                                         cB.dq + k * TOPK_MAX, (unsigned long long) c->mtp_P + 1 + k)
-                                       : s_tok[0];
-#endif
             c->dsmp = P.spec_smp;
             c->dconf[k] = conf;
             c->dchain = chain;
@@ -5031,9 +4875,9 @@ __device__ __noinline__ void mtp_pass(const Launch & PL, int li, int row0, bool 
 }
 
 #ifndef MK_MTP_KVC
-#define MK_MTP_KVC 1 // MAXT > 5 builds: K / V-only MTP catch-up rows (mtp_kv_pass); 0: every catch-up row runs the full pass
+#define MK_MTP_KVC 1 // K / V-only MTP catch-up rows (mtp_kv_pass); 0: every catch-up row runs the full pass
 #endif
-#define MTP_KVC (MK_MTP_KVC && MK_MAXT > 5 && MK_WV && !MK_KV_EMU)
+#define MTP_KVC (MK_MTP_KVC && !MK_KV_EMU)
 #if MTP_KVC
 // K / V-only MTP catch-up rows (MK_MTP_KVC). Of a cycle's catch-up rows (the accepted drafts + the bonus, R = a + 1) only
 // the last row's MTP output is ever read (write_h_rows keeps the last row: it feeds the draft head and the chain); the
@@ -5114,11 +4958,9 @@ __device__ void run_main(const Launch & P, uint8_t * /*sm*/, unsigned & epoch) {
     uint8_t * const sm = smem;
     main_forward<T>(P, sm, epoch);
 }
-#if MK_MAXT > 5
 // T = 6 .. MAXT: one MAXT-row pass (padding rows, see main_forward), out of line: a separate function keeps mk_cycle (and
-// ptxas's memory for it) at the size of the MAXT 5 kernel
+// ptxas's memory for it) at the size of the T <= 5 passes
 __device__ __noinline__ void run_wide(const Launch & P, unsigned & epoch) { main_forward<MAXT>(P, smem, epoch); }
-#endif
 
 // the launch's MTP passes (catch-up rows, then the drafts the next launch verifies) of the sequence of view s_view; li:
 // its lane in the batched launch PL (-1: PL is its own launch). (A lane's Launch copy passed by reference would take
@@ -5160,7 +5002,6 @@ __device__ __noinline__ void mtp_tail(const Launch & PL, int li, unsigned & epoc
     }
 }
 
-#if MK_MAXT > 5 && MK_EGRESS
 // ---- batched launches (MKEngine::slots_step): the rows of several lanes in one pass ----
 // The weight phases run once over all rows (view 0's row buffers). The per-sequence phases run per lane in its main view
 // (its rows from row 0): attention, its combine and the delta-net core as the lanes' items back to back (no grid barrier
@@ -5304,24 +5145,17 @@ __device__ __noinline__ void main_forward_b(const Launch & P, unsigned & epoch) 
 #if MK_PAR_WIDE
         if constexpr (CK) {
             ffn_gu_ck<RT>(W);
-#if MK_C1
             resid_wv_ck<RT, true, FF>(W.fd, cB.qa, wnext, 3);
-#else
-            gsync(epoch, PH_FFN_GU);
-            resid_wv_ck<RT, true, FF>(W.fd, cB.qa, wnext, 1);
-#endif
             gsync(epoch, PH_FFN_DOWN);
         } else
 #endif
         {
-#if MK_C1
             if (WIDE || ((W.fg.fm || W.fu.fm) && W.fd.fm)) {
                 ffn_gu_wv<RT>(W, true);
                 resid_wv<RT, true, FF>(W.fd, cB.qa, wnext, 3);
                 gsync(epoch, PH_FFN_DOWN);
                 continue;
             }
-#endif
             if constexpr (WIDE) ffn_gu_wv<RT>(W);
             else if (W.fg.fm || W.fu.fm) ffn_gu_wv<RT>(W);
             else ffn_gu<RT>(W, sm);
@@ -5388,7 +5222,6 @@ __device__ __noinline__ void main_forward_b(const Launch & P, unsigned & epoch) 
     gsync(epoch, PH_LMHEAD);
     }
 }
-#endif
 
 template <int T>
 __device__ void bench_phase(int which, int layer, uint8_t * /*sm*/, unsigned & epoch) {
@@ -5396,7 +5229,6 @@ __device__ void bench_phase(int which, int layer, uint8_t * /*sm*/, unsigned & e
     for (int it = 0; it < 4; it++) {
         const int L = layer + 4 * it; // different layers: weights are not L2-resident, code is
         const LayerW & W = cW.L[L];
-#if MK_WV
         if (which == 0) {
             if (W.fg.fm || W.fu.fm) ffn_gu_wv<T>(W);
             else ffn_gu<T>(W, sm);
@@ -5409,14 +5241,6 @@ __device__ void bench_phase(int which, int layer, uint8_t * /*sm*/, unsigned & e
                 else dn_proj<T>(W, 0, 0, 0, sm);
             }
         }
-#else
-        if (which == 0) ffn_gu<T>(W, sm);
-        else if (which == 1) {
-            resid_any<T, 17>(W.fd, cB.qa, cB.x, true, W.attn_norm, sm);
-        } else if (which == 2) {
-            if (!W.attn) dn_proj<T>(W, 0, 0, 0, sm);
-        }
-#endif
         gsync(epoch, PH_FFN_GU);
     }
 }
@@ -5435,7 +5259,7 @@ __device__ __noinline__ void gsync_bench(int n) {
     }
 }
 
-#if MK_MAXT > 5 && MK_EGRESS && MTP_KVC
+#if MTP_KVC
 // ---- batched MTP (Launch::mtpb): the lanes' MTP passes shared, lane i at row i of view 0's row buffers ----
 // view_mtp(i) = lane i's full view with the row buffers at row i: the per-lane parts (attention at the lane's position,
 // its K / V rows, h, the draft head and its control) run there unchanged on one row; the GEMV phases run once over all
@@ -5587,7 +5411,6 @@ __device__ __noinline__ void mtp_pass_b(const Launch & P, const MtpRows & mr, co
                 Ctl * c = cB.ctl;
                 const float * mm = misc(sm);
                 const float conf = __expf(mm[LM_BEST] - mm[LM_LSE]);
-    #if MK_MAXT > 5
     #if MK_SPEC_LOG
                 cB.dlog[k * (TOPK_MAX + 1) + TOPK_MAX] = make_float2(mm[LM_LSE], mm[LM_BEST]);
     #endif
@@ -5601,18 +5424,6 @@ __device__ __noinline__ void mtp_pass_b(const Launch & P, const MtpRows & mr, co
                 // under q' (the distribution it was drawn from) instead of the draft head's top-1 probability
                 const float chain = (k == 0 ? 1.f : c->dchain) * (Q.gate_chain == 2 && Q.spec_smp ? dq_prob(cB.dq + k * TOPK_MAX, dt) : conf);
                 const float f = Q.gate_chain ? chain : conf;
-    #else
-                const float chain = (k == 0 ? 1.f : c->dchain) * conf;
-    #if MK_SPEC_LOG
-                cB.dlog[k * (TOPK_MAX + 1) + TOPK_MAX] = make_float2(mm[LM_LSE], mm[LM_BEST]);
-    #endif
-                const float f = Q.gate_chain ? chain : conf;
-                // (draft_sample reads lm_head's shared-memory copy of tl: the same values, without the L2 round trips)
-                c->tok[1 + k] = Q.spec_smp ? draft_sample_ol(Q.top_k, Q.temp, Q.top_p, Q.min_p, Q.seed,
-                                                             reinterpret_cast<const float2 *>(sm + SM_CAND),
-                                                             cB.dq + k * TOPK_MAX, (unsigned long long) c->mtp_P + 1 + k)
-                                           : s_tok[0];
-    #endif
                 c->dsmp = Q.spec_smp;
                 c->dconf[k] = conf;
                 c->dchain = chain;
@@ -5705,26 +5516,26 @@ __device__ __noinline__ void mtp_batch(const Launch & P, unsigned & epoch) {
 }
 #endif
 
-#if MK_EGRESS
-// MK_EGRESS, after the launch's last grid barrier (every block has passed it, and with it every write to ctl): block 0
+// Egress: block 0 copies the launch's Ctl to a mapped host mirror after the launch's last grid barrier (step() reads the
+// mirror instead of a device-to-host copy), the barrier counts run on across launches (each launch starts from the counts
+// the previous one left, kept in cB.bar words; wrap-safe compares) so launch() zeroes them only once, and dv_add uploads
+// asynchronously from pinned staging on the launch stream (fewer copy-engine switches per launch, which the native
+// Windows build pays most for).
+// mk_egress, after the launch's last grid barrier (every block has passed it, and with it every write to ctl): block 0
 // publishes the counts the next launch starts from (BAR_BASE, C1_BASE) and copies ctl to its mapped host mirror (the host
 // reads that after the launch instead of a device-to-host copy)
 __device__ __forceinline__ void mk_egress(unsigned epoch) {
     if (blockIdx.x != 0) return;
     if (threadIdx.x == 0) {
         cB.bar[BAR_BASE] = s_bar0 + epoch;
-#if MK_C1
         cB.bar[C1_BASE] = s_c1b + s_c1n * (gridDim.x / WV_S); // (block 0 consumes chunk 0: s_c1n = this launch's split edges)
-#endif
     }
     if (cB.ctl_eg && threadIdx.x < sizeof(Ctl) / 4) {
         reinterpret_cast<volatile int *>(cB.ctl_eg)[threadIdx.x] = reinterpret_cast<volatile const int *>(cB.ctl)[threadIdx.x];
         __threadfence_system();
     }
 }
-#endif
 
-#if MK_MAXT > 5 && MK_EGRESS
 // a batched launch: the main pass, each lane's MTP passes (its full view: rows from 0), then mk_egress per lane
 __device__ __noinline__ void run_batch(const Launch & P, unsigned & epoch) {
     switch (P.T) {
@@ -5760,19 +5571,16 @@ __device__ __noinline__ void run_batch(const Launch & P, unsigned & epoch) {
         }
     }
 }
-#endif
 
 // P is __grid_constant__: the out-of-line callees take it by reference, and a plain parameter whose address is taken is
 // copied to local memory (320 B of the stack frame, which the driver reserves for every thread slot of the GPU)
 __global__ void __launch_bounds__(NT, 1) mk_cycle(const __grid_constant__ Launch P) { MK_VIEW_INIT();
     uint8_t * const sm = smem;
     unsigned epoch = 0;
-#if MK_EGRESS
     if (threadIdx.x == 0) { // (0 after the host's memset: the first launch, bench launches)
         s_bar0 = __ldcg(cB.bar + BAR_BASE);
         s_c1b = __ldcg(cB.bar + C1_BASE);
     }
-#endif
     if (P.mode == MODE_BENCH) {
         if (P.last == 3) { // gsync bench: P.ndraft barriers of form P.score
             switch (P.score) {
@@ -5793,37 +5601,25 @@ __global__ void __launch_bounds__(NT, 1) mk_cycle(const __grid_constant__ Launch
         cB.prof[0] = gtimer() << 8;
         s_bar_k = 0;
     }
-#if MK_C1
     if (threadIdx.x == 0) s_c1n = 0; // (C1 split edges passed: c1_wait's target)
-#endif
-#if MK_MAXT > 5 && MK_EGRESS
     if (P.nl > 0) {
         run_batch(P, epoch);
         return;
     }
-#endif
     switch (P.T) {
         case 1: run_main<1>(P, sm, epoch); break;
         case 2: run_main<2>(P, sm, epoch); break;
         case 3: run_main<3>(P, sm, epoch); break;
         case 4: run_main<4>(P, sm, epoch); break;
         case 5: run_main<5>(P, sm, epoch); break;
-#if MK_MAXT > 5
         default: run_wide(P, epoch); break; // T = 6 .. MAXT
-#endif
     }
-#if MK_EGRESS
     if (P.ndraft == 0 || P.score) {
         mk_egress(epoch);
         return;
     }
-#else
-    if (P.ndraft == 0 || P.score) return;
-#endif
     mtp_tail(P, -1, epoch);
-#if MK_EGRESS
     mk_egress(epoch);
-#endif
 }
 
 #include "prefill.cuh"
@@ -6266,9 +6062,7 @@ bool repack_iq3s(const uint8_t * src, uint8_t * q, uint8_t * meta, int nb, const
     return true;
 }
 
-#if MK_WV
 #include "wv_host.cuh"
-#endif
 #include "loader.cuh"
 
 } // namespace
@@ -6298,9 +6092,8 @@ struct MKEngine::Impl {
         int depth = 1;       // 0: n_draft - 1 after a cycle with a rejection (at least 3), 1: always n_draft,
                              // 2: 1 + the accepted count of the last cycle (clamped to [dmin, n_draft])
         int dmin = 1;
-#if MK_MAXT > 5
         // generalised gate (any depth): stop after draft k >= 1 below 0.4, drop the deepest draft (k = n_draft - 1, the
-        // T = n_draft + 1 verify row) below drop_last; at n_draft 4 the same gates as the MAXT 5 default
+        // T = n_draft + 1 verify row) below drop_last (at n_draft 4: the default gates above)
         float gate_drop[MAXT - 1] = {}, gate_stop[MAXT - 1] = {0.f, 0.4f, 0.4f, 0.4f, 0.4f, 0.4f, 0.4f};
         float drop_last = 0.4f;
         // context cap: from position dctx on, at most 4 drafts (T <= 5: at long context the wide pass's second
@@ -6311,18 +6104,11 @@ struct MKEngine::Impl {
         // 5-6 below 0.3, never drop the deepest draft (from an offline policy search on open-policy logs; greedy output
         // is unchanged). Any explicit stop / drop key turns it off.
         int g7 = 1;
-#else
-        float gate_drop[4] = {0.f, 0.f, 0.f, 0.4f}, gate_stop[4] = {0.f, 0.4f, 0.4f, 0.4f}; // on-device early stop
-#endif
         int gate_chain = 1;
         int h1 = 1; // sampling: sampled drafts (Launch::spec_smp)
     } pol;
-    // the policy's draft depth at position pos: n_draft, or (MK_MAXT > 5) at most 4 from Policy::dctx on
-#if MK_MAXT > 5
+    // the policy's draft depth at position pos: n_draft, or at most 4 from Policy::dctx on
     int depth_top(int pos) const { return pos >= pol.dctx ? std::min(n_draft_max, 4) : n_draft_max; }
-#else
-    int depth_top(int) const { return n_draft_max; }
-#endif
 #if MK_SPEC_LOG
     FILE * slog = nullptr;               // MK_SPEC_LOG_FILE: one JSON line per decode cycle
     std::vector<float2> slog_q;          // dlog of the drafts the next cycle verifies
@@ -6352,7 +6138,6 @@ struct MKEngine::Impl {
     float * emb_host = nullptr;   // the prefill's image rows: pinned, mapped (cP.emb = its device alias)
     size_t emb_cap = 0;           // (floats)
     volatile int * err_host = nullptr; // cB.err's host side
-#if MK_EGRESS
     volatile Ctl * ctl_eg_host = nullptr; // cB.ctl_eg's host side
     bool bar_live = false;                // the cB.bar counts run on from the previous launch (zeroed once, and after bench launches)
     // ctl after a decode launch: the kernel's mapped mirror (a device-to-host copy without one)
@@ -6360,7 +6145,6 @@ struct MKEngine::Impl {
         if (ctl_eg_host) memcpy(&c, const_cast<const Ctl *>(ctl_eg_host), sizeof(Ctl));
         else CK(cudaMemcpy(&c, hb.ctl, sizeof(Ctl), cudaMemcpyDeviceToHost));
     }
-#endif
     bool err_mtp_warned = false;
 #if MK_TEST_NAN
     int test_nan_at = getenv("MK_TEST_NAN_AT") ? atoi(getenv("MK_TEST_NAN_AT")) : 0, test_nan_n = 0;
@@ -6937,9 +6721,7 @@ struct MKEngine::Impl {
     // not (step's additions). A rewind / truncate rebuilds it that way, and a prefill continuing at dv_n rebuilds it over
     // the whole new sequence, so a reused prefix drafts (and samples) exactly as the same prompt sent fresh.
     int dv_n = 0;
-#if MK_EGRESS
     int * dv_pin = nullptr; // dv_add's pinned staging: the ids (dv_base + DV_EXTRA), then [dv_base + DV_EXTRA] the row count
-#endif
 
     // Adds the tokens not yet in the draft head's vocabulary (appends their ids).
     void dv_add(const int * toks, size_t n) {
@@ -6955,7 +6737,6 @@ struct MKEngine::Impl {
         if (dv_ids.size() & 1) dv_ids.push_back(dv_ids.back()); // the draft lm_head takes rows in pairs
         const int k = (int) dv_ids.size() - n0;
         Mat & m = hw.head_d;
-#if MK_EGRESS
         if (dv_pin) {
             // asynchronous on the launch stream (ordered before the next launch). The staged ids [n0, n0 + k) are not
             // rewritten before a later synchronisation: appends go past them, and dv_truncate's synchronous row-count copy
@@ -6968,7 +6749,6 @@ struct MKEngine::Impl {
                                        cudaMemcpyHostToDevice, 0));
             return;
         }
-#endif
         CK(cudaMemcpy(const_cast<int *>(hw.draft_ids) + n0, dv_ids.data() + n0, k * 4, cudaMemcpyHostToDevice));
         m.N = (int) dv_ids.size();
         CK(cudaMemcpyToSymbol(cW, &m.N, sizeof(int), offsetof(ModelW, head_d) + offsetof(Mat, N)));
@@ -7165,7 +6945,7 @@ struct MKEngine::Impl {
     // imatrix). Lossy, but only the drafts can change: they are verified by the exact main model, so the output (greedy
     // ids, the sampled distribution) is unchanged and only acceptance moves. Each MTP pass streams ~0.1 GB less.
     // 0 off, 1 on (default), ab: both copies on the device and the policy key mtpq=0|1 picks one (A/B tests).
-    // DP4A_NARROW builds: always on, IQ4_NL too (their dp4a kernels read none of these types; 0 / ab are refused).
+    // Always on, IQ4_NL too (the dp4a kernels read none of these types; 0 / ab are refused).
     int mtp_q4 = 1;
     bool req_q4 = false; // want(): re-quantise the current tensor to Q4_K (set while the MTP block loads)
     int n_req = 0;
@@ -7235,7 +7015,7 @@ struct MKEngine::Impl {
         });
     }
     static bool requant_type(uint32_t t) {
-        return t == gguf::Q5_K || t == gguf::Q6_K || t == gguf::Q8_0 || t == gguf::Q4_0 || (DP4A_NARROW && t == gguf::IQ4_NL);
+        return t == gguf::Q5_K || t == gguf::Q6_K || t == gguf::Q8_0 || t == gguf::Q4_0 || t == gguf::IQ4_NL;
     }
     // The MTP block's re-quantisation (~2.5 s of CPU on UD-Q4_K_XL) runs on a background thread from early in the load
     // (rq_start; MK_LOAD_RQBG=0: inline); want() takes its results. Same rows, same calls, same bytes.
@@ -7398,12 +7178,10 @@ struct MKEngine::Impl {
         };
         if (t.type == gguf::Q4_K || t.type == gguf::Q5_K) {
             m.rb = (int) gguf::type_row_bytes(t.type, K);
-#if MK_WV
             if (wv_lay) {
                 HSet & S = hset();
                 wv_place(m, t.data, t.nbytes, nullptr, 0, S);
             } else
-#endif
             {
                 m.w = dput<uint8_t>(t.data, t.nbytes);
                 keep(t);
@@ -7460,12 +7238,10 @@ struct MKEngine::Impl {
                     }
                 });
             }
-#if MK_MAXT > 5
             // main-layer ffn_down: tile-major values and meta pairs; MK_WV_Q6F: every main-layer Q6_K fragment-ordered with
             // the meta inline (one stream: no meta, m.d stays null)
             if (wv_lay && (wv_fd || MK_WV_Q6F)) wv_place(m, qd, qn, md, mn, S);
             else
-#endif
             {
                 m.w = dput<uint8_t>(qd, qn, &S);
                 m.d = reinterpret_cast<const __half *>(dput<uint8_t>(md, mn, &S));
@@ -7481,10 +7257,8 @@ struct MKEngine::Impl {
                 auto _ = lc.scope("repack IQ4_XS");
                 parallel_rows(N, [&](int64_t r) { repack_iq4xs(t.data + (size_t) r * nb * 136, qd + (size_t) r * m.rb, nb); });
             }
-#if MK_WV
             if (wv_lay) wv_place(m, qd, qn, nullptr, 0, S);
             else
-#endif
             m.w = dput<uint8_t>(qd, qn, &S);
         } else if (t.type == gguf::Q3_K || t.type == gguf::IQ3_S) {
             // native (rows_q3k / rows_iq3s, prefill TQ3K / TIQ3S): values 96 B per block + meta (Q3_K: the Q6_K meta
@@ -7523,10 +7297,8 @@ struct MKEngine::Impl {
                 });
             }
             if (!exact) throw std::runtime_error(name + ": native Q3_K / IQ3_S repack is not exact");
-#if MK_MAXT > 5
             if (wv_lay && wv_fd) wv_place(m, qd, qn, md, mn, S); // main-layer ffn_down: tile-major values and meta
             else
-#endif
             {
                 m.w = dput<uint8_t>(qd, qn, &S);
                 m.d = reinterpret_cast<const __half *>(dput<uint8_t>(md, mn, &S));
@@ -7543,10 +7315,8 @@ struct MKEngine::Impl {
                 auto _ = lc.scope("repack IQ4_NL");
                 parallel_rows(N, [&](int64_t r) { repack_iq4nl(t.data + (size_t) r * nb * 144, qd + (size_t) r * m.rb, nb); });
             }
-#if MK_WV
             if (wv_lay) wv_place(m, qd, qn, nullptr, 0, S);
             else
-#endif
             m.w = dput<uint8_t>(qd, qn, &S);
         } else if (t.type == gguf::Q8_0) {
             const int nb32 = K / 32;
@@ -7575,10 +7345,8 @@ struct MKEngine::Impl {
                     }
                 });
             }
-#if MK_WV
             if (wv_lay) wv_place(m, qd, qn, md, mn, S);
             else
-#endif
             {
                 m.w = dput<uint8_t>(qd, qn, &S);
                 m.d = (const __half *) dput<uint16_t>(md, mn / 2, &S);
@@ -7590,9 +7358,8 @@ struct MKEngine::Impl {
     }
     std::vector<std::vector<uint8_t>> own_keep; // want()'s copies, until the uploads are done (freed after the load)
 
-#if MK_WV
     // the matrices of the main layers (set while they load) of the wv types are re-laid-out on the host before the upload
-    // (MK_MAXT > 5: wv_fd while a main layer's ffn_down loads: its Q6_K / Q3_K / IQ3_S too)
+    // (wv_fd while a main layer's ffn_down loads: its Q6_K / Q3_K / IQ3_S too)
     bool wv_lay = false, wv_fd = false;
     int wv_n = 0;
     double wv_s = 0;
@@ -7617,7 +7384,7 @@ struct MKEngine::Impl {
     std::vector<void *> wv_tabs; // the probes' gather tables (cudaMalloc)
     int wv_dev_n = 0;
     void wv_place(Mat & m, const uint8_t * w, size_t wn, const uint8_t * meta, size_t meta_n, HSet & S) {
-        const bool q6f = MK_MAXT > 5 && MK_WV_Q6F && m.type == T_Q6K;
+        const bool q6f = MK_WV_Q6F && m.type == T_Q6K;
         const size_t on = q6f ? wn + meta_n : wn, omn = q6f ? 0 : meta_n;
         const size_t moff = (wn + 255) & ~(size_t) 255;
         bool dev = gpurl && wv_dev_ok(m.type, m.N, m.K, m.rb, meta_n, wv_probes);
@@ -7676,7 +7443,6 @@ struct MKEngine::Impl {
         wv_tabs.clear();
         for (auto & kv : wv_probes) kv.second.dtab = nullptr;
     }
-#endif
 
     QBuf qbuf(int U) {
         QBuf q;
@@ -7904,15 +7670,9 @@ struct MKEngine::Impl {
             need(name, got, {T_Q4K, T_Q5K, T_Q6K, T_Q8_0, T_IQ4X, T_IQ4NL, T_Q3K, T_IQ3S});
         };
         if (const char * e = getenv("MK_MTP_Q4")) {
-#if DP4A_NARROW
             if (strcmp(e, "1"))
                 throw std::runtime_error(std::string("MK_MTP_Q4=") + e + " was removed from this build: the MTP block is always re-quantised to "
                                          "Q4_K (MK_MTP_Q4=0 / ab and the policy key mtpq: builds with MK_MAXT 5 only)");
-#else
-            if (!strcmp(e, "ab")) mtp_q4 = 2;
-            else if (!strcmp(e, "0") || !strcmp(e, "1")) mtp_q4 = e[0] - '0';
-            else throw std::runtime_error("MK_MTP_Q4: 0, 1 or ab");
-#endif
         }
         if (const char * e = getenv("MK_DRAFT_Q4")) {
             if (strcmp(e, "0") && strcmp(e, "1")) throw std::runtime_error("MK_DRAFT_Q4: 0 or 1");
@@ -7925,9 +7685,7 @@ struct MKEngine::Impl {
             LayerW & L = hw.L[i];
             const bool mtp = i == NL;
             req_q4 = mtp && mtp_q4 != 0;
-#if MK_WV
             wv_lay = !mtp;
-#endif
             L.attn = mtp || ((i + 1) % 4 == 0);
             L.attn_norm = up_f32(blk(i, "attn_norm.weight"), D);
             L.post_norm = up_f32(blk(i, "post_attention_norm.weight"), D);
@@ -7935,11 +7693,11 @@ struct MKEngine::Impl {
                 L.q = up_mat(blk(i, "attn_q.weight"), D, QG);
                 L.k = up_mat(blk(i, "attn_k.weight"), D, KVD);
                 L.v = up_mat(blk(i, "attn_v.weight"), D, KVD);
-#if MK_MAXT > 5 && MK_WV_OUT
+#if MK_WV_OUT
                 wv_fd = true; // MK_WV_OUT: the offset types of out / ssm_out in the wv layout too
 #endif
                 L.o = up_mat(blk(i, "attn_output.weight"), VD, D);
-#if MK_MAXT > 5 && MK_WV_OUT
+#if MK_WV_OUT
                 wv_fd = false;
 #endif
                 needq(blk(i, "attn_q.weight"), L.q.type);
@@ -7951,11 +7709,11 @@ struct MKEngine::Impl {
             } else {
                 L.qkv = up_mat(blk(i, "attn_qkv.weight"), D, QKV);
                 L.gate = up_mat(blk(i, "attn_gate.weight"), D, VD);
-#if MK_MAXT > 5 && MK_WV_OUT
+#if MK_WV_OUT
                 wv_fd = true;
 #endif
                 L.sout = up_mat(blk(i, "ssm_out.weight"), VD, D);
-#if MK_MAXT > 5 && MK_WV_OUT
+#if MK_WV_OUT
                 wv_fd = false;
 #endif
                 needq(blk(i, "attn_qkv.weight"), L.qkv.type);
@@ -8013,28 +7771,21 @@ struct MKEngine::Impl {
             }
             L.fg = up_mat(blk(i, "ffn_gate.weight"), D, FF);
             L.fu = up_mat(blk(i, "ffn_up.weight"), D, FF);
-#if MK_MAXT > 5
             wv_fd = true;
-#endif
             L.fd = up_mat(blk(i, "ffn_down.weight"), FF, D);
-#if MK_MAXT > 5
             wv_fd = false;
-            if (!mtp && !L.fd.fm) throw std::runtime_error(blk(i, "ffn_down.weight") + ": MK_MAXT > 5 needs every ffn_down in the wv layout");
-#endif
+            if (!mtp && !L.fd.fm) throw std::runtime_error(blk(i, "ffn_down.weight") + ": the wide pass needs every ffn_down in the wv layout");
             needq(blk(i, "ffn_gate.weight"), L.fg.type);
             needq(blk(i, "ffn_up.weight"), L.fu.type);
             needq(blk(i, "ffn_down.weight"), L.fd.type);
         }
         mem_mark("weights: 64 layers + MTP");
-#if MK_WV
         wv_lay = false;
-        fprintf(stderr, "[mk] MK_WV: %d main-pass matrices in the wv layout (%d on the device, the others re-laid-out on the host in %.1f s; %s), MAXT %d\n", wv_n, wv_dev_n, wv_s,
-                MAXT > 5 ? (MK_WV_Q6F ? (MK_WV_OUT ? "Q6_K everywhere (FM), ffn_down / out / ssm_out every type; elsewhere Q3_K / IQ3_S stay on dp4a"
-                                                   : "Q6_K everywhere (FM), ffn_down every type; elsewhere Q3_K / IQ3_S stay on dp4a")
-                            : MK_WV_OUT ? "ffn_down, out, ssm_out: every type; elsewhere Q6_K / Q3_K / IQ3_S stay on dp4a"
-                                        : "ffn_down: every type; elsewhere Q6_K / Q3_K / IQ3_S stay on dp4a")
-                          : "Q6_K / Q3_K / IQ3_S stay on dp4a", MAXT);
-#endif
+        fprintf(stderr, "[mk] wv: %d main-pass matrices in the wv layout (%d on the device, the others re-laid-out on the host in %.1f s; %s), MAXT %d\n", wv_n, wv_dev_n, wv_s,
+                MK_WV_Q6F ? (MK_WV_OUT ? "Q6_K everywhere (FM), ffn_down / out / ssm_out every type; elsewhere Q3_K / IQ3_S stay on dp4a"
+                                       : "Q6_K everywhere (FM), ffn_down every type; elsewhere Q3_K / IQ3_S stay on dp4a")
+                          : MK_WV_OUT ? "ffn_down, out, ssm_out: every type; elsewhere Q6_K / Q3_K / IQ3_S stay on dp4a"
+                                      : "ffn_down: every type; elsewhere Q6_K / Q3_K / IQ3_S stay on dp4a", MAXT);
         if (has_mtp) {
             req_q4 = mtp_q4 != 0;
             hw.eh = up_mat(blk(NL, "nextn.eh_proj.weight"), 2 * D, D);
@@ -8058,7 +7809,6 @@ struct MKEngine::Impl {
             hw.hnorm = up_f32(blk(NL, "nextn.hnorm.weight"), D);
             hw.shnorm = up_f32(blk(NL, "nextn.shared_head_norm.weight"), D);
         }
-#if DP4A_NARROW
         // Every matrix outside the wv layout must be of a type this build's dp4a dispatch keeps: main layers a hybrid type
         // (Q3_K / IQ3_S; Q6_K without MK_WV_Q6F: wv.cuh gemv_pairs_dp), the MTP block (solo and batched passes: gemv_pairs_any,
         // resid_any, rows16_any) after its re-quantisation also Q4_K / IQ4_XS. The loader above guarantees it for every file
@@ -8089,7 +7839,6 @@ struct MKEngine::Impl {
             }
             if (has_mtp) dp4a_need(blk(NL, "nextn.eh_proj.weight"), hw.eh, true);
         }
-#endif
         hw.onorm = up_f32("output_norm.weight", D);
         hw.head = up_mat("output.weight", D, VOCAB);
         // Q8_0: some fine-tunes (~0.3 GB more than Q6_K); lm_head reads either type
@@ -8122,12 +7871,10 @@ struct MKEngine::Impl {
             hw.draft_ids = did;
             dv_ids = ids;
             dv_base = (int) ids.size();
-#if MK_EGRESS
             if (cudaHostAlloc(reinterpret_cast<void **>(&dv_pin), ((size_t) cap + 1) * 4, cudaHostAllocDefault) != cudaSuccess) {
                 (void) cudaGetLastError();
                 dv_pin = nullptr; // (synchronous copies)
             }
-#endif
             dv_in.assign(VOCAB, 0);
             for (int t : ids) dv_in[t] = 1;
             fprintf(stderr, "[mk] MTP draft head restricted to %d tokens (%s)\n", m.N, draft_vocab.c_str());
@@ -8189,9 +7936,7 @@ struct MKEngine::Impl {
         }
         wrec_on = false;
         mem_mark("token_embd");
-#if MK_WV
         wv_dev_done();
-#endif
         CK(cudaMemcpyToSymbol(cW, &hw, sizeof(ModelW)));
         mem_mark("cW symbol (module load)");
         if (n_conv)
@@ -8200,8 +7945,7 @@ struct MKEngine::Impl {
         if (n_nat)
             fprintf(stderr, "[mk] %d Q3_K / IQ3_S tensors repacked to their native layouts in %.1f s (exact, checked per row)\n", n_nat, nat_s);
         if (n_req)
-            fprintf(stderr, "[mk] MTP block: %d matrices re-quantised to Q4_K in %.1f s (drafts only%s)\n", n_req, req_s,
-                    DP4A_NARROW ? "" : mtp_q4 == 2 ? "; MK_MTP_Q4=0: as stored; ab: both copies, policy mtpq=0|1" : "; MK_MTP_Q4=0: as stored");
+            fprintf(stderr, "[mk] MTP block: %d matrices re-quantised to Q4_K in %.1f s (drafts only)\n", n_req, req_s);
 
         hb.x = dalloc<float>(RMAX * D);
         hb.xm = dalloc<float>(RMAX * D);
@@ -8235,9 +7979,7 @@ struct MKEngine::Impl {
 #if MK_K5
         fprintf(stderr, "[mk] K5: split dn_proj -> dn_core barrier, delta-net heads in dn_proj arrival order (MK_K5=1)\n");
 #endif
-#if MK_C1
-        fprintf(stderr, "[mk] C1: ffn_gu -> ffn_down per-chunk waits instead of a grid barrier (MK_C1=1)\n");
-#endif
+        fprintf(stderr, "[mk] C1: ffn_gu -> ffn_down per-chunk waits instead of a grid barrier\n");
         hb.ctx = ctx + KV_PAD; // rows per kv head (KV_PAD: the MTP draft rows written past the last admitted position)
         {
             const size_t rows = (size_t) kv_slots * NKV * hb.ctx; // (no MTP block: no slot N_ATT_SLOTS - 1)
@@ -8254,10 +7996,8 @@ struct MKEngine::Impl {
             // the KV layout are unchanged). Drafts are verified, so the output is exact; acceptance can change.
             hb.mtp_win = getenv("MK_MTP_WIN") ? atoi(getenv("MK_MTP_WIN")) : 0;
             if (hb.mtp_win > 0) fprintf(stderr, "[mk] MTP decode attention window %d positions (MK_MTP_WIN)\n", hb.mtp_win);
-#if MK_MAXT > 5
             // MK_MTP_KVC builds: the catch-up rows before the last 5 run K / V only (same drafts); env MK_MTP_KVC=0: off
             hb.mtp_kvc = !(getenv("MK_MTP_KVC") && atoi(getenv("MK_MTP_KVC")) == 0);
-#endif
             // MK_KV (q8 cache): per attention slot and K / V, q8_0 (default), q4 (kv_store_q4) or q5 / q6 / q7
             // (kv_store_qn), e.g. "V*=6r,K16=4r": comma-separated <K|V|*><slot>=<4..8>[r], slot 0..15 = attention layer
             // 4 slot + 3, 16 = MTP block, * or empty = all slots; r: stored Hadamard-rotated (K: the queries get the same
@@ -8395,17 +8135,11 @@ struct MKEngine::Impl {
         hb.cand = dalloc<float2>((size_t) RMAX * TOPK_MAX);
         hb.logits = nullptr; // 5 MB used by scoring launches only (score_logits): logits_alloc()
         hb.pcnt = nullptr;   // 0.5 MB for the presence / frequency penalty, allocated by the first set_penalty
-#if MK_C1
         hb.bar = dalloc<unsigned>(C1_WORDS); // count word | go word | C1's per-chunk counters, each on its own line
-#else
-        hb.bar = dalloc<unsigned>(2 * GS_GO); // count word | go word (gsync form 1 / 2, the gsync bench) on its own line
-#endif
         hb.cnt = dalloc<unsigned>(4);
         hb.ctl = dalloc<Ctl>(1);
-#if MK_WV
         hb.wvpart = dalloc<float>((size_t) WV_S * RMAX * D);
         hb.wvcnt = dalloc<unsigned>(2 * (D / 32), DA_INIT0); // (starts at 0; the last arrival of each use resets it)
-#endif
         profiling = getenv("MK_PROFILE") != nullptr;
         hb.prof = profiling ? dalloc<unsigned long long>(4096 + 1024 * 128) : nullptr;
         mem_mark("logits, sampling, ctl");
@@ -8417,7 +8151,6 @@ struct MKEngine::Impl {
             err_host = eh;
             CK(cudaHostGetDevicePointer(reinterpret_cast<void **>(&hb.err), eh, 0));
         }
-#if MK_EGRESS
         {
             Ctl * ce = nullptr;
             CK(cudaHostAlloc(reinterpret_cast<void **>(&ce), sizeof(Ctl), cudaHostAllocMapped));
@@ -8425,7 +8158,6 @@ struct MKEngine::Impl {
             ctl_eg_host = ce;
             CK(cudaHostGetDevicePointer(reinterpret_cast<void **>(&hb.ctl_eg), ce, 0));
         }
-#endif
         CK(cudaMemcpyToSymbol(cBs, &hb, sizeof(Bufs)));
 
         CK(cudaFuncSetAttribute(mk_cycle, cudaFuncAttributeMaxDynamicSharedMemorySize, SM_TOTAL));
@@ -8611,9 +8343,7 @@ struct MKEngine::Impl {
         ck_free(); // (checkpoint copies may still read or write device buffers)
         for (auto & l : lanes) { // (a live lane's resources are in the members above, the engine's own ones in its Lane)
             ck_slots_free(l.ck);
-#if MK_EGRESS
             if (l.ctl_eg_host) cudaFreeHost(const_cast<Ctl *>(l.ctl_eg_host));
-#endif
         }
         for (auto & p : parked)
             for (char * c : p.second.blob.chunks) cudaFreeHost(c);
@@ -8631,10 +8361,8 @@ struct MKEngine::Impl {
         if (embd_host) cudaFreeHost(embd_host);
         if (emb_host) cudaFreeHost(emb_host);
         if (err_host) cudaFreeHost(const_cast<int *>(err_host));
-#if MK_EGRESS
         if (ctl_eg_host) cudaFreeHost(const_cast<Ctl *>(ctl_eg_host));
         if (dv_pin) cudaFreeHost(dv_pin);
-#endif
     }
 
     // The default pool keeps what is freed into it, and what a failed allocation grew it by before failing: back to the
@@ -8676,14 +8404,12 @@ struct MKEngine::Impl {
             L.gate_drop[k] = pol.gate_drop[k];
             L.gate_stop[k] = pol.gate_stop[k];
         }
-#if MK_MAXT > 5
         const int top = depth_top(hctl.n); // drop_last: the deepest draft of this position's policy depth
         if (pol.g7 && top > 5) {
             for (int k = 1; k <= 3; k++) L.gate_stop[k] = 0.25f;
             L.gate_stop[4] = L.gate_stop[5] = 0.3f;
             L.gate_drop[4] = 0.3f;
         } else if (top >= 1) L.gate_drop[top - 1] = std::max(L.gate_drop[top - 1], pol.drop_last);
-#endif
         L.gate_chain = pol.gate_chain;
         L.spec_smp = smp_temp > 0.f && pol.h1;
         // chain=2 with sampled drafts: the chain holds the drafted token's own q' probability, so a drop gate on it would
@@ -8706,20 +8432,10 @@ struct MKEngine::Impl {
             fprintf(stderr, "[mk] MK_TEST_NAN: NaN K scales before decode launch %d\n", test_nan_n);
         }
 #endif
-#if MK_EGRESS
         if (!bar_live) { // (the counts run on from the previous launch's BAR_BASE / C1_BASE: zeroed once, and after bench launches)
-#if MK_C1
             CK(cudaMemsetAsync(hb.bar, 0, C1_WORDS * 4));
-#else
-            CK(cudaMemsetAsync(hb.bar, 0, 2 * GS_GO * 4));
-#endif
             bar_live = true;
         }
-#elif MK_C1
-        CK(cudaMemsetAsync(hb.bar, 0, C1_WORDS * 4)); // (bench launches use only the first two lines)
-#else
-        CK(cudaMemsetAsync(hb.bar, 0, 2 * GS_GO * 4));
-#endif
         if (profiling) CK(cudaMemsetAsync(hb.prof, 0, (4096 + 1024 * 128) * 8));
         CK(cudaLaunchCooperativeKernel((void *) mk_cycle, dim3(nsm), dim3(NT), args, SM_TOTAL, 0));
         wd_T = T;
@@ -8820,9 +8536,7 @@ struct MKEngine::Impl {
     // every gsync form (gs_arrive_wait) at nsm and nsm / 2 blocks, round-robin over the configurations so clock drift hits
     // them alike; per barrier = (median t(N) - median t(0)) / N. MK_GSB_REPS (default 15) rounds; 1.5 s GPU warm-up first.
     void gsync_bench_host(int N) {
-#if MK_EGRESS
         bar_live = false; // (these launches zero the barrier words themselves and leave no BAR_BASE)
-#endif
         const int reps = getenv("MK_GSB_REPS") ? std::max(3, atoi(getenv("MK_GSB_REPS"))) : 15;
         st_warm<<<nsm * 4, 256>>>((unsigned long long) 1500 * 1000000ull);
         CK(cudaGetLastError());
@@ -8867,9 +8581,7 @@ struct MKEngine::Impl {
     }
 
     void bench() {
-#if MK_EGRESS
         bar_live = false; // (these launches zero the barrier words themselves and leave no BAR_BASE)
-#endif
         if (const char * g = getenv("MK_GSB")) {
             gsync_bench_host(std::max(1, atoi(g)));
             return;
@@ -8980,7 +8692,6 @@ struct MKEngine::Impl {
         mmh_attr<pf::TQ4K, true>();
         mmh_attr<pf::TQ5K, true>();
         mmh_attr<pf::TIQ4, true>();
-#if MK_WV
         mmh_attr<pf::TQ4K, false, 1>();
         mmh_attr<pf::TQ5K, false, 1>();
         mmh_attr<pf::TQ80, false, 1>();
@@ -8989,12 +8700,9 @@ struct MKEngine::Impl {
         mmh_attr<pf::TQ4K, true, 1>();
         mmh_attr<pf::TQ5K, true, 1>();
         mmh_attr<pf::TIQ4, true, 1>();
-#if MK_MAXT > 5
         mmh_attr<pf::TQ6K, false, 1>();
         mmh_attr<pf::TQ3K, false, 1>();
         mmh_attr<pf::TIQ3S, false, 1>();
-#endif
-#endif
         glu_mix_attr();
         if (const char * e = getenv("MK_PF_BN")) { // force one GEMM token tile (tuning / tests); 0 = by prompt size
             pf_bn_force = atoi(e);
@@ -9225,7 +8933,7 @@ struct MKEngine::Impl {
         CK(cudaFuncSetAttribute(pf::mmh<TYPE, GLU, 64, LAY>, cudaFuncAttributeMaxDynamicSharedMemorySize, pf::hm_smem<TYPE, 64>()));
         CK(cudaFuncSetAttribute(pf::mmh<TYPE, GLU, 128, LAY>, cudaFuncAttributeMaxDynamicSharedMemorySize, pf::hm_smem<TYPE, 128>()));
     }
-    // nrt row tiles (CTAs along N) x token tiles of pf_nb tokens; LAY 1: the matrix is in the wv layout (MK_WV)
+    // nrt row tiles (CTAs along N) x token tiles of pf_nb tokens; LAY 1: the matrix is in the wv layout
     template <int TYPE, bool GLU, int LAY = 0>
     void mmh_launch(int nrt, const pf::WMat & W, const __half * X, int ntok, const pf::Out & O, const uint8_t * W2 = nullptr) {
         switch (pf_nb(ntok, nrt)) {
@@ -9303,7 +9011,6 @@ struct MKEngine::Impl {
         const __half * X = (xin ? xin : hp.xh) + (size_t) t0 * m.K;
         const pf::Out O{y, ldy, mode, nullptr};
         const int nrt = m.N / pf::BM;
-#if MK_WV
         if (m.fm) {
             switch (m.type) {
                 case T_Q4K: mmh_launch<pf::TQ4K, false, 1>(nrt, W, X, ntok, O); return;
@@ -9311,15 +9018,12 @@ struct MKEngine::Impl {
                 case T_Q8_0: mmh_launch<pf::TQ80, false, 1>(nrt, W, X, ntok, O); return;
                 case T_IQ4X: mmh_launch<pf::TIQ4, false, 1>(nrt, W, X, ntok, O); return;
                 case T_IQ4NL: mmh_launch<pf::TIQ4NL, false, 1>(nrt, W, X, ntok, O); return;
-#if MK_MAXT > 5
                 case T_Q6K: mmh_launch<pf::TQ6K, false, 1>(nrt, W, X, ntok, O); return;
                 case T_Q3K: mmh_launch<pf::TQ3K, false, 1>(nrt, W, X, ntok, O); return;
                 case T_IQ3S: mmh_launch<pf::TIQ3S, false, 1>(nrt, W, X, ntok, O); return;
-#endif
                 default: throw std::runtime_error("gemm: unsupported weight type in the wv layout");
             }
         }
-#endif
         switch (m.type) {
             case T_Q4K: mmh_launch<pf::TQ4K, false>(nrt, W, X, ntok, O); break;
             case T_Q5K: mmh_launch<pf::TQ5K, false>(nrt, W, X, ntok, O); break;
@@ -9336,9 +9040,7 @@ struct MKEngine::Impl {
     // xh2[t] = silu(Wg x_t) * (Wu x_t) for the first ntok rows of xh: one fused GEMM when gate and
     // up share a type with in-row scales, else two GEMMs into y0 / y1 and pk_glu
     static bool glu_fused(const Mat & g, const Mat & u) {
-#if MK_WV
         if (g.fm != u.fm) return false;
-#endif
         return g.type == u.type && g.rb == u.rb && (g.type == T_Q4K || g.type == T_Q5K || g.type == T_IQ4X);
     }
     void gemm_glu(const Mat & g, const Mat & u, int ntok) {
@@ -9350,7 +9052,6 @@ struct MKEngine::Impl {
         const pf::WMat W{g.w, g.d, g.type, g.K, g.N, g.rb, g.nd};
         const pf::Out O{nullptr, g.N, pf::OUT_STORE, hp.xh2};
         const int nrt = g.N / (pf::BM / 2);
-#if MK_WV
         if (glu_fused(g, u) && g.fm) {
             switch (g.type) {
                 case T_Q4K: mmh_launch<pf::TQ4K, true, 1>(nrt, W, hp.xh, ntok, O, u.w); return;
@@ -9359,7 +9060,6 @@ struct MKEngine::Impl {
                 default: break;
             }
         }
-#endif
         if (glu_fused(g, u)) {
             switch (g.type) {
                 case T_Q4K: mmh_launch<pf::TQ4K, true>(nrt, W, hp.xh, ntok, O, u.w); return;
@@ -9376,10 +9076,10 @@ struct MKEngine::Impl {
     // V2: a gate / up pair of different types (or layouts) as one mixed-type fused launch, pf::mmh<TG, true, NB, LG, TU, LU>
     // (warps 0-3 gate rows, 4-7 up rows, each half its own type): the same products, sums and silu * up as the two GEMMs +
     // pk_glu, so bit-identical, without the fp32 y0 / y1 round trip (y1 can then shrink, pf_init). MK_PF_GLU_MIX=0: off.
-    // The pairs of UD-Q4_K_XL (gate / up, the layout of the build: MK_WV main layers are in the wv layout except Q3_K;
-    // Q6_K only with MK_WV_Q6F at MAXT > 5); any other pair takes the two-GEMM path.
+    // The pairs of UD-Q4_K_XL (gate / up; main layers are in the wv layout except Q3_K, Q6_K only with MK_WV_Q6F); any
+    // other pair takes the two-GEMM path.
     bool glu_mix_on = !(getenv("MK_PF_GLU_MIX") && atoi(getenv("MK_PF_GLU_MIX")) == 0);
-    static constexpr int GLW = MK_WV ? 1 : 0, GL6 = MK_WV && MK_MAXT > 5 && MK_WV_Q6F ? 1 : 0;
+    static constexpr int GLW = 1, GL6 = MK_WV_Q6F ? 1 : 0;
 #define MK_GLU_MIX_PAIRS(X)                                                                                                \
     X(pf::TQ4K, GLW, pf::TQ5K, GLW) X(pf::TIQ4, GLW, pf::TQ5K, GLW) X(pf::TIQ4, GLW, pf::TQ4K, GLW)                      \
     X(pf::TQ4K, GLW, pf::TIQ4, GLW) X(pf::TQ6K, GL6, pf::TQ6K, GL6) X(pf::TIQ4, GLW, pf::TQ3K, 0)                        \
@@ -9407,11 +9107,7 @@ struct MKEngine::Impl {
         if (glu_fused(g, u) || g.K != u.K || g.N != u.N) return false;
         const pf::WMat Wg{g.w, g.d, g.type, g.K, g.N, g.rb, g.nd}, Wu{u.w, u.d, u.type, u.K, u.N, u.rb, u.nd};
         const pf::Out O{nullptr, g.N, pf::OUT_STORE, hp.xh2};
-#if MK_WV
         const int nrt = g.N / (pf::BM / 2), gl = g.fm, ul = u.fm;
-#else
-        const int nrt = g.N / (pf::BM / 2), gl = 0, ul = 0;
-#endif
 #define MK_GLU_GO(TG, LG, TU, LU)                                                                                          \
     if (g.type == TG && gl == LG && u.type == TU && ul == LU) {                                                            \
         if (ntok > 0) mmh_launch_mix<TG, LG, TU, LU>(nrt, Wg, Wu, ntok, O);                                                \
@@ -10546,9 +10242,7 @@ struct MKEngine::Impl {
         float pen_pres = 0.f, pen_freq = 0.f; // (always 0: a lane has no penalty counts, hb.pcnt null)
         bool pcnt_dirty = false;
         std::vector<Span> spans, rope_spans;
-#if MK_EGRESS
         volatile Ctl * ctl_eg_host = nullptr;
-#endif
         std::vector<CkSlot> ck;
         std::vector<CkChunk> ck_plan;
         std::vector<RingSide> rsides[N_ATT_SLOTS]; // MK_EXACT + MK_KV_WIN: its window rings as its checkpoints copy them
@@ -10588,9 +10282,7 @@ struct MKEngine::Impl {
         std::swap(pcnt_dirty, l.pcnt_dirty);
         std::swap(spans, l.spans);
         std::swap(rope_spans, l.rope_spans);
-#if MK_EGRESS
         std::swap(ctl_eg_host, l.ctl_eg_host);
-#endif
         std::swap(ck, l.ck);
         std::swap(ck_plan, l.ck_plan);
         std::swap(rsides, l.rsides);
@@ -10685,9 +10377,7 @@ struct MKEngine::Impl {
         cudaDeviceSynchronize();
         for (Lane & l : lanes) {
             ck_slots_free(l.ck);
-#if MK_EGRESS
             if (l.ctl_eg_host) cudaFreeHost(const_cast<Ctl *>(l.ctl_eg_host));
-#endif
         }
         lanes.clear();
         for (size_t i = na; i < allocs.size(); i++) use_pool ? cudaFreeAsync(allocs[i], 0) : cudaFree(allocs[i]);
@@ -10750,11 +10440,6 @@ struct MKEngine::Impl {
     // MKEngine::slots_open: n lanes of lctx positions each (0: the most that fit, leaving MK_SLOT_RESERVE_MIB, default
     // 1536, for the prefill and the runtime); returns lctx
     int slots_open(int n, int lctx) {
-#if !(MK_MAXT > 5 && MK_EGRESS)
-        (void) n;
-        (void) lctx;
-        throw std::runtime_error("parallel slots need a MK_WV=1 MK_MAXT > 5 build");
-#else
         if (!lanes.empty()) throw std::runtime_error("slots are open already");
         if (n < 1 || n > NSEQ) throw std::runtime_error("slots: 1 .. " + std::to_string(NSEQ));
         // (2+ lanes run batched passes of MAXT rows, two lanes always: embed_prologue skips the rows past a smaller grid)
@@ -10936,9 +10621,7 @@ struct MKEngine::Impl {
         if (ring_bytes_ck > 0) fprintf(stderr, ", %d with the window rings, %.1f MiB pinned host each", ck_rings, ring_bytes_ck / 1048576.0);
         fprintf(stderr, ")\n");
         return lctx;
-#endif
     }
-#if MK_MAXT > 5 && MK_EGRESS
     // the main view of lane k for a batched launch: its rows start at row r0 of the pass
     Bufs lane_main_view(const Lane & l, int r0) const {
         Bufs v = l.hb;
@@ -11047,11 +10730,7 @@ struct MKEngine::Impl {
         ck_guard_state();
         ring_snap_guard();
         if (!bar_live) {
-#if MK_C1
             CK(cudaMemsetAsync(hb.bar, 0, C1_WORDS * 4));
-#else
-            CK(cudaMemsetAsync(hb.bar, 0, 2 * GS_GO * 4));
-#endif
             bar_live = true;
         }
         if (profiling) CK(cudaMemsetAsync(hb.prof, 0, (4096 + 1024 * 128) * 8));
@@ -11077,7 +10756,6 @@ struct MKEngine::Impl {
         }
         return out;
     }
-#endif
     // one solo decode step of the live sequence (MKEngine::step's body): appends the emitted tokens to out
     int step_live(std::vector<int> & out);
 
@@ -11109,7 +10787,6 @@ MKEngine::MKEngine(const std::string & path, int ctx, int n_draft, const std::st
         }
     } delete_on_throw{p_, std::uncaught_exceptions()};
     n_draft = n_draft_ = p_->n_draft_cap; // (0 without an MTP block)
-#if MK_MAXT > 5
     if (n_draft > 4) { // the wide pass (T >= 6) runs the pipelined q8-cache decode attention only (attn_core<T > 5>: attn_core_q8,
                        // or attn_core_q8m for the low-bit MK_KV sides)
         bool q8 = p_->hb.kvq8;
@@ -11121,7 +10798,6 @@ MKEngine::MKEngine(const std::string & path, int ctx, int n_draft, const std::st
                                               : "n_draft > 4 needs the all-q8 KV cache (--kv q8, no low-bit MK_KV; MK_DA_Q4=0 build)");
         }
     }
-#endif
     reset();
     if (const char * pol = getenv("MK_POLICY")) set_policy(pol);
 #if MK_SPEC_LOG
@@ -11130,10 +10806,9 @@ MKEngine::MKEngine(const std::string & path, int ctx, int n_draft, const std::st
 }
 
 // "key=value,...": depth=0|1|2 (see Impl::Policy), dmin=N; on-device early stop (Launch::gate_*): drop=F,
-// stop=F (every draft), dropK=F / stopK=F (draft K = 1..4 only), chain=0|1; h1=0|1 (sampled drafts when
-// sampling); mtpq=0|1 (MK_MTP_Q4=ab only, MK_MAXT 5 builds: the MTP block as stored / re-quantised to Q4_K; kept until changed);
-// dq4=0|1 (MK_DRAFT_Q4=1 only: the draft head reads lm_head / its Q4_K copy; kept until changed);
-// MK_MAXT > 5: dropK / stopK up to K = 7, droplast=F (the deepest draft), dctx=N (from position N on at most 4 drafts),
+// stop=F (every draft), dropK=F / stopK=F (draft K = 1..7), chain=0|1; h1=0|1 (sampled drafts when
+// sampling); dq4=0|1 (MK_DRAFT_Q4=1 only: the draft head reads lm_head / its Q4_K copy; kept until changed);
+// droplast=F (the deepest draft), dctx=N (from position N on at most 4 drafts),
 // chain=2 (sampled drafts: the chain multiplies each drafted token's probability under q' instead of the top-1's);
 // g7=0|1 (the depth > 5 gates, Impl::Policy); blk=0 only (blk=1, block verification of sampled drafts, is refused);
 // "" = defaults
@@ -11151,10 +10826,8 @@ void MKEngine::set_policy(const std::string & spec) {
         const size_t e = kv.find('=');
         if (e == std::string::npos) throw std::runtime_error("policy: expected key=value, got " + kv);
         const std::string k = kv.substr(0, e), v = kv.substr(e + 1);
-#if MK_MAXT > 5
         if (k == "drop" || k == "stop" || (k.size() == 5 && (k.compare(0, 4, "drop") == 0 || k.compare(0, 4, "stop") == 0)))
             pol.g7 = 0; // explicit gates replace the depth > 5 defaults
-#endif
         if (k == "depth") pol.depth = std::stoi(v);
         else if (k == "dmin") pol.dmin = std::stoi(v);
         else if (k == "drop") for (float & x : pol.gate_drop) x = std::stof(v);
@@ -11162,23 +10835,15 @@ void MKEngine::set_policy(const std::string & spec) {
         else if (k.size() == 5 && (k.compare(0, 4, "drop") == 0 || k.compare(0, 4, "stop") == 0) && k[4] >= '1' &&
                  k[4] < '1' + MAXT - 1) // dropK / stopK: draft K alone (e.g. drop4: the T = 5 verify row)
             (k[0] == 'd' ? dk : sk)[k[4] - '1'] = std::stof(v);
-#if MK_MAXT > 5
         else if (k == "droplast") pol.drop_last = std::stof(v), pol.g7 = 0; // the deepest draft (k = n_draft - 1)
         else if (k == "g7") pol.g7 = std::stoi(v);
         else if (k == "dctx") pol.dctx = std::stoi(v); // from position dctx on: at most 4 drafts
-#endif
         else if (k == "chain") pol.gate_chain = std::stoi(v);
         else if (k == "h1") pol.h1 = std::stoi(v);
-#if MK_MAXT > 5
         else if (k == "blk") {
             if (std::stoi(v)) throw std::runtime_error("policy blk=" + v + " was removed (block verification of sampled drafts; blk=0 is the only value)");
         }
-#endif
-#if DP4A_NARROW
         else if (k == "mtpq") throw std::runtime_error("policy mtpq was removed from this build: the MTP block is always re-quantised to Q4_K");
-#else
-        else if (k == "mtpq") p_->set_mtp_q4(std::stoi(v)); // MK_MTP_Q4=ab only; takes effect from the next prefill
-#endif
         else if (k == "dq4") p_->set_draft_q4(std::stoi(v)); // MK_DRAFT_Q4=1 only; from the next launch
         else throw std::runtime_error("policy: unknown key " + k);
     }
@@ -12025,10 +11690,8 @@ std::vector<std::vector<int>> MKEngine::slots_step(const std::vector<int> & slot
             if (c.n + MAXT + 2 < I.ctx) step(o); // (else full: no tokens)
             out[at[0]] = o;
         } else if (ks.size() >= 2) {
-#if MK_MAXT > 5 && MK_EGRESS
             const auto r = I.lanes_step(ks); // (a failure there: every lane in ks, the batched launch wrote them all)
             for (size_t j = 0; j < ks.size(); j++) out[at[j]] = r[j];
-#endif
         }
     });
     for (int s : firsts) I.lanes[s].first = -1; // (taken only now: a throw above leaves the token for the next call)
@@ -12062,17 +11725,13 @@ int MKEngine::Impl::step_live(std::vector<int> & out) {
     if (c.n + MAXT + 2 >= ctx) throw std::runtime_error("context full"); // (rows past ctx: KV_PAD)
     // verify the previous launch's drafts, minus any that would put this launch's rows across an
     // attention-partition boundary (once per ATT_BUCKET positions; keeps greedy output depth-independent)
-#if MK_MAXT > 5
     // T >= 6 runs as one MAXT-row pass (padding rows): the whole n + 1 .. n + MAXT must lie in one partition, else at most 5
     int T = att_cap_T(c.n, 1 + nd_avail);
     if (T > 5 && att_cap_T(c.n, MAXT) < MAXT) T = 5;
-#else
-    const int T = att_cap_T(c.n, 1 + nd_avail);
-#endif
     // Draft depth (an upper bound: the on-device gate may stop drafting earlier), by Policy::depth (default 1: the
     // full depth). Depth 0: after a cycle that rejected a draft, draft one token less (but at least 3), since a deeper
     // draft is then unlikely to be accepted; the full depth again after a fully accepted cycle.
-    const int top = depth_top(c.n); // n_draft (MK_MAXT > 5: at most 4 from Policy::dctx on)
+    const int top = depth_top(c.n); // n_draft (at most 4 from Policy::dctx on)
     int nd = top;
     if (pol.depth == 0) nd = (!all_acc && top > 3) ? top - 1 : top;
     else if (pol.depth == 2) nd = std::min(top, std::max(std::min(pol.dmin, top), 1 + last_acc));
@@ -12083,11 +11742,7 @@ int MKEngine::Impl::step_live(std::vector<int> & out) {
     for (int i = 1; i < T; i++) drafts[i] = c.tok[i];
 #endif
     launch(MODE_DECODE, T, 0);
-#if MK_EGRESS
     ctl_fetch(c);
-#else
-    CK(cudaMemcpy(&c, hb.ctl, sizeof(Ctl), cudaMemcpyDeviceToHost));
-#endif
     nd_avail = nd > 0 ? std::min(nd, c.nd_prod) : 0;
 #if MK_SPEC_LOG
     slog_cycle(n0, T, drafts, c);
