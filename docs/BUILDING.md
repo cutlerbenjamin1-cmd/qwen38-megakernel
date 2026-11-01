@@ -77,8 +77,8 @@ What `make` builds:
   `../llama.cpp/build/bin/libmtmd.so` exists, which is llama.cpp's default; `make vision` builds them explicitly.
 
 Build settings:
-- **The served configuration** is the default: `MKFLAGS=-DMK_WV_Q6F=1 -DMK_K5=1` (the fragment-ordered Q6_K layout,
-  the split barrier before the DeltaNet core). The engine always verifies on int8 tensor cores, up to 7 drafts.
+- **The served configuration** needs no flags: `MKFLAGS` is empty by default and takes the debug and experiment flags
+  of [CONFIGURATION.md](CONFIGURATION.md#engine--d-flags), e.g. `make MKFLAGS=-DMK_SPEC_LOG=1`.
 - **Architecture:** `make` asks `nvidia-smi` for the first GPU's compute capability (sm_86 if it is missing); override
   it with `ARCH=sm_89` or similar.
 - **Huge pages:** the Makefile sets `GLIBC_TUNABLES=glibc.malloc.hugetlb=1`, which lets ptxas's heap use transparent

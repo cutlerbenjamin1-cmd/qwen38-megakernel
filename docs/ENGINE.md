@@ -326,7 +326,7 @@ frame or frame pair is an image (the same M-RoPE positions, so the engine needs 
 - **Gated-DeltaNet rollback by lazy replay**: the recurrent state is committed only through the surely-accepted token;
   accepted drafts are replayed from a small (k, v, g, beta) ring at the start of the next cycle, so rejected drafts cost
   no state snapshots or extra state traffic.
-- **Split barrier before the DeltaNet core** (`MK_K5=1`, served build): the 48 DeltaNet heads go to the first 48 blocks
+- **Split barrier before the DeltaNet core**: the 48 DeltaNet heads go to the first 48 blocks
   that finish the DeltaNet projections; they load the head's state and replay its accepted drafts before waiting for
   the rest. Bitwise exact; decode +1.1% at 38k and +0.75% at 101.6k context (A-B-A, 2026-10-17).
 - **Per-chunk waits before ffn_down**: ffn_down runs in four split-K chunks, and
