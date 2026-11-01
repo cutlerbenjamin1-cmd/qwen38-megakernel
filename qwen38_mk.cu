@@ -74,15 +74,6 @@ extern char ** environ; // (state files: the MK_* settings in the key)
 #ifndef MK_KV_EMU
 #define MK_KV_EMU 0
 #endif
-// Decode attention routing (compile-time, for A/B builds; both default on, all choices give bit-identical partials):
-// MK_DA_ROUTE=1: chunks of one K/V tile (L_ctx <= ATT_BUCKET) run attn_core_t (no pipeline fill: faster there);
-// MK_DA_Q4=1: q4 MK_KV slots run the pipelined kernel too (attn_core_q8m, attn_core_t's q4 -> fp16 values).
-#ifndef MK_DA_ROUTE
-#define MK_DA_ROUTE 1
-#endif
-#ifndef MK_DA_Q4
-#define MK_DA_Q4 1
-#endif
 // wv: the main-pass GEMV phases run the int8 tensor-core verify GEMM (wv.cuh) on a load-time fragment-ordered
 // tile-major weight layout, at every T (T-invariant, not bit-identical to the dp4a GEMVs).
 // MK_WV_FMK (default 1): Q4_K / Q5_K main-pass matrices fragment-ordered like IQ4_XS. 0: tile-major whole blocks (the
@@ -99,15 +90,6 @@ extern char ** environ; // (state files: the MK_* settings in the key)
 // MK_K2_TB: tokens per batch of resid_wv's last-arrival combine (their partial loads issued together)
 #ifndef MK_K2_TB
 #define MK_K2_TB 8
-#endif
-// MK_K7: the DeltaNet state layout of each head (64 KB, logical S[col][row], col = value, row = key dim).
-// 0: upstream [col][row]: dn_core's thread (col, quarter r) owns 32 contiguous floats, so a warp's float4 load / store hits
-// 32 lines 512 B apart (16 B of each 32-B sector: 50% sector efficiency). 1: permuted so that dn_core's warp w reads float4 i of
-// its 32 lanes as 512 contiguous bytes: float4 (8 w + i) 32 + lane holds rows 32 r + 4 i .. + 3 of col (lane = 4 (col & 7) + r,
-// w = col >> 3). dn_core and pk_dn_scan (prefill) address it through dn_sidx; every other user copies whole layers (layout
-// agnostic). Same arithmetic: bit-exact; state files are keyed by the binary, so a build never reads the other layout.
-#ifndef MK_K7
-#define MK_K7 1
 #endif
 // MK_K6_LD (exact): the tile-major Q8_0 wv tile load. 0: eight 8-byte loads per row and super-block (lanes tq 0-1
 // and 2-3 each read half of a 32-B sector; the other half comes with the next k: every sector crosses L2 -> SM twice).
@@ -227,12 +209,6 @@ constexpr int SM_ATTN = 32 * (256 + 8) * 2 + SM_ATTN_KV + 32 * ATP * 4 + 32 * (A
 // attn_core_q8 (decode attention, all-q8 slots): q8 K / V ring stages, double-buffered S and P
 constexpr int AQ_NSK = 3, AQ_NSV = 4; // K(t) is issued in interval t - 2 and read in t; V(t) issued in t - 1, read in t + 2
 constexpr int AQ_NSKM = 4;            // MIX (low-bit MK_KV slots): K(t) issued in t - 3, expanded to int8 in t - 1, read in t
-#ifndef MK_XP_SM
-#define MK_XP_SM 0 // MIX tile expansion: rows per tile done by the softmax warps (0: all 12 non-S warps round-robin)
-#endif
-#ifndef MK_AQ_EARLY
-#define MK_AQ_EARLY 0 // MIX: 1 = issue the interval's K / V copies at the top of the interval, 0 = after
-#endif                // the MMA work (the copies' lead time does not limit the MIX kernel)
 constexpr int AQ_LDS = ATP + 4;       // S row stride (floats): the softmax quads of 8 rows hit distinct banks; the pad
                                       // columns 32 .. 34 hold the rows' m, l and alpha (the 99 KB budget with AQ_NSKM)
 constexpr int AQ_STG = ATP * KVQ_ROW; // one K or V ring stage
@@ -1831,13 +1807,13 @@ __device__ __noinline__ void dn_proj(const LayerW & W, int dl, int n, int dn_c, 
     }
 }
 
-// float index of state element (col, row) within a head's 128 x 128 block (MK_K7 layout; see there)
+// float index of state element (col, row) within a head's 128 x 128 block. The DeltaNet state of each head (64 KB,
+// logical S[col][row], col = value, row = key dim) is permuted so that dn_core's warp w reads float4 i of its 32 lanes as
+// 512 contiguous bytes: float4 (8 w + i) 32 + lane holds rows 32 r + 4 i .. + 3 of col (lane = 4 (col & 7) + r,
+// w = col >> 3); upstream's [col][row] gave a warp's float4 load / store 32 lines 512 B apart (50% sector efficiency).
+// dn_core and pk_dn_scan (prefill) address it through dn_sidx; every other user copies whole layers.
 __host__ __device__ __forceinline__ int dn_sidx(int col, int row) {
-#if MK_K7
     return (((col >> 3) * 256 + ((row >> 2) & 7) * 32 + (col & 7) * 4 + (row >> 5)) << 2) + (row & 3);
-#else
-    return col * 128 + row;
-#endif
 }
 
 // delta-net core: one block per value head (48 blocks).  conv1d+silu, l2-norm, gated delta
@@ -1874,13 +1850,8 @@ __device__ __noinline__ void dn_core(const LayerW & W, int dl, int n, int dn_c, 
     float * s_gb = s_z + T * 128;                // [NE][2]
     float * s_raw = s_gb + 32;                   // [T][384] conv outputs (silu), 16-byte aligned
 
-#if MK_K7 // S[i] (rows 32 r + 4 i .. + 3 of col) = float4 (8 warp + i) 32 + lane of the head (= dn_sidx)
     float4 * const Sg = reinterpret_cast<float4 *>(cB.dstate + ((size_t) dl * NVH + h) * 128 * 128) + warp * 256 + lane;
     constexpr int SGS = 32; // float4 stride between S[i] and S[i + 1]
-#else
-    float4 * const Sg = reinterpret_cast<float4 *>(cB.dstate + ((size_t) dl * NVH + h) * 128 * 128 + col * 128 + 32 * r);
-    constexpr int SGS = 1;
-#endif
     float4 S[8];
 #pragma unroll
     for (int i = 0; i < 8; i++) S[i] = __ldcg(Sg + SGS * i);
@@ -3277,12 +3248,6 @@ __device__ __forceinline__ void attn_core_q8_t(const LayerW & W, int slot, int n
                 for (int k = 0; k < 4; k++) acc[i][j][k] = 0.f;
 
         for (int jt = 0; jt < ntl + 2; jt++) {
-            // MIX: the copies of K(jt + 3) (into the stage of K(jt - 1)) and V(jt + 1) (into the stage of V(jt - 3), both read
-            // in interval jt - 1) go out FIRST, by warps 4-15: a tile then has two whole intervals to land instead of one
-            // (the all-q8 kernel issues after its MMA work; its intervals are DRAM-bound, so the lead time does not show)
-            if constexpr (MIX && MK_AQ_EARLY) {
-                if (warp >= 4 && jt + 1 < ntl) issue(tid - 128, kring + ((jt + 3) % NSK) * AQ_STG, jt + 3, vring + ((jt + 1) % NSV) * AQ_STG, jt + 1, NT - 128);
-            }
             if (warp < 4) {
                 // ---- S(jt) = Q K(jt)^T: B = positions 8 wn + g8 (all 16 k-steps converted first), all row tiles
                 if (jt < ntl) {
@@ -3431,19 +3396,13 @@ __device__ __forceinline__ void attn_core_q8_t(const LayerW & W, int slot, int n
             // then wait for K(jt + 1) and V(jt)
             if (warp >= 4) {
                 if constexpr (MIX) {
-                    // K(jt + 3) into the stage of K(jt - 1) (unless issued at the top of the interval, MK_AQ_EARLY); then the
+                    // K(jt + 3) into the stage of K(jt - 1); then the
                     // low-bit tiles that landed at the end of interval jt - 1 are expanded to bytes for interval jt + 1: K(jt + 1)
                     // (S warps) and V(jt - 1) (P V warps), up to 3 rows per warp per call; all TP rows (rows >= np hold stale
                     // but finite bytes under zero scales: masked S, P = 0). Their stages are not touched by any copy in flight.
-                    if constexpr (!MK_AQ_EARLY) {
-                        if (jt + 1 < ntl) issue(tid - 128, kring + ((jt + 3) % NSK) * AQ_STG, jt + 3, vring + ((jt + 1) % NSV) * AQ_STG, jt + 1, NT - 128);
-                    }
-                    // row split of each tile: MK_XP_SM = 0: rows round-robin over the 12 warps; else rows 0 .. MK_XP_SM - 1 go to
-                    // the (lightly loaded) softmax warps 12-15, the rest to the P V warps 4-11
-                    int r0, rs, r1;
-                    if constexpr (MK_XP_SM == 0) { r0 = warp - 4; rs = NW - 4; r1 = TP; }
-                    else if (warp >= 12) { r0 = warp - 12; rs = 4; r1 = MK_XP_SM; }
-                    else { r0 = MK_XP_SM + warp - 4; rs = 8; r1 = TP; }
+                    if (jt + 1 < ntl) issue(tid - 128, kring + ((jt + 3) % NSK) * AQ_STG, jt + 3, vring + ((jt + 1) % NSV) * AQ_STG, jt + 1, NT - 128);
+                    // row split of each tile: rows round-robin over the 12 warps 4-15
+                    int r0 = warp - 4, rs = NW - 4, r1 = TP;
                     if (jt + 1 < ntl) {
                         const int kb_ = kbt(jt + 1);
                         if (kb_ != 8) kv_tile_expand<false>(kring + ((jt + 1) % NSK) * AQ_STG, kb_, r1, r0, rs, KVQ_ROW);
@@ -3489,16 +3448,11 @@ __device__ __noinline__ void attn_core_q8(const LayerW & W, int slot, int n) {
     attn_core_q8_t<T>(W, slot, n);
 }
 
-#if MK_DA_Q4
 template <int T>
 __device__ __noinline__ void attn_core_q8m(const LayerW & W, int slot, int n) {
     attn_core_q8_t<T, true>(W, slot, n);
 }
-#endif
 
-#ifndef MK_W48
-#define MK_W48 1 // T >= 6: 1 = attn_core_w48 (one K / V read for all 6 T query rows), 0 = attn_core_q8_t's two head-group passes
-#endif
 // attn_core_w48 (MIX): P V warp wn expands dims 32 wn .. 32 wn + 31 of all 32 staged rows of a low-bit V tile in place to the
 // biased bytes n (kv_rows_expand<BITS, false>'s bytes): lane = row, its lane words 4 wn .. 4 wn + 3 and their high bits are
 // loaded first, then a named barrier of the 8 P V warps (a slice's output overlaps other slices' input), then the stores.
@@ -3546,7 +3500,7 @@ __device__ __forceinline__ void kv_slice_expand(uint8_t * st, int wn) {
     *reinterpret_cast<uint4 *>(row + 32 * wn + 16) = make_uint4(o[4], o[5], o[6], o[7]);
 }
 
-// T >= 6, MK_W48: decode attention over all R = 6 T <= 48 query rows of a kv head in ONE pass, so K / V are read
+// T >= 6: decode attention over all R = 6 T <= 48 query rows of a kv head in ONE pass, so K / V are read
 // once (attn_core_q8_t's two head-group passes read them twice). Shared memory: 48-row sQ, sS,
 // sP, 3 K and 3 V stages (99,072 B): V(t) is issued in interval t (not t - 1), lands by the end of t + 1, read in t + 2. MIX:
 // no expansion stage; the consumers expand in place right before use: S warp wn its K rows 8 wn .. 8 wn + 7 of K(jt)
@@ -3935,52 +3889,33 @@ template <int T>
 __device__ __noinline__ void attn_core_w48q(const LayerW & W, int slot, int n) {
     attn_core_w48<T, false>(W, slot, n);
 }
-#if MK_DA_Q4
 template <int T>
 __device__ __noinline__ void attn_core_w48m(const LayerW & W, int slot, int n) {
     attn_core_w48<T, true>(W, slot, n);
 }
-#endif
 
-// q8 cache: the pipelined kernel when a chunk has more than one tile (L_ctx > ATT_BUCKET; MK_DA_ROUTE), attn_core_t for
+// q8 cache: the pipelined kernel when a chunk has more than one tile (L_ctx > ATT_BUCKET), attn_core_t for
 // one-tile chunks (the pipeline fill does not pay there) and with MK_DATTN=0. Every choice gives the same partials.
 template <int T>
 __device__ __noinline__ void attn_core(const LayerW & W, int slot, int n, uint8_t * /*sm*/) {
-    if constexpr (T > 5) { // q8 cache (checked by the host): the pipelined kernel at every context (MK_W48: one
-                           // pass over all 6 T rows, else two head-group passes); slots with a low-bit MK_KV side run the MIX
-                           // form (the same partials per row)
-#if MK_W48
-#if MK_DA_Q4
+    if constexpr (T > 5) { // q8 cache (checked by the host): the pipelined kernel at every context, one pass over all
+                           // 6 T rows (attn_core_w48); slots with a low-bit MK_KV side run the MIX form (the same partials
+                           // per row)
         if (cB.kvb[0][slot] != 8 || cB.kvb[1][slot] != 8) attn_core_w48m<T>(W, slot, n);
         else
-#endif
         attn_core_w48q<T>(W, slot, n);
-#else
-#if MK_DA_Q4
-        if (cB.kvb[0][slot] != 8 || cB.kvb[1][slot] != 8) attn_core_q8m<T>(W, slot, n);
-        else
-#endif
-        attn_core_q8<T>(W, slot, n);
-#endif
         return;
     } else
     if (cB.kvq8) {
-#if MK_DA_ROUTE || MK_DA_Q4
         // one call site per kernel: attn_core_t is force-inlined, a second site would duplicate it
         const bool q8 = cB.kvb[0][slot] == 8 && cB.kvb[1][slot] == 8;
-        if (cB.dattn && (!MK_DA_ROUTE || n + T > ATT_BUCKET) && (MK_DA_Q4 || q8)) {
-#if MK_DA_Q4
+        if (cB.dattn && n + T > ATT_BUCKET) {
             if (!q8) attn_core_q8m<T>(W, slot, n);
             else
-#endif
             attn_core_q8<T>(W, slot, n);
         } else {
             attn_core_t<T, true>(W, slot, n);
         }
-#else
-        if (cB.dattn && cB.kvb[0][slot] == 8 && cB.kvb[1][slot] == 8) attn_core_q8<T>(W, slot, n);
-        else attn_core_t<T, true>(W, slot, n);
-#endif
     } else {
         attn_core_t<T, false>(W, slot, n);
     }
@@ -7905,7 +7840,7 @@ struct MKEngine::Impl {
             throw std::runtime_error("MK_K6=" + std::to_string(hb.k6) + ": bit 1 (the K-split of the Q8_0 k / v tiles) was removed; bits 2 and 4 remain (default 4)");
         k8 = getenv("MK_K8") ? atoi(getenv("MK_K8")) : MK_K8_DEF;
         if (const char * e = getenv("MK_K8_NT")) k8_nt = atoi(e) == 8 ? 8 : 4;
-        fprintf(stderr, "[mk] stock2: K6 %d (ld %d), K7 state layout %d, K8 %d (nt %d)\n", hb.k6, MK_K6_LD, MK_K7, k8, k8_nt);
+        fprintf(stderr, "[mk] stock2: K6 %d (ld %d), K8 %d (nt %d)\n", hb.k6, MK_K6_LD, k8, k8_nt);
         fprintf(stderr, "[mk] K5: split dn_proj -> dn_core barrier, delta-net heads in dn_proj arrival order\n");
         fprintf(stderr, "[mk] C1: ffn_gu -> ffn_down per-chunk waits instead of a grid barrier\n");
         hb.ctx = ctx + KV_PAD; // rows per kv head (KV_PAD: the MTP draft rows written past the last admitted position)
@@ -10713,17 +10648,9 @@ MKEngine::MKEngine(const std::string & path, int ctx, int n_draft, const std::st
         }
     } delete_on_throw{p_, std::uncaught_exceptions()};
     n_draft = n_draft_ = p_->n_draft_cap; // (0 without an MTP block)
-    if (n_draft > 4) { // the wide pass (T >= 6) runs the pipelined q8-cache decode attention only (attn_core<T > 5>: attn_core_q8,
-                       // or attn_core_q8m for the low-bit MK_KV sides)
-        bool q8 = p_->hb.kvq8;
-#if !MK_DA_Q4
-        for (int s = 0; s < N_ATT_SLOTS; s++) q8 = q8 && p_->hb.kvb[0][s] == 8 && p_->hb.kvb[1][s] == 8;
-#endif
-        if (!q8) {
-            throw std::runtime_error(MK_DA_Q4 ? "n_draft > 4 needs the q8 KV cache (--kv q8)"
-                                              : "n_draft > 4 needs the all-q8 KV cache (--kv q8, no low-bit MK_KV; MK_DA_Q4=0 build)");
-        }
-    }
+    // the wide pass (T >= 6) runs the pipelined q8-cache decode attention only (attn_core<T > 5>: attn_core_w48q, or
+    // attn_core_w48m for the low-bit MK_KV sides)
+    if (n_draft > 4 && !p_->hb.kvq8) throw std::runtime_error("n_draft > 4 needs the q8 KV cache (--kv q8)");
     reset();
     if (const char * pol = getenv("MK_POLICY")) set_policy(pol);
 #if MK_SPEC_LOG

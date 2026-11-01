@@ -391,7 +391,7 @@ __global__ void __launch_bounds__(256, 2) pk_dn_scan(int T, int t0, const float 
     __shared__ float sa[DC], sb[DC], sg[DC], sd[DC];
     const int h = blockIdx.x, kh = h % NKH, tid = threadIdx.x, lane = tid & 31, w = tid >> 5, g = lane >> 2, t4 = lane & 3;
     const int col0 = blockIdx.y * 64 + 8 * w; // this warp's 8 value columns
-    const float * Si = st_in + (size_t) h * 128 * 128; // element (col, row) at dn_sidx(col, row) (MK_K7)
+    const float * Si = st_in + (size_t) h * 128 * 128; // element (col, row) at dn_sidx(col, row)
     float S[8][4];                                    // rows 16 mt + g (+8), columns col0 + 2 t4 (+1)
 #pragma unroll
     for (int mt = 0; mt < 8; mt++) {
