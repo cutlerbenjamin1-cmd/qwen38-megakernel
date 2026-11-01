@@ -96,30 +96,6 @@ extern char ** environ; // (state files: the MK_* settings in the key)
 #ifndef MK_WV_OUT
 #define MK_WV_OUT 0
 #endif
-// MK_WV_Q6F (default 0): every main-layer Q6_K matrix fragment-ordered with its meta inline (wv.cuh "FM
-// Q6_K") and on wv at every T: out / ssm_out, gate / up, qkv / z, k / v leave dp4a (KLD-gated: new summation order),
-// ffn_down's Q6_K moves from tile-major to FM (bit-identical: the same integer chunk sums and float sequence).
-#ifndef MK_WV_Q6F
-#define MK_WV_Q6F 0
-#endif
-// MK_GSYNC: the grid barrier's form. 0 (default): upstream's (every block's thread 0 red.release-adds one word
-// and ld.acquire-polls that same word). 1: flag broadcast with relaxed polling (arrivals atom.acq_rel-add the count word;
-// the last arriver st.release-writes the generation to a separate "go" line; the others poll go with ld.relaxed and re-read
-// it with ld.acquire once it is reached). 2: flag broadcast, ld.acquire polling. 3: upstream's arrival, relaxed polling.
-// All forms keep release / acquire semantics between every block's writes before and every block's reads after the barrier.
-// The gsync bench (MK_GSB, bench mode) runs every form in any build.
-#ifndef MK_GSYNC
-#define MK_GSYNC 0
-#endif
-// MK_K5 (compile-time; 0 = default = the code without it): the dn_proj -> dn_core grid barrier becomes a split
-// barrier (k5_arrive after dn_proj, k5_wait inside dn_core) and the 48 heads go to the first 48 blocks to finish dn_proj,
-// which load the head's state and replay its accepted drafts (inputs of earlier launches) before the wait. Bitwise exact.
-#ifndef MK_K5
-#define MK_K5 0
-#endif
-#if MK_K5 && MK_GSYNC != 0
-#error "MK_K5 needs MK_GSYNC=0 (its split barrier is form 0's arrival / poll on the same counter)"
-#endif
 // MK_K2_TB: tokens per batch of resid_wv's last-arrival combine (their partial loads issued together)
 #ifndef MK_K2_TB
 #define MK_K2_TB 8
@@ -573,7 +549,7 @@ __shared__ unsigned s_bar_k; // index of the last grid barrier passed (profiling
 extern __shared__ __align__(16) uint8_t smem[]; // dynamic shared memory of the persistent block
 
 // Grid barrier, thread 0 of each block (epoch: the arrival count that completes this generation, already advanced).
-// Form V (MK_GSYNC): 0 = release-add on arrival, acquire-poll the same word until every block of this generation arrived;
+// Form V (gsync runs form 0; the gsync bench, MK_GSB, runs every form): 0 = release-add on arrival, acquire-poll the same word until every block of this generation arrived;
 // 1 / 2 = flag broadcast: acq_rel-add the count word, the last arriver release-writes the generation to the go word (its
 // own 128-byte line, cB.bar + GS_GO) and the others poll only go (1: relaxed polls, then one acquire re-read; 2: acquire
 // polls); 3 = form 0's arrival with relaxed polls and one acquire re-read. Both words start at 0 every launch.
@@ -629,7 +605,7 @@ __device__ __forceinline__ void gsync(unsigned & epoch, int tag) {
             if (k < 1024) cB.prof[4096 + k * 128 + blockIdx.x] = gtimer();
         }
         epoch += gridDim.x;
-        gs_arrive_wait<MK_GSYNC>(MK_EPOCH(epoch));
+        gs_arrive_wait<0>(MK_EPOCH(epoch));
         if (cB.prof && blockIdx.x == 0) {
             const unsigned k = epoch / gridDim.x;
             s_bar_k = k;
@@ -639,8 +615,9 @@ __device__ __forceinline__ void gsync(unsigned & epoch, int tag) {
     __syncthreads();
 }
 
-#if MK_K5
-// K5 split grid barrier (MK_GSYNC 0's counter and epoch accounting, gsync cut in two halves).
+// K5: the dn_proj -> dn_core grid barrier is a split barrier (k5_arrive after dn_proj, k5_wait inside dn_core) and the
+// 48 heads go to the first 48 blocks to finish dn_proj, which load the head's state and replay its accepted drafts
+// (inputs of earlier launches) before the wait. Bitwise exact. Form 0's counter and epoch accounting, gsync cut in two.
 // k5_arrive: every block, right after its producer items; release-adds one arrival (atom: the returned count is the
 // block's arrival rank in this generation) and advances epoch as gsync does. The first NVH blocks to arrive take the
 // delta-net heads 0 .. NVH - 1 (s_k5h, -1: none), s_k5e = the count that completes the generation. Every block then calls
@@ -678,7 +655,6 @@ __device__ __forceinline__ void k5_wait() {
     }
     __syncthreads();
 }
-#endif
 
 // profiling: timestamp the end of a phase's activation fill (block 0)
 __device__ __forceinline__ void mark_fill() {
@@ -1295,7 +1271,7 @@ __device__ __noinline__ void gemv_pairs(const Mat m, int lo, int hi, Out out) {
 }
 
 // Runtime dispatch on a matrix's type (uniform across the grid). Every main-layer matrix of Q4_K, Q5_K, Q8_0, IQ4_NL,
-// IQ4_XS (and Q6_K with MK_WV_Q6F) is in the wv layout and the MTP block is re-quantised to Q4_K, so these read the
+// IQ4_XS and Q6_K is in the wv layout and the MTP block is re-quantised to Q4_K, so these read the
 // hybrid types and the MTP block only; the loader refuses any matrix they would not read. Plain switches: a capturing
 // lambda would take the address of the caller's locals and push them to local memory.
 // (mk_cycle's stack frame is the deepest call chain incl. the callees' spills: a spilling GEMV instantiation of any
@@ -1305,9 +1281,6 @@ template <int T, int IT, class Out>
 __device__ __forceinline__ void gemv_pairs_any(const Mat & m, int lo, int hi, Out out) {
     switch (m.type) {
         case T_Q4K: gemv_pairs<T, IT, T_Q4K>(m, lo, hi, out); break;
-#if !MK_WV_Q6F
-        case T_Q6K: gemv_pairs<T, IT, T_Q6K>(m, lo, hi, out); break;
-#endif
         case T_Q3K: gemv_pairs<T, IT, T_Q3K>(m, lo, hi, out); break;
         case T_IQ3S: gemv_pairs<T, IT, T_IQ3S>(m, lo, hi, out); break;
         default: gemv_pairs<T, IT, T_IQ4X>(m, lo, hi, out); break;
@@ -1617,9 +1590,6 @@ template <int T, int IT>
 __device__ __forceinline__ void resid_any(const Mat & W, const QBuf & in, float * x, bool add, const float * wnext, uint8_t * sm) {
     switch (W.type) {
         case T_Q4K: resid32<T, IT, T_Q4K>(W, in, x, add, wnext, sm); break;
-#if !MK_WV_Q6F
-        case T_Q6K: resid32<T, IT, T_Q6K>(W, in, x, add, wnext, sm); break;
-#endif
         case T_Q3K: resid32<T, IT, T_Q3K>(W, in, x, add, wnext, sm); break;
         case T_IQ3S: resid32<T, IT, T_IQ3S>(W, in, x, add, wnext, sm); break;
         default: resid32<T, IT, T_IQ4X>(W, in, x, add, wnext, sm); break;
@@ -1706,9 +1676,6 @@ template <int T>
 __device__ __forceinline__ LaneT<T> rows16_any(const Mat & m, int j) {
     switch (m.type) {
         case T_Q4K: return rows16<T, T_Q4K>(m, j);
-#if !MK_WV_Q6F
-        case T_Q6K: return rows16<T, T_Q6K>(m, j);
-#endif
         case T_Q3K: return rows16<T, T_Q3K>(m, j);
         case T_IQ3S: return rows16<T, T_IQ3S>(m, j);
         default: return rows16<T, T_IQ4X>(m, j);
@@ -1875,14 +1842,13 @@ __host__ __device__ __forceinline__ int dn_sidx(int col, int row) {
 
 // delta-net core: one block per value head (48 blocks).  conv1d+silu, l2-norm, gated delta
 // rule (with replay of pending accepted tokens), gated rms-norm, quantise for ssm_out.
-// K5 (MK_K5 builds, solo launches): the head this block took at its dn_proj arrival (k5_arrive), the replay before the
+// K5 (solo launches): the head this block took at its dn_proj arrival (k5_arrive), the replay before the
 // barrier completes. K5 false: head hh (batched launches: one (lane, head) item after a grid barrier; hh < 0: blockIdx.x),
 // the same events in the same order (bit-identical).
-template <int T, bool K5 = (MK_K5 != 0)>
+template <int T, bool K5 = true>
 __device__ __noinline__ void dn_core(const LayerW & W, int dl, int n, int dn_c, int n_commit, uint8_t * /*sm*/, int hh = -1) {
     uint8_t * const sm = smem;
     int h;
-#if MK_K5
     if constexpr (K5) {
         h = s_k5h;
         if (h < 0) {
@@ -1890,7 +1856,6 @@ __device__ __noinline__ void dn_core(const LayerW & W, int dl, int n, int dn_c, 
             return;
         }
     } else
-#endif
     {
         h = hh >= 0 ? hh : (int) blockIdx.x;
         if (h >= NVH) return;
@@ -1924,7 +1889,6 @@ __device__ __noinline__ void dn_core(const LayerW & W, int dl, int n, int dn_c, 
     float * ring = cB.kvgb + (size_t) dl * KV_RING * KVGB;
     const float * conv = cB.conv + (size_t) dl * CONV_RING * QKV;
 
-#if MK_K5
     if constexpr (K5) {
         // ---- K5 Pre (before the dn_proj barrier completes): the replayed events' inputs come from earlier launches (kvgb
         // ring), so load them and run the replay now; the events' arithmetic and order are those of the single loop below ----
@@ -1993,7 +1957,6 @@ __device__ __noinline__ void dn_core(const LayerW & W, int dl, int n, int dn_c, 
         for (int i = tid; i < T * 128; i += NT) s_z[i] = __ldcg(cB.z + (i >> 7) * VD + h * 128 + (i & 127));
         __syncthreads();
     } else
-#endif
     {
         // ---- prologue: every input of every event, one round of loads ----
         if (tid < 384) {
@@ -2061,7 +2024,6 @@ __device__ __noinline__ void dn_core(const LayerW & W, int dl, int n, int dn_c, 
         }
     }
 
-#if MK_K5
     if constexpr (K5) {
         // ---- gated delta rule over the new tokens' events (the replayed ones ran before the wait) ----
         for (int e = np; e < np + T; e++) {
@@ -2102,7 +2064,6 @@ __device__ __noinline__ void dn_core(const LayerW & W, int dl, int n, int dn_c, 
             }
         }
     } else
-#endif
     {
         // ---- gated delta rule over all events; inputs are in shared memory, no barriers needed ----
         for (int e = 0; e < np + T; e++) {
@@ -4697,11 +4658,7 @@ __device__ void main_forward(const Launch & P, uint8_t * /*sm*/, unsigned & epoc
             if constexpr (WIDE) dn_proj_wv<T>(W, dl, n, dn_c);
             else if (W.qkv.fm || W.gate.fm) dn_proj_wv<T>(W, dl, n, dn_c);
             else dn_proj<T>(W, dl, n, dn_c, sm);
-#if MK_K5
             k5_arrive(epoch, PH_DN_PROJ); // split barrier: dn_core waits after its replay (k5_wait)
-#else
-            gsync(epoch, PH_DN_PROJ);
-#endif
             dn_core<T>(W, dl, n, dn_c, n_commit, sm);
             gsync(epoch, PH_DN_CORE);
             if (W.sout.fm) resid_out_wv<T>(W.sout, W.post_norm);
@@ -7228,9 +7185,9 @@ struct MKEngine::Impl {
                     }
                 });
             }
-            // main-layer ffn_down: tile-major values and meta pairs; MK_WV_Q6F: every main-layer Q6_K fragment-ordered with
-            // the meta inline (one stream: no meta, m.d stays null)
-            if (wv_lay && (wv_fd || MK_WV_Q6F)) wv_place(m, qd, qn, md, mn, S);
+            // main layers: ffn_down's tile-major values and meta pairs, every Q6_K fragment-ordered with the meta inline
+            // (one stream: no meta, m.d stays null)
+            if (wv_lay) wv_place(m, qd, qn, md, mn, S);
             else
             {
                 m.w = dput<uint8_t>(qd, qn, &S);
@@ -7374,7 +7331,7 @@ struct MKEngine::Impl {
     std::vector<void *> wv_tabs; // the probes' gather tables (cudaMalloc)
     int wv_dev_n = 0;
     void wv_place(Mat & m, const uint8_t * w, size_t wn, const uint8_t * meta, size_t meta_n, HSet & S) {
-        const bool q6f = MK_WV_Q6F && m.type == T_Q6K;
+        const bool q6f = m.type == T_Q6K;
         const size_t on = q6f ? wn + meta_n : wn, omn = q6f ? 0 : meta_n;
         const size_t moff = (wn + 255) & ~(size_t) 255;
         bool dev = gpurl && wv_dev_ok(m.type, m.N, m.K, m.rb, meta_n, wv_probes);
@@ -7771,10 +7728,8 @@ struct MKEngine::Impl {
         mem_mark("weights: 64 layers + MTP");
         wv_lay = false;
         fprintf(stderr, "[mk] wv: %d main-pass matrices in the wv layout (%d on the device, the others re-laid-out on the host in %.1f s; %s), MAXT %d\n", wv_n, wv_dev_n, wv_s,
-                MK_WV_Q6F ? (MK_WV_OUT ? "Q6_K everywhere (FM), ffn_down / out / ssm_out every type; elsewhere Q3_K / IQ3_S stay on dp4a"
-                                       : "Q6_K everywhere (FM), ffn_down every type; elsewhere Q3_K / IQ3_S stay on dp4a")
-                          : MK_WV_OUT ? "ffn_down, out, ssm_out: every type; elsewhere Q6_K / Q3_K / IQ3_S stay on dp4a"
-                                      : "ffn_down: every type; elsewhere Q6_K / Q3_K / IQ3_S stay on dp4a", MAXT);
+                MK_WV_OUT ? "Q6_K everywhere (FM), ffn_down / out / ssm_out every type; elsewhere Q3_K / IQ3_S stay on dp4a"
+                          : "Q6_K everywhere (FM), ffn_down every type; elsewhere Q3_K / IQ3_S stay on dp4a", MAXT);
         if (has_mtp) {
             req_q4 = true;
             hw.eh = up_mat(blk(NL, "nextn.eh_proj.weight"), 2 * D, D);
@@ -7785,13 +7740,13 @@ struct MKEngine::Impl {
             hw.shnorm = up_f32(blk(NL, "nextn.shared_head_norm.weight"), D);
         }
         // Every matrix outside the wv layout must be of a type this build's dp4a dispatch keeps: main layers a hybrid type
-        // (Q3_K / IQ3_S; Q6_K without MK_WV_Q6F: wv.cuh gemv_pairs_dp), the MTP block (solo and batched passes: gemv_pairs_any,
+        // (Q3_K / IQ3_S: wv.cuh gemv_pairs_dp), the MTP block (solo and batched passes: gemv_pairs_any,
         // resid_any, rows16_any) after its re-quantisation also Q4_K / IQ4_XS. The loader above guarantees it for every file
         // it accepts; anything else is refused here rather than mis-read.
         {
             auto dp4a_need = [&](const std::string & name, const Mat & m, bool mtp) {
                 const int t = m.type;
-                if (m.fm || t == T_Q3K || t == T_IQ3S || (!MK_WV_Q6F && t == T_Q6K) || (mtp && (t == T_Q4K || t == T_IQ4X))) return;
+                if (m.fm || t == T_Q3K || t == T_IQ3S || (mtp && (t == T_Q4K || t == T_IQ4X))) return;
                 throw std::runtime_error(name + " is " + tname(t) + (mtp ? " in the MTP block" : " outside the wv layout") +
                                          ": this build's dp4a kernels do not read it");
             };
@@ -7941,7 +7896,7 @@ struct MKEngine::Impl {
         // stockfix switches (bit-exact): K1 MK_K1, K2 MK_K2 (both default on)
         hb.k1 = !(getenv("MK_K1") && atoi(getenv("MK_K1")) == 0);
         hb.k2 = !(getenv("MK_K2") && atoi(getenv("MK_K2")) == 0);
-        fprintf(stderr, "[mk] stockfix: K1 ab dealing %d, K2 combine %d (tb %d), gsync form %d\n", hb.k1, hb.k2, MK_K2_TB, MK_GSYNC);
+        fprintf(stderr, "[mk] stockfix: K1 ab dealing %d, K2 combine %d (tb %d)\n", hb.k1, hb.k2, MK_K2_TB);
         // stock2 switches: K6 MK_K6 (bits: 2 dealing across blocks, exact; 4 8-row halves of the Q8_0
         // k / v tiles, exact), K8 MK_K8 (bits, prefill, exact: 1 pk_ab on a second stream, 2 pk_norm_quant reads x once,
         // 4 pk_dn_prep MK_K8_NT tokens per block); compile-time K7 (state layout), K6_LD (Q8_0 tile loads)
@@ -7951,9 +7906,7 @@ struct MKEngine::Impl {
         k8 = getenv("MK_K8") ? atoi(getenv("MK_K8")) : MK_K8_DEF;
         if (const char * e = getenv("MK_K8_NT")) k8_nt = atoi(e) == 8 ? 8 : 4;
         fprintf(stderr, "[mk] stock2: K6 %d (ld %d), K7 state layout %d, K8 %d (nt %d)\n", hb.k6, MK_K6_LD, MK_K7, k8, k8_nt);
-#if MK_K5
-        fprintf(stderr, "[mk] K5: split dn_proj -> dn_core barrier, delta-net heads in dn_proj arrival order (MK_K5=1)\n");
-#endif
+        fprintf(stderr, "[mk] K5: split dn_proj -> dn_core barrier, delta-net heads in dn_proj arrival order\n");
         fprintf(stderr, "[mk] C1: ffn_gu -> ffn_down per-chunk waits instead of a grid barrier\n");
         hb.ctx = ctx + KV_PAD; // rows per kv head (KV_PAD: the MTP draft rows written past the last admitted position)
         {
@@ -8552,7 +8505,7 @@ struct MKEngine::Impl {
                 fprintf(stderr, "[mk-gsb] blocks %2d form %s: %.3f us per barrier (median; min %.3f), N %d, launch %.1f us, %d reps\n",
                         nbs[bi], fn[f], (mn - m0) * 1e3 / N, (best - b0) * 1e3 / N, N, m0 * 1e3, reps);
             }
-        fprintf(stderr, "[mk-gsb] this build's gsync is form %d (MK_GSYNC)\n", MK_GSYNC);
+        fprintf(stderr, "[mk-gsb] the engine's gsync is form 0\n");
     }
 
     void bench() {
@@ -9051,15 +9004,13 @@ struct MKEngine::Impl {
     // V2: a gate / up pair of different types (or layouts) as one mixed-type fused launch, pf::mmh<TG, true, NB, LG, TU, LU>
     // (warps 0-3 gate rows, 4-7 up rows, each half its own type): the same products, sums and silu * up as the two GEMMs +
     // pk_glu, so bit-identical, without the fp32 y0 / y1 round trip (y1 can then shrink, pf_init). MK_PF_GLU_MIX=0: off.
-    // The pairs of UD-Q4_K_XL (gate / up; main layers are in the wv layout except Q3_K, Q6_K only with MK_WV_Q6F); any
-    // other pair takes the two-GEMM path.
+    // The pairs of UD-Q4_K_XL (gate / up; main layers are in the wv layout except Q3_K); any other pair takes the two-GEMM
+    // path.
     bool glu_mix_on = !(getenv("MK_PF_GLU_MIX") && atoi(getenv("MK_PF_GLU_MIX")) == 0);
-    static constexpr int GLW = 1, GL6 = MK_WV_Q6F ? 1 : 0;
 #define MK_GLU_MIX_PAIRS(X)                                                                                                \
-    X(pf::TQ4K, GLW, pf::TQ5K, GLW) X(pf::TIQ4, GLW, pf::TQ5K, GLW) X(pf::TIQ4, GLW, pf::TQ4K, GLW)                      \
-    X(pf::TQ4K, GLW, pf::TIQ4, GLW) X(pf::TQ6K, GL6, pf::TQ6K, GL6) X(pf::TIQ4, GLW, pf::TQ3K, 0)                        \
-    X(pf::TQ6K, GL6, pf::TQ5K, GLW) X(pf::TQ3K, 0, pf::TIQ4, GLW) X(pf::TIQ4NL, GLW, pf::TIQ4, GLW)                      \
-    X(pf::TIQ4NL, GLW, pf::TQ5K, GLW) X(pf::TQ5K, GLW, pf::TIQ4NL, GLW)
+    X(pf::TQ4K, 1, pf::TQ5K, 1) X(pf::TIQ4, 1, pf::TQ5K, 1) X(pf::TIQ4, 1, pf::TQ4K, 1) X(pf::TQ4K, 1, pf::TIQ4, 1)      \
+    X(pf::TQ6K, 1, pf::TQ6K, 1) X(pf::TIQ4, 1, pf::TQ3K, 0) X(pf::TQ6K, 1, pf::TQ5K, 1) X(pf::TQ3K, 0, pf::TIQ4, 1)      \
+    X(pf::TIQ4NL, 1, pf::TIQ4, 1) X(pf::TIQ4NL, 1, pf::TQ5K, 1) X(pf::TQ5K, 1, pf::TIQ4NL, 1)
     template <int TG, int LG, int TU, int LU> void mmh_attr_mix() {
         CK(cudaFuncSetAttribute(pf::mmh<TG, true, 32, LG, TU, LU>, cudaFuncAttributeMaxDynamicSharedMemorySize, pf::hm_smem2<TG, TU, 32>()));
         CK(cudaFuncSetAttribute(pf::mmh<TG, true, 64, LG, TU, LU>, cudaFuncAttributeMaxDynamicSharedMemorySize, pf::hm_smem2<TG, TU, 64>()));

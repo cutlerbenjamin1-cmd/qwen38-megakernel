@@ -5,13 +5,12 @@
 // ---- host: load-time re-layout (exact byte permutation of the device layout) --------------------------------------
 // w: N rows x rb bytes in the device layout of `type` (after the loader's repacks; may be the GGUF mapping itself);
 // meta: its meta stream, meta_n bytes (N rows of meta_n / N bytes: Q8_0's scales, Q6_K / Q3_K / IQ3_S's meta) or none
-// (meta_n 0). Writes the wv layout to out (N rb bytes; MK_WV_Q6F Q6_K: N rb + meta_n bytes with the meta inline) and a
+// (meta_n 0). Writes the wv layout to out (N rb bytes; Q6_K: N rb + meta_n bytes with the meta inline) and a
 // re-laid meta stream to out_meta. Returns the bytes left in the meta stream (0: none, or folded into out). N % 16 == 0.
 // out / out_meta must not overlap w / meta. Every output byte is written.
 size_t wv_relayout(int type, int N, int K, int rb, const uint8_t * w, const uint8_t * meta, size_t meta_n, uint8_t * out,
                    uint8_t * out_meta) {
     const int nb = K / 256;
-#if MK_WV_Q6F
     if (type == T_Q6K) { // FM Q6_K (wv.cuh "FM Q6_K"): units of Q6F_UNIT bytes, the meta stream inline
         const int mrow = nb * Q6_META;
         parallel_rows(N / 16, [&](int64_t tile) {
@@ -40,7 +39,6 @@ size_t wv_relayout(int type, int N, int K, int rb, const uint8_t * w, const uint
         });
         return 0;
     }
-#endif
     if (wv_fm(type)) {
         const int BS = type == T_Q4K ? 144 : type == T_Q5K ? 176 : 136;
         parallel_rows(N / 16, [&](int64_t tile) {
@@ -96,7 +94,7 @@ size_t wv_relayout(int type, int N, int K, int rb, const uint8_t * w, const uint
 //   running wv_relayout itself on a probe of 16 rows whose words hold their own (row, word) positions (wv_probe), so this
 //   path follows any change of the host code;
 // - tile-major types move whole blocks of 4-byte words (wv_tm_dev: the host's tm(), word for word);
-// - FM Q6_K (MK_WV_Q6F) packs 2-bit fields: wv_q6f_dev is the host loop, line for line.
+// - FM Q6_K packs 2-bit fields: wv_q6f_dev is the host loop, line for line.
 struct WvProbe {
     int G = 0;                 // super-blocks per gather group (IQ4_XS: 2, the loader's 272-B block pairs)
     int seg = 0;               // source bytes of one row per group (G * block bytes)
@@ -149,7 +147,6 @@ __global__ void wv_tm_dev(const uint32_t * __restrict__ src, uint32_t * __restri
         dst[i] = src[(tile * 16 + rr) * rowbw + (int64_t) b * bsw + j];
     }
 }
-#if MK_WV_Q6F
 // one thread per (tile, super-block, row of the tile): that row's bytes of the Q6F_UNIT unit (wv_relayout's Q6_K loop)
 __global__ void wv_q6f_dev(const uint8_t * __restrict__ w, const uint8_t * __restrict__ meta, uint8_t * __restrict__ out, int N, int nb, int rb) {
     const int mrow = nb * Q6_META;
@@ -181,15 +178,12 @@ __global__ void wv_q6f_dev(const uint8_t * __restrict__ w, const uint8_t * __res
         }
     }
 }
-#endif
 // Which wv layouts have a device path, for a matrix of this shape (rb row bytes, meta_n meta bytes): host side, before the
 // staging copy is queued. FM types: also makes the type's gather table (once; probes[type].dtab must then be uploaded).
 inline bool wv_dev_ok(int type, int N, int K, int rb, size_t meta_n, std::map<int, WvProbe> & probes) {
     const int nb = K / 256;
     if (N % 16) return false;
-#if MK_WV_Q6F
     if (type == T_Q6K) return meta_n == (size_t) N * nb * Q6_META && nb % 2 == 0;
-#endif
     if (wv_fm(type)) {
         auto it = probes.find(type);
         if (it == probes.end()) {
@@ -210,12 +204,10 @@ inline cudaError_t wv_dev_launch(int type, int N, int K, int rb, const uint8_t *
                                  uint8_t * out_meta, cudaStream_t st, const WvProbe * pp) {
     const int nb = K / 256, TPB = 256;
     auto grid = [](int64_t n) { return (unsigned) std::max<int64_t>(1, std::min<int64_t>(4096, (n + 255) / 256)); };
-#if MK_WV_Q6F
     if (type == T_Q6K) {
         wv_q6f_dev<<<grid((int64_t) (N / 16) * nb * 16), TPB, 0, st>>>(sw, sm, out, N, nb, rb);
         return cudaGetLastError();
     }
-#endif
     if (wv_fm(type)) {
         const WvProbe & p = *pp;
         const int W = (int) p.tab.size(), ngrp = nb / p.G;

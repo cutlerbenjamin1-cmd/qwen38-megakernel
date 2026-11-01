@@ -20,9 +20,6 @@
 #ifndef MK_PF_FRAG_G
 #define MK_PF_FRAG_G -1 // (tuning) the MMA group of a stage after which the next stage's scales + fragments are made; -1: frag_g
 #endif
-#ifndef MK_WV_Q6F
-#define MK_WV_Q6F 0 // (qwen38_mk.cu sets it; FM Q6_K units, see mmh's FM6)
-#endif
 #ifndef MK_PF_INFCHK
 #define MK_PF_INFCHK 0 // debug builds: 1 = count the prefill GEMMs' fp16 overflows (chk_*; the served build has none of it)
 #endif
@@ -205,7 +202,7 @@ __device__ __forceinline__ unsigned h2u(__half2 h) { return *reinterpret_cast<un
 // row; IQ4_XS: 16 B per row pair g / g + 8). rawq's 32-bit reads are bank-conflict-free because odd-g lanes read their
 // chunks' second half (row g + 8) as their "row A": the lane's MMA rows are g + 8 (g & 1) and the other one, which the
 // scales and the epilogue follow (the same products and sums per row: exact).
-// FM6 (MK_WV_Q6F): Q6_K in wv.cuh's FM Q6_K units (3360 B per tile and super-block, meta inline). Stage layout (the
+// FM6: Q6_K in wv.cuh's FM Q6_K units (3360 B per tile and super-block, meta inline). Stage layout (the
 // weight part, 64 B x ROWS): qlo of tile t at F6L + 512 t (the unit's group-p block, whole), qhi at F6H + 256 t (likewise),
 // per row 16 B at F6M + 16 r: sc[4p .. 4p + 3] | d of rows g / g + 8 | the fp16 scale pairs (scales). The unit's qlo / qhi
 // order is the thread order of rawq (lane l = 4 g + t4: rows g / g + 8, elements 4 t4 .. + 3 of each 16-chunk), so rawq
@@ -243,7 +240,7 @@ template <int TG, int TU, int NB> __host__ __device__ constexpr int hm_smem2() {
 // thread of the per-row copies (scale streams, Q6_K meta, Q3_K / IQ3_S extra bytes): threads TB .. TB + ROWS - 1.
 template <int TYPE, int LAY, int ROWS, bool TW2, int HB, int TB, bool OWN = false> struct HalfW {
     static constexpr bool FMT = LAY && (TYPE == TIQ4 || (MK_WV_FMK && (TYPE == TQ4K || TYPE == TQ5K))); // fragment-ordered
-    static constexpr bool FM6 = LAY && TYPE == TQ6K && MK_WV_Q6F;
+    static constexpr bool FM6 = LAY && TYPE == TQ6K;
     static constexpr int BLK = WT<TYPE>::BLK, NCH = WT<TYPE>::NCH, SR = HT<TYPE>::SR;
     static constexpr bool SEP = HT<TYPE>::SEP;
     static constexpr int F6L = 0, F6H = 32 * ROWS, F6M = 48 * ROWS, F6U = 3360;

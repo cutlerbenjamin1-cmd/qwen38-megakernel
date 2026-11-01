@@ -3,9 +3,9 @@ NVCC ?= /usr/local/cuda/bin/nvcc
 # the first GPU's architecture (sm_86 RTX 30, sm_89 RTX 40, sm_120 RTX 50); sm_86 if nvidia-smi is missing
 ARCH ?= $(or $(shell nvidia-smi --query-gpu=compute_cap --format=csv,noheader 2>/dev/null | head -n1 | tr -d '. '),86)
 ARCH := sm_$(patsubst sm_%,%,$(ARCH))
-# engine configuration: fragment-ordered Q6_K and the split DeltaNet barrier = the served build (the engine always
-# verifies on int8 tensor cores, up to 7 drafts). ptxas peaks at ~19 GiB of RAM with it (2026-10-30).
-MKFLAGS ?= -DMK_WV_Q6F=1 -DMK_K5=1
+# the engine's extra -D flags: none for the served build; debug / experiment builds, e.g. MKFLAGS=-DMK_SPEC_LOG=1.
+# ptxas peaks at ~19 GiB of RAM (2026-10-30).
+MKFLAGS ?=
 NVFLAGS = -O3 -std=c++17 -arch=$(ARCH) -lineinfo -Xptxas -dlcm=cg -Xptxas -v -Xcompiler -fPIC $(MKFLAGS)
 # Most of the build is ptxas on the megakernel (one thread, ~19 GiB heap). It runs ~20% faster when glibc's malloc asks
 # for transparent huge pages, which this tunable does (glibc 2.35+; nothing changes where THP is off). Same machine code.
