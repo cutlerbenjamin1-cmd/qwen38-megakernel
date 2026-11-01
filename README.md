@@ -8,6 +8,10 @@ Hadamard-rotated in preset F) while the newest 2,048 positions stay in a q8_0 ri
 weight. It speaks the OpenAI, Anthropic and OpenAI Responses APIs, so coding agents and chat UIs connect to it
 directly.
 
+**And it's exact, bit for bit.** Greedy output is the same at 0 drafts or 7, a cached, edited or resumed conversation
+answers exactly like the same request sent fresh, and the Windows and Linux builds give identical tokens. Speculation
+and caching never change the answer ([how](#exact-output)).
+
 [Quick start](#quick-start) | [Benchmarks](docs/BENCHMARKS.md) | [Supported clients](docs/CLIENTS.md) |
 [Configuration](docs/CONFIGURATION.md) | [Releases](https://github.com/cutlerbenjamin1-cmd/qwen38-megakernel/releases)
 
