@@ -3,8 +3,10 @@
 **Qwen3.8-27B on a single 24 GB GPU, decoding 1.8-2x faster than llama.cpp.**
 
 A CUDA engine and server built for one model. On an RTX 3090 it decodes 157 tok/s on short prompts and 109 tok/s with
-100k tokens of context, fits the model's full 262k context on the card, and speaks the OpenAI, Anthropic and OpenAI
-Responses APIs, so coding agents and chat UIs connect to it directly.
+100k tokens of context, and fits the model's full 262k context on the card: older K / V drop to 5-6 bits (K
+Hadamard-rotated in preset F) while the newest 2,048 positions stay in a q8_0 ring, where attention puts most of its
+weight. It speaks the OpenAI, Anthropic and OpenAI Responses APIs, so coding agents and chat UIs connect to it
+directly.
 
 [Quick start](#quick-start) | [Benchmarks](docs/BENCHMARKS.md) | [Supported clients](docs/CLIENTS.md) |
 [Configuration](docs/CONFIGURATION.md) | [Releases](https://github.com/cutlerbenjamin1-cmd/qwen38-megakernel/releases)
