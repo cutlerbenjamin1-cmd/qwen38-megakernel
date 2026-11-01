@@ -33,7 +33,8 @@ struct MKEngine::Impl {
     // draft-depth policy (MKEngine::set_policy). Default: up to n_draft drafts, the on-device gate on the running
     // product c_k of the MTP's own top-1 probabilities stops drafting after draft k >= 2 when c_k < 0.4 and drops
     // the 4th draft (the T = 5 verify row) when c_4 < 0.4; sampled drafts when sampling. Tuned on replayed logs
-    // + live A/B. Without gates and sampled drafts: "depth=0,drop=0,stop=0,chain=0,h1=0".
+    // + live A/B. "depth=0,drop=0,stop=0,chain=0,h1=0": depth rule 0, no stop gates, top-1 drafts when sampling; the
+    // one gate left drops the deepest draft when its own probability (chain=0, not the product) is below droplast 0.4.
     struct Policy {
         int depth = 1;       // 0: n_draft - 1 after a cycle with a rejection (at least 3), 1: always n_draft,
                              // 2: 1 + the accepted count of the last cycle (clamped to [dmin, n_draft])
@@ -115,8 +116,8 @@ struct MKEngine::Impl {
     //   engine); stream 0 waits for a group's event only before the first kernel that reads that group's state
     //   (pf_run: dn_prep of the group's first layer). Same bytes, same order of use: bit-identical.
     // If the scratch is too small for the end snapshot (MK_PF_CAP below ~640), the end save copies straight from the
-    // state and stream 0 waits for it before the state is next modified; below ~340 there are too few staging slots
-    // too, and a checkpoint inside a prompt splits the prefill into two pf_runs around it.
+    // state and stream 0 waits for it before the state is next modified; below 384 there are too few staging slots
+    // too: only ck_exact is saved inside a prompt, by two pf_runs around it (MK_EXACT: no checkpoint inside it).
     static constexpr size_t CK_SL = (size_t) NVH * 128 * 128, CK_CL = (size_t) CONV_RING * QKV; // floats per DeltaNet layer
     static constexpr size_t CK_NS = 48 * CK_SL, CK_NC = 48 * CK_CL, CK_NH = (size_t) H_RING * D;
     static constexpr int CK_NG = 5;

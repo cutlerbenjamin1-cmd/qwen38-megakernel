@@ -60,6 +60,7 @@ class MKEngine {
     // (older ones thin out, recent ones stay dense). ck_exact (or -1) is kept at its exact position; the others move
     // down by up to 31 tokens onto the batched prefill's scan grid. Saving changes nothing the prefill computes.
     // Unless ck_exact is inside the batched part, a checkpoint at the end of the prompt is saved too (as prefill()).
+    // MK_EXACT: ck_exact moves onto the grid like the others; no end-of-prompt checkpoint (MK_PF_CAP below 384: none).
     int prefill(const std::vector<int> & tokens, const std::vector<int> & cks, int ck_exact);
     // prefill(tokens, cks, ck_exact) with images inside the prompt (each ends before its last token; batched prefill
     // only). The sequence keeps their positions for its RoPE rows until a reset, rewind or truncate drops them; after a

@@ -952,8 +952,10 @@ int MKEngine::prefill(const std::vector<int> & tokens, const std::vector<int> & 
         if (st && p_->st_load(st_path, st_key, hend)) {
             p_->st_how = 1;
         } else {
-        if (p_->stg_n < 2) { // too few staging slots (MK_PF_CAP below ~340): two pf_runs around ck_exact, other positions ignored
-            if (ck_exact > n0 && ck_exact < hend) { // (never with MK_EXACT: its ck_exact joined cks, which this path ignores)
+        // too few staging slots (MK_PF_CAP below 384): two pf_runs around ck_exact, other positions ignored (MK_EXACT:
+        // its ck_exact joined cks, so no checkpoint is saved inside the prompt)
+        if (p_->stg_n < 2) {
+            if (ck_exact > n0 && ck_exact < hend) {
                 p_->pf_run(std::vector<int>(head.begin(), head.begin() + (ck_exact - n0)), n0, nullptr, nullptr, 0, nullptr, er);
                 stop_if_cancelled();
                 c.dn_c = ck_exact;
