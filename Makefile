@@ -98,10 +98,11 @@ tests/gguf_fuzz: tests/gguf_fuzz.cpp gguf.h
 exactness: qwen38_mk libqwen38mk.so
 	python3 scripts/exactness.py $(if $(MK_MODEL),-m $(MK_MODEL)) $(EXACTNESS_ARGS)
 
-# GPU kernel checks without a model (the GPU to itself): the tensor-core verify GEMM against the engine's dp4a GEMVs
-# (wvgemm_bench check: T-invariance, integer and fp64 checks) and the decode attention variants bit-identical to each other
-# and token-count invariant at T 4 and 5 (dattn_bench TINV=1; its kernel copies stop at T 5). wv_ref.cuh, wvgemm_bench's
-# copy of the engine's GEMV code, is regenerated from qwen38_mk.cu every time and rewritten only when it changes.
+# The benches' GPU self-checks without a model (the GPU to itself). wvgemm_bench check: its own tensor-core verify
+# kernel (a counterpart of wv.cuh, not the engine's code) bit-identical at every T, and it and the engine's dp4a GEMVs
+# within error bounds of fp64; wv_ref.cuh, its copy of the engine's dp4a code, is regenerated from mk_shared.cuh +
+# qwen38_mk.cu every time and rewritten only when it changes. dattn_bench TINV=1: its own copies of the decode
+# attention kernels (not regenerated: older than the engine's, up to T 5) bit-identical to each other and T-invariant.
 bench/wv_ref.cuh: FORCE
 	@python3 bench/wv_extract.py qwen38_mk.cu $@.tmp > /dev/null
 	@cmp -s $@.tmp $@ && rm -f $@.tmp || mv $@.tmp $@

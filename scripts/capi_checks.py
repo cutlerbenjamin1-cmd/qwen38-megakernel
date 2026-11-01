@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
 """GPU checks of the C API: engine errors and their roll-backs, penalties, policies (scripts/gate.sh runs them).
-usage: capi_checks.py <libqwen38mk.so> <model.gguf> <draft_vocab> [case]
+usage: capi_checks.py <libqwen38mk.so> <model.gguf> <draft_vocab> [case ...]
 
-Without a case it runs every case in its own process and prints one verdict each: PASS, FAIL, or SKIP with the reason (a
-case that cannot test what it is for on this machine). Exit status 1 when any case FAILed or crashed, else 0.
+It runs the given cases (default: every case), each in its own process, and prints one verdict each: PASS, FAIL, or
+SKIP with the reason (a case that cannot test what it is for on this machine). Exit status 1 when any case FAILed or
+crashed, 2 on an unknown case, else 0.
 
 The out-of-memory cases never ask the device for more than its free VRAM, so they need no spill and give the same answer on
 every run (on WDDM / WSL2 the driver's CUDA sysmem fallback lets an allocation past the VRAM succeed in system memory, charged
@@ -513,12 +514,17 @@ def commit_gate(c):
 
 
 if __name__ == "__main__":
-    if len(sys.argv) > 4:
-        r = globals()["case_" + sys.argv[4]](lib())
+    if sys.argv[4:5] == ["--child"]:  # (the driver's own form: one case in this process)
+        r = globals()["case_" + sys.argv[5]](lib())
         sys.stdout.flush()
         os._exit(SKIP_RC if r is None else 0 if r is True else 1)  # (no interpreter teardown after the engine is gone)
+    todo = list(dict.fromkeys(sys.argv[4:])) or list(CASES)
+    unknown = [c for c in todo if c not in CASES]
+    if unknown:
+        print(f"capi_checks: unknown case {' '.join(unknown)} (cases: {' '.join(CASES)})", file=sys.stderr, flush=True)
+        sys.exit(2)
     verdict = {}
-    for c in CASES:
+    for c in todo:
         print(f"== {c}", flush=True)
         why = commit_gate(c)
         if why:
@@ -526,7 +532,8 @@ if __name__ == "__main__":
             verdict[c] = "SKIP"
             print(f"-- {c}: SKIP (not started)", flush=True)
             continue
-        r = subprocess.run([sys.executable, __file__, LIB, MODEL, DV, c], stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+        r = subprocess.run([sys.executable, __file__, LIB, MODEL, DV, "--child", c], stdout=subprocess.PIPE,
+                           stderr=subprocess.STDOUT, text=True)
         lines = r.stdout.splitlines()
         print("\n".join(ln for ln in lines if ln.startswith(("PASS", "FAIL", "SKIP", "     ", "Traceback", "[mk] error"))
                         or "Error" in ln or "exiting with code" in ln or "out of memory" in ln))
@@ -539,9 +546,9 @@ if __name__ == "__main__":
             verdict[c] = "FAIL"
         sig = f", killed by signal {-r.returncode}" if r.returncode < 0 else ""
         print(f"-- {c}: {verdict[c]} (exit {r.returncode}{sig})", flush=True)
-    failed = [c for c in CASES if verdict[c] == "FAIL"]
-    skipped = [c for c in CASES if verdict[c] == "SKIP"]
-    passed = [c for c in CASES if verdict[c] == "PASS"]
-    print(f"CAPI_CHECKS_DONE: {len(passed)} passed, {len(failed)} failed, {len(skipped)} skipped of {len(CASES)}"
+    failed = [c for c in todo if verdict[c] == "FAIL"]
+    skipped = [c for c in todo if verdict[c] == "SKIP"]
+    passed = [c for c in todo if verdict[c] == "PASS"]
+    print(f"CAPI_CHECKS_DONE: {len(passed)} passed, {len(failed)} failed, {len(skipped)} skipped of {len(todo)}"
           + (f"; FAILED: {' '.join(failed)}" if failed else "") + (f"; SKIPPED: {' '.join(skipped)}" if skipped else ""))
     sys.exit(1 if failed else 0)

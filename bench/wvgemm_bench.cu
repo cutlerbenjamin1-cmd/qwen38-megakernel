@@ -2,7 +2,7 @@
 // the engine's dp4a GEMV (its own rows_* / accR code, copied verbatim into wv_ref.cuh by wv_extract.py).
 //
 //   python3 wv_extract.py && nvcc -O3 -std=c++17 -arch=sm_86 -lineinfo -Xptxas -v wvgemm_bench.cu -o wvgemm_bench
-//   ./wvgemm_bench check            exactness: T-invariance (T = 1..16 bit-identical per row) + integer / fp64 checks
+//   ./wvgemm_bench check            exactness: T-invariance (T = 1..16 bit-identical per row) + wv / dp4a vs fp64
 //                                   (exit status 1 on a failure; `make check` runs it)
 //   ./wvgemm_bench time [roles] [types] [reps]
 //
@@ -2088,7 +2088,9 @@ static void init_grid(std::mt19937 & rng) {
     CK(cudaMemcpyToSymbol(g_iq3s_grid, grid.data(), 512 * 4));
 }
 
-// exactness: per type x role: wv at T = 1..8, 16 bit-identical per (row, token) to T = 16's; wv and dp4a vs fp64
+// exactness: per type x role: wv at T = 1..8, 16 bit-identical per (row, token) to the largest T that ran; wv and the
+// engine's dp4a (T = 4) vs fp64 within CHK_RMS / CHK_MAX of the rows' rms, |wv - dp4a| within CHK_MAX (NaN fails)
+constexpr double CHK_RMS = 1e-5, CHK_MAX = 1e-4; // (correct kernels: rms errors <= 6e-7, max <= 4.5e-6)
 static int check(const std::vector<int> & roles, const std::vector<int> & types) {
     std::mt19937 rng(1234);
     init_grid(rng);
@@ -2119,6 +2121,7 @@ static int check(const std::vector<int> & roles, const std::vector<int> & types)
             std::vector<double> href((size_t) 16 * R.M);
             CK(cudaMemcpy(href.data(), ref, href.size() * 8, cudaMemcpyDeviceToHost));
             std::vector<std::vector<float>> res;
+            std::vector<char> ran; // the T's whose kernel launched (the others need more shared memory than there is)
             for (int T : TS) {
                 CK(cudaMemset(out, 0xff, sizeof(float) * 16 * R.M));
                 WvArgs a{D2.dmats, 1, X.q, out, part, cnt, R.M, R.K, R.S, g_scr};
@@ -2127,15 +2130,19 @@ static int check(const std::vector<int> & roles, const std::vector<int> & types)
                 std::vector<float> h((size_t) 16 * R.M);
                 CK(cudaMemcpy(h.data(), out, h.size() * 4, cudaMemcpyDeviceToHost));
                 if (ms < 0) h.assign(h.size(), NAN);
+                ran.push_back(ms >= 0);
                 res.push_back(h);
             }
-            // T-invariance against the largest T that ran (rows t < T)
-            int tinv_bad = 0, tref = -1, ntested = 0;
-            for (int ti = (int) res.size() - 1; ti >= 0 && tref < 0; ti--)
-                if (!std::isnan(res[ti][0]) || !std::isnan(res[ti][1])) tref = ti;
+            // T-invariance against the largest T that ran (rows t < T); none ran: a failure (tref 0, its rows NaN)
+            int tinv_bad = 0, tref = 0, ntested = 0;
+            for (int ti = (int) res.size() - 1; ti > 0; ti--)
+                if (ran[ti]) {
+                    tref = ti;
+                    break;
+                }
             for (size_t ti = 0; ti < res.size(); ti++) {
                 const int T = TS[ti];
-                if (std::isnan(res[ti][0]) && std::isnan(res[ti][1])) continue;
+                if (!ran[ti]) continue;
                 ntested++;
                 for (int t = 0; t < T; t++)
                     if (memcmp(res[ti].data() + (size_t) t * R.M, res[tref].data() + (size_t) t * R.M, 4 * R.M)) tinv_bad++;
@@ -2145,7 +2152,7 @@ static int check(const std::vector<int> & roles, const std::vector<int> & types)
             const int Td = 4; // dp4a reference rows
             CK(cudaMemset(out, 0, sizeof(float) * 16 * R.M));
             DpArgs da{D.dmats, 1, X.q, out, R.M, g_park};
-            dp4a_any(ty, Td, R.IT, da, 0);
+            const bool dp_ran = dp4a_any(ty, Td, R.IT, da, 0) >= 0;
             CK(cudaDeviceSynchronize());
             std::vector<float> hd((size_t) 16 * R.M);
             CK(cudaMemcpy(hd.data(), out, hd.size() * 4, cudaMemcpyDeviceToHost));
@@ -2174,11 +2181,15 @@ static int check(const std::vector<int> & roles, const std::vector<int> & types)
                 const size_t nbh = (size_t) 4 * R.M * (Tmax < 8 ? Tmax : 8);
                 for (size_t i = 0; i < nbh; i++) hsh = (hsh ^ hb[i]) * 1099511628211ull;
             }
+            const double e_w = sqrt(ew / n) / rms, m_w = mw / rms, e_d = sqrt(ed / nd) / rms, m_d = md / rms;
+            const double m_wd = dwd / rms;
+            const bool in_bounds =
+                e_w <= CHK_RMS && m_w <= CHK_MAX && e_d <= CHK_RMS && m_d <= CHK_MAX && m_wd <= CHK_MAX;
             printf("%-9s %-6s T-inv(%d T's, ref T=%d) %s (%d rows differ) | rel err vs fp64: wv rms %.2e max %.2e, dp4a rms "
-                   "%.2e max %.2e | max |wv-dp4a| %.2e | hash %016llx\n",
-                   R.name, tname(ty), ntested, Tmax, tinv_bad ? "FAIL" : "ok", tinv_bad, sqrt(ew / n) / rms, mw / rms,
-                   sqrt(ed / nd) / rms, md / rms, dwd / rms, hsh);
-            if (tinv_bad || sqrt(ew / n) / rms > 1e-4) bad++;
+                   "%.2e max %.2e | max |wv-dp4a| %.2e | hash %016llx%s\n",
+                   R.name, tname(ty), ntested, Tmax, tinv_bad || !ntested ? "FAIL" : "ok", tinv_bad, e_w, m_w, e_d,
+                   m_d, m_wd, hsh, !dp_ran ? " | FAIL: dp4a did not run" : !in_bounds ? " | FAIL: error bound" : "");
+            if (tinv_bad || !ntested || !dp_ran || !in_bounds) bad++;
             cudaFree(out); cudaFree(part); cudaFree(cnt); cudaFree(ref); cudaFree(idot);
             release(D);
             release(D2);

@@ -3,9 +3,10 @@
 #   scripts/gate.sh -m <gguf> --record DIR   run every check, keep the outputs in DIR as a reference
 #   scripts/gate.sh -m <gguf> --ref DIR      run every check, and every output must equal DIR's
 #   scripts/gate.sh -m <gguf>                run every check against the build itself only
-# Each check prints ok / FAIL / skip; the exit status is 1 if any failed (2: bad arguments or a stale build). A reference
-# is kept only if all its checks passed (its MANIFEST says PASS), and it holds for the GPU, driver and model files it was
-# recorded with: the token ids of a sampled run or a KL report are not portable to another GPU.
+# Each check prints ok / FAIL / skip; the exit status is 1 if any failed (2: bad arguments, a stale build, or an --out
+# holding a recorded reference). A reference is kept only if all its checks passed (its MANIFEST says PASS), and it
+# holds for the GPU, driver and model files it was recorded with: the token ids of a sampled run or a KL report are not
+# portable to another GPU. The MANIFEST keeps the MK_* environment the gate inherited; --ref fails on another one.
 # Options: --out DIR (default gate-out; --record writes to its DIR), --legs LIST (default: all, see LEGS), --model2 <gguf>
 # (a second model: one more greedy run and the 4-slot checks), --kld-ref FILE (tools/llama_ref's reference: the kld leg),
 # --capi FILE (default scripts/capi_checks.py) and --capi-cases "CASE ..." (default: the script's own), --python PY (with
@@ -14,9 +15,14 @@ set -uo pipefail
 REPO=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 LEGS_ALL="benches exactness pfcap cli tinv slots capi kld"
 MODEL=${MK_MODEL:-}; MODEL2=; REF=; REC=; O=gate-out; LEGS=$LEGS_ALL; KLD_REF=; PY=python3; PORT=18190; TO=1800
-CAPI=$REPO/scripts/capi_checks.py; CAPI_CASES=
+CAPI=$REPO/scripts/capi_checks.py; CAPI_CASES=; ENV_DIFF=
 usage() { awk 'NR > 1 && /^#/ { sub(/^# ?/, ""); print; next } NR > 1 { exit }' "$0"; exit 2; }
+die() { echo "gate: $*" >&2; exit 2; }
 while [ $# -gt 0 ]; do
+    case $1 in
+        -m|--model|--model2|--record|--ref|--out|--legs|--kld-ref|--capi|--capi-cases|--python|--port|--timeout)
+            [ $# -ge 2 ] || die "option $1 needs a value" ;;
+    esac
     case $1 in
         -m|--model) MODEL=$2; shift 2 ;;
         --model2) MODEL2=$2; shift 2 ;;
@@ -34,10 +40,10 @@ while [ $# -gt 0 ]; do
         *) echo "unknown option $1"; usage ;;
     esac
 done
-die() { echo "gate: $*" >&2; exit 2; }
 [ -n "$MODEL" ] && [ -f "$MODEL" ] || die "no model file (-m <gguf> or MK_MODEL)"
 [ -z "$MODEL2" ] || [ -f "$MODEL2" ] || die "no file $MODEL2"
 [ -z "$KLD_REF" ] || [ -f "$KLD_REF" ] || die "no file $KLD_REF"
+[ -f "$CAPI" ] || die "no file $CAPI (--capi)"
 [ -n "$REC" ] && [ -n "$REF" ] && die "--record and --ref exclude each other"
 for l in $LEGS; do [[ " $LEGS_ALL " == *" $l "* ]] || die "unknown leg $l (legs: $LEGS_ALL)"; done
 BIN=$REPO/qwen38_mk; LIB=$REPO/libqwen38mk.so; DV=$REPO/draft_vocab_32k.bin
@@ -54,6 +60,7 @@ if [ -n "$REF" ]; then
 fi
 mkdir -p "$O" && O=$(cd "$O" && pwd)
 [ "$O" != "$REF" ] || die "--out is the reference directory"
+[ ! -e "$O/MANIFEST" ] || die "$O holds a recorded reference (MANIFEST): give --out another directory"
 for l in $LEGS_ALL; do rm -rf "${O:?}/$l"; done
 rm -f "$O/gate.log" "$O/MANIFEST.run"
 exec > >(tee "$O/gate.log") 2>&1
@@ -61,6 +68,11 @@ exec > >(tee "$O/gate.log") 2>&1
 # a model file's identity without reading 17 GB: size and the SHA-256 of its first and last 16 MiB
 fid() { echo "$(basename "$1") $(stat -c %s "$1") $({ head -c 16M "$1"; tail -c 16M "$1"; } | sha256sum | cut -c1-16)"; }
 gpu=$(nvidia-smi --query-gpu=name,driver_version --format=csv,noheader 2>/dev/null | head -1)
+# the MK_* environment the gate inherited, sorted (MK_MODEL: the model line; MK_API_KEY is not written down)
+mkenv=
+for v in $(compgen -e | LC_ALL=C sort); do
+    [[ $v == MK_* && $v != MK_MODEL && $v != MK_API_KEY ]] && mkenv+=" $v=${!v//$'\n'/\\n}"
+done
 {
     echo "head: $(git -C "$REPO" describe --always --dirty 2>/dev/null) ($(git -C "$REPO" branch --show-current 2>/dev/null))"
     echo "build: $(grep -ho '"[^"]*"' "$REPO/build/mk_build_info.h" 2>/dev/null | tr '\n' ' ')"
@@ -69,6 +81,7 @@ gpu=$(nvidia-smi --query-gpu=name,driver_version --format=csv,noheader 2>/dev/nu
     [ -z "$MODEL2" ] || echo "model2: $(fid "$MODEL2")"
     [ -z "$KLD_REF" ] || echo "kld_ref: $(fid "$KLD_REF")"
     echo "legs: $LEGS"
+    echo "env:$mkenv"
     echo "date: $(date -Is)"
 } > "$O/MANIFEST.run"
 echo "== gate $(date +%T): $REPO -> $O"
@@ -81,24 +94,29 @@ if [ -n "$REF" ]; then
         [ -z "$a" ] || [ -z "$b" ] || [ "$a" = "$b" ] || die "the reference was recorded with another $k (${b#*: })"
     done
     [ "$(grep '^gpu:' "$REF/MANIFEST")" = "gpu: $gpu" ] || echo "   NOTE: recorded on another GPU / driver; a difference there may be the machine's"
+    b=$(grep '^env:' "$REF/MANIFEST")
+    if [ -z "$b" ]; then echo "   NOTE: the reference has no env: line (its MK_* environment is unknown)"
+    elif [ "$b" != "env:$mkenv" ]; then b=${b#env:}; ENV_DIFF="here {${mkenv# }}, the reference {${b# }}"; fi
 fi
 
 NOK=0; NFAIL=0; NSKIP=0; FAILED=
 ok() { echo "ok   $*"; NOK=$((NOK + 1)); }
 fail() { echo "FAIL $*"; NFAIL=$((NFAIL + 1)); FAILED="$FAILED ${1%%:*}"; }
 skip() { echo "skip $*"; NSKIP=$((NSKIP + 1)); }
-# ref <name> <file>: with --ref, the file must equal the reference's file of the same path (if that leg was recorded)
+[ -z "$ENV_DIFF" ] || fail "env: the inherited MK_* variables differ from the reference's: $ENV_DIFF"
+# ref <name> <file>: with --ref, the file must equal the reference's file of the same path. A check the reference did
+# not run (its leg not recorded, or no such file in a PASS reference: recorded without --model2 / --kld-ref) is a skip.
 ref() {
     [ -n "$REF" ] || return 0
     local rel=${2#"$O"/} leg=${2#"$O"/}; leg=${leg%%/*}
-    grep -q "^legs:.*\b$leg\b" "$REF/MANIFEST" || { skip "$1 reference: leg $leg not recorded"; return 0; }
-    if [ ! -f "$REF/$rel" ]; then fail "$1: no $rel in the reference"
+    if ! grep -q "^legs:.*\b$leg\b" "$REF/MANIFEST"; then skip "$1 reference: NOTE: leg $leg not recorded"
+    elif [ ! -f "$REF/$rel" ]; then skip "$1 reference: NOTE: the reference did not run it (no $rel)"
     elif cmp -s "$2" "$REF/$rel"; then ok "$1 == reference"
     else fail "$1: differs from the reference ($rel)"; fi
 }
 run() { timeout -s KILL "$TO" "$@" < /dev/null; }
 
-# kernel microbenchmarks against the engine's code, no model (Makefile `check`)
+# the kernel benches' self-checks, no model (Makefile `check`: what each covers is noted there)
 leg_benches() {
     make -C "$REPO" check > "$O/benches/make_check.log" 2>&1
     local rc=$?
@@ -213,9 +231,8 @@ leg_slots() {
     if [ -n "$MODEL2" ]; then same_as_solo m2_exact4 "" "$MODEL2" 4; else skip "slots m2_exact4: no --model2"; fi
 }
 
-# the C API checks (engine errors, roll-backs, penalties, policies): every case must PASS
+# the C API checks (engine errors, roll-backs, penalties, policies): every case PASSes, or SKIPs where it cannot run
 leg_capi() {
-    [ -f "$CAPI" ] || { skip "capi: no $CAPI"; return; }
     local l=$O/capi/capi.log
     # shellcheck disable=SC2086
     run "$PY" "$CAPI" "$LIB" "$MODEL" "$DV" $CAPI_CASES > "$l" 2>&1
@@ -224,8 +241,10 @@ leg_capi() {
     grep -E '^FAIL' "$l" | sed 's/^/   /'
     local sum
     sum=$(grep -ho 'CAPI_CHECKS_DONE: .*' "$l" | sed 's/CAPI_CHECKS_DONE: //')
-    if [ $rc = 0 ] && [ "$nf" = 0 ] && [ "$np" -gt 0 ]; then ok "capi: $np checks PASS${sum:+ (cases: $sum)}"
-    else fail "capi: exit $rc, $nf FAIL, $np PASS (capi/capi.log)"; fi
+    if [ $rc != 0 ] || [ "$nf" != 0 ] || [ -z "$sum" ]; then fail "capi: exit $rc, $nf FAIL, $np PASS (capi/capi.log)"
+    elif [[ $sum == "0 passed, 0 failed, "* ]]; then skip "capi: no case could run here (cases: $sum)"
+    elif [ "$np" -gt 0 ]; then ok "capi: $np checks PASS (cases: $sum)"
+    else fail "capi: no PASS line (capi/capi.log)"; fi
 }
 
 # accuracy against llama.cpp (qwen38_mk --kld): the report itself is checked against the reference's
