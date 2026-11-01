@@ -30,7 +30,7 @@ Every option is listed with its default in [CONFIGURATION.md](CONFIGURATION.md);
 
 ## Running it
 
-The launchers start the server with the settings we use:
+The launchers start the server with the recommended settings:
 
 ```sh
 scripts/serve.sh                     # Linux / WSL2: http://127.0.0.1:8080, 120,000-token context
@@ -67,9 +67,9 @@ Side requests, parking, checkpoints and keep-warm use the server's defaults in b
 
 The port opens before the model loads: until the load is done every request gets llama-server's 503 `Loading model`
 (`/health` answers 200 `{"status": "ok"}` once ready), and a port that is already taken fails at once instead of after
-the load. With the model on a local disk the server was ready ~12 s after start under WSL2 (model on ext4) and ~7 s
-natively on Windows from an NVMe disk (2026-10-16). Under WSL2, keep the GGUF on the Linux filesystem: files on `/mnt/c`
-load several times slower. Before it listens, the server runs one prefill and one decode cycle, so a context too large
+the load. With the model on a local disk the server is ready in about 12 s under WSL2 (model on ext4) and about 7 s
+natively on Windows (NVMe). Under WSL2, keep the GGUF on the Linux filesystem: files on `/mnt/c` load several times
+slower. Before it listens, the server runs one prefill and one decode cycle, so a context too large
 for the card fails at startup rather than on the first request.
 
 ```sh
@@ -112,15 +112,14 @@ moves that state around (to host memory and back) without touching its bits.
 | situation | reply is identical, bit for bit, to | checked by |
 |---|---|---|
 | follow-up turn; edited message or system prompt | the same request on a fresh server | a state-digest probe after each reuse (every K / V row, window-ring row and DeltaNet / conv state compared): 10 / 10 scenarios bitwise equal in every release gate; server replies compared |
-| new session resumed at a pinned checkpoint | the same request on a fresh server (greedy, and temperature 1.0 with fixed seeds; q8_0 and preset D) | a new session after a live, a parked and a 63k-token conversation, 2026-10-21 |
-| parked conversation brought back | each conversation alone on a fresh server | 8 interleaved requests of 3 conversations, greedy and sampled, q8_0 and preset D: every release gate since 2026-10-19 |
-| side request, and the conversation kept beside it | each of them alone on a fresh server | 5 side-request scenarios, q8_0 and preset D, every release gate since 2026-10-19; 40 titles beside two conversations (2026-10-20) |
-| a prefill stopped because the client left | a server that never saw that request | the requests after a stopped prefill, compared in the release gates since 2026-10-18 |
+| new session resumed at a pinned checkpoint | the same request on a fresh server (greedy, and temperature 1.0 with fixed seeds; q8_0 and preset D) | a new session after a live, a parked and a 63k-token conversation |
+| parked conversation brought back | each conversation alone on a fresh server | 8 interleaved requests of 3 conversations, greedy and sampled, q8_0 and preset D: every release gate |
+| side request, and the conversation kept beside it | each of them alone on a fresh server | 5 side-request scenarios, q8_0 and preset D, every release gate; 40 titles beside two conversations |
+| a prefill stopped because the client left | a server that never saw that request | the requests after a stopped prefill, compared in every release gate |
 
 Sampled replies are identical too when the request sets a `seed`: the draft vocabulary the MTP head uses is rebuilt
-after a rewind exactly as a fresh prefill builds it (since 2026-10-20, 7a59582; before, a sampled follow-up could
-differ). Without a `seed`, each request draws a random one. The gates run on Linux and on the native Windows build, and
-the two give the same replies.
+after a rewind exactly as a fresh prefill builds it. Without a `seed`, each request draws a random one. The gates run on
+Linux and on the native Windows build, and the two give the same replies.
 
 What is not exact, and against what:
 - **Exact reuse off** (`MK_EXACT_REUSE=0` in the launchers, no `--exact-reuse` on the server): a follow-up appends to
@@ -164,8 +163,7 @@ checkpoint saved at the previous generation prompt, and the previous reply is pr
 that re-prefill is what exactness costs. An edit to an earlier message, or to the end of the system prompt, resumes at
 the last checkpoint before the edit.
 
-Measured on 2026-10-20 (7322fbd; WSL2 server, 120,000-token context, 7 drafts, exact reuse on; prompt processing time
-of the request):
+Prompt processing time of each request (WSL2 server, 120,000-token context, 7 drafts, exact reuse on):
 
 | request | q8_0 KV | preset D |
 |---|---|---|
@@ -174,9 +172,9 @@ of the request):
 | edit the end of a 9.1k-token system prompt | 89 ms | 97 ms |
 | for scale: the 11.6k-token prompt from scratch | 5.98 s | 6.09 s |
 
-Exact against plain reuse, measured when exact reuse was made (2026-10-14, 026ee53; 11.6k-token chat, 7 drafts): a
-follow-up turn took 167 ms exact against 78 ms appending, a follow-up that keeps the previous turn's thinking 469
-against 86 ms, and edits the same either way. The longer the previous reply, the more the follow-up re-prefills.
+What exactness costs against appending (exact reuse off; 11.6k-token chat, 7 drafts): a follow-up turn took 167 ms
+against 78 ms, a follow-up that keeps the previous turn's thinking 469 against 86 ms, and edits the same either way.
+The longer the previous reply, the more the follow-up re-prefills.
 
 ### Checkpoints
 
@@ -186,8 +184,8 @@ saves checkpoints of it during the batched prefill (with exact reuse, of the low
 from there), one at the start of each message (`--ck-msgs 1`) and one every `--ck-every` [4096] prompt tokens, on the
 absolute 32-token grid of the recurrent scan. When the pool is full it keeps the most useful ones and thins the oldest:
 in a conversation that grows past ~20-35k tokens, the checkpoints near its start are gone (that is what pinning,
-below, fixes). A checkpoint holds 174 MiB with the q8_0 cache and 288 MiB with preset D (the server's startup line,
-2026-10-20).
+below, fixes). A checkpoint holds 174 MiB with the q8_0 cache and 288 MiB with preset D (the server prints the size at
+startup).
 
 ### New sessions: pinned prefix checkpoints
 
@@ -203,12 +201,11 @@ sessions resume there. At most two pins per conversation, inside the pool (no me
 under 8 one, under 4 none); prompts without a system message, or with one under 1,024 tokens, pin nothing. A parked
 conversation that a new session restores only for its system prompt is parked again at once, so it is not lost.
 
-Measured on 2026-10-21 (WSL2, preset D, 131,072-token context; the clients' captured first requests; the new session
-arrives after a 52-55k-token conversation of the same client that is either still live or parked; times are the
-client's wall time and include parking the long conversation, ~2.5-3.5 s of which was the first allocation of host
-memory):
+Measured with the clients' captured first requests (WSL2, preset D, 131,072-token context). The new session arrives
+after a 52-55k-token conversation of the same client that is either still live or parked; times are the client's wall
+time and include parking the long conversation, ~2.5-3.5 s of which was the first allocation of host memory:
 
-| client (prompt of the new session) | before: cached / time | with pins: cached / time |
+| client (prompt of the new session) | without pins: cached / time | with pins: cached / time |
 |---|---|---|
 | Claude Code, default settings (11,850 tokens), live | 0 / 10.1 s | 8,288 / 5.9 s |
 | Claude Code, default settings, parked | 0 / 8.7 s | 8,288 / 4.0 s |
@@ -259,8 +256,7 @@ What a parked conversation costs: its rows (36,992 bytes per token with the q8_0
 recurrent state (174 MiB) and its checkpoints (174 or 288 MiB each). A 38k-token conversation with the q8_0 cache and
 two checkpoints takes 1.9 GB.
 
-Park and restore against reading the conversation again (2026-10-19, 316b488; WSL2, q8_0 cache, memory already
-allocated):
+Park and restore against reading the conversation again (WSL2, q8_0 cache, memory already allocated):
 
 | conversation | park | restore | prefill it again |
 |---|---|---|---|
@@ -274,8 +270,7 @@ first park of a large conversation is slower, because page-locked memory is allo
 120k-token park); after that the memory is reused.
 
 In practice: with OpenCode 2.0.32 on native Windows (230,000-token context, preset D), two coding sessions running at
-the same time finished in 110 s with ~72k prompt tokens prefilled, against 242 s and ~232k tokens with the store off
-(2026-10-19).
+the same time finished in 110 s with ~72k prompt tokens prefilled, against 242 s and ~232k tokens with the store off.
 
 ### One-shot requests: side requests
 
@@ -286,7 +281,7 @@ engine and the next real turn would wait for it to come back. The server runs th
 - **Which requests:** a prompt of at most `--side-max` [8192] tokens with no earlier assistant reply in it that would
   otherwise throw away at least twice its length (and at least `--park-min` tokens) of the cached conversation. With
   parking on, it must also be a one-shot: a request without tools, whatever its `max_tokens`, or one that asks for at
-  most 1,024 tokens. Every agent client we tested sends its one-shots without tools and every new session's first turn
+  most 1,024 tokens. Every tested agent client sends its one-shots without tools and every new session's first turn
   with tools, so a new agent session is parked like any conversation and finds its own next turns cached. With parking
   on, any later request without tools (a chat without tools, a summary that quotes the conversation as messages) runs
   beside a conversation whose last request had tools in the same way.
@@ -297,7 +292,7 @@ engine and the next real turn would wait for it to come back. The server runs th
   After the reply, also after a disconnect or an error, everything is copied back and the cached conversation is bit
   for bit as before.
 - **Cost:** ~10-20 ms each way under WSL2 for a 2.7k-8k-token side prompt, whatever the length of the cached
-  conversation (2026-10-19).
+  conversation.
 - **Room:** before it starts, the server makes room in the host store (other side conversations go first) for the rows
   of its prompt and reply: `max_tokens`, or 8,192 tokens when the request sets none. If the store still runs out, or
   the engine fails, the cached sequence is dropped and the next prompt is prefilled in full (logged; never a corrupt
@@ -307,7 +302,7 @@ engine and the next real turn would wait for it to come back. The server runs th
   turns runs as a side request again, resumed from there, while the long conversation stays on the GPU: a chat without
   tools keeps its prefix cached beside an agent's conversation. At most 4 side conversations are kept (the oldest goes
   first; most are titles, never continued), they are evicted before the other parked conversations, and parking one
-  never evicts anything else. Steady state for titles (WSL2, q8_0, 2026-10-20): kept aside in 10-15 ms, back in 10 ms,
+  never evicts anything else. Steady state for titles (WSL2, q8_0): kept aside in 10-15 ms, back in 10 ms,
   its own ~400-token conversation parked (363 MiB) in 15-21 ms. Continuing a 1.5k-token side conversation beside a
   9k-token one took 27-34 ms with q8_0 (425 MB copied) and 86 ms with preset D (new host memory included), and parking
   it again with the long conversation's rows back 35-41 ms (q8_0) and 70 ms (preset D).
@@ -327,18 +322,18 @@ priority, and gets normal priority back if that request answers in fewer than 25
 Parked conversations, side requests and the checkpoint pool live in page-locked host memory, which the OS cannot swap
 out. Three server options size it:
 
-- `--park-mib` [8192]: the budget. On the client traffic we replayed ([below](#measured-on-real-client-traffic)), both
+- `--park-mib` [8192]: the budget. On the replayed client traffic ([below](#measured-on-real-client-traffic)), both
   mixed sequences filled 8 GiB.
 - `--park-cks` [2]: checkpoints kept per parked conversation besides its pins. With exact reuse any checkpoint gives
   the same bits, so fewer only cost re-prefill after an edit. With 1, less is copied (47.9 instead of
   62.0 GiB over the two mixed sequences), but a parked conversation can no longer resume before its last turn: 7% more
-  tokens were prefilled (2026-10-21, 4937c58, the build before pinned checkpoints).
+  tokens were prefilled (measured without pinned checkpoints).
 - `--park-min` [1024]: conversations shorter than this are not parked, and a parked conversation comes back only when
   the prompt reuses this many more tokens of it than of the cached one. It also bounds side requests from below (a side
   request must save at least this much).
 
-`--park-min 4096` was measured as an option on the deployed build (ef4a6dd; native Windows, 230,000-token context,
-preset D, 8 GiB store; two replayed mixed-client sequences, 201 requests, fixed seeds):
+`--park-min 4096` against the default (native Windows, 230,000-token context, preset D, 8 GiB store; two replayed
+mixed-client sequences, 201 requests, fixed seeds):
 
 | `--park-min` | parks | GiB copied | real conversations evicted | restores | cache misses | tokens prefilled | prefill time |
 |---|---|---|---|---|---|---|---|
@@ -347,15 +342,15 @@ preset D, 8 GiB store; two replayed mixed-client sequences, 201 requests, fixed 
 
 4096 halved the evictions of real conversations at the same prefill time; five requests cached 1.0-3.3k tokens less (a
 small parked conversation was no longer brought back for them) and one 6.0k more. The server's default is 1024, and the
-launchers do not change it. Do not raise it to 8192: side requests are tied to it, and on 4937c58 (the same sequences,
-2026-10-21) cache misses rose from 34 to 90 and 15% more tokens were prefilled: titles beside a 5-6k-token conversation
-were no longer side requests, and that conversation was not parked either.
+launchers do not change it. Do not raise it to 8192: side requests are tied to it, so titles beside a 5-6k-token
+conversation stop being side requests and that conversation is not parked either (on the same sequences: 2.6 times the
+cache misses and 15% more tokens prefilled).
 
 ### What the console shows
 
 Each generation request logs three lines: what it asks for, its prompt, and its reply. The prompt line says how the
 cache was used, and each park, restore, eviction and side request logs a line of its own with tokens, bytes and copy
-time. From the harness runs (2026-10-21, native Windows, preset D):
+time. From a run with several clients (native Windows, preset D):
 
 ```text
 #24 parked the cached conversation (another conversation came back): 12,022 tok, 1,165 MiB copied in 118 ms
@@ -371,12 +366,12 @@ sizes, and `/metrics` counts parks, restores, evictions and side requests: see [
 
 ### Measured on real client traffic
 
-The requests captured from the client runs of 2026-10-21 ([CLIENTS.md](CLIENTS.md)) were replayed against the server
-before (538d441) and after (ef4a6dd) the cache rules for one-shots, edited histories, compaction leftovers and pinned
-checkpoints (native Windows, 230,000-token context, preset D, 8 GiB store; the server generates its own replies, so
-reply lengths differ from the live runs):
+The requests captured from the client test runs ([CLIENTS.md](CLIENTS.md)), replayed against the server without and
+with the cache rules above for one-shots, edited histories, compaction leftovers and pinned checkpoints (native
+Windows, 230,000-token context, preset D, 8 GiB store; the server generates its own replies, so reply lengths differ
+from the live runs):
 
-| replay | before | after |
+| replay | without these rules | with them |
 |---|---|---|
 | 9 single-client sequences: prefill time | 885 s | 800 s |
 | 9 single-client sequences: tokens prefilled | 1,267k | 1,150k |
@@ -418,7 +413,7 @@ MK_AGENTS=4 scripts/serve.sh 8080 0                                        # the
 `--parallel N` (`-np N`, llama-server's and open-jet's option) is `--agents N` with `-c` defaulting to 32,768 per slot.
 
 - **Context:** with `--agents`, `-c` is each slot's context, and its default is 0: the most that fits next to
-  `MK_SLOT_RESERVE_MIB` [1536] of working memory. On an RTX 3090 (24 GB), 2026-10-28:
+  `MK_SLOT_RESERVE_MIB` [1536] of working memory. On an RTX 3090 (24 GB):
 
   | model | KV cache | `--agents 2` | `--agents 4` |
   |---|---|---|---|
@@ -442,14 +437,14 @@ MK_AGENTS=4 scripts/serve.sh 8080 0                                        # the
   depend on where the prompt is cut).
   Sampled replies (temperature above 0 with a `seed`) are reproducible alone, and beside other
   requests keep their distribution but not their tokens: speculative sampling's tokens depend on the draft schedule,
-  and a slot's drafts depend on how many slots share the cycle (an engine limitation). Measured on 2026-10-28 (Q4_K_M;
+  and a slot's drafts depend on how many slots share the cycle (an engine limitation). Tested with Q4_K_M across
   OpenAI chat and Anthropic Messages, streamed or not, with and without tools, 2 to 4 at once, an 8k-token prompt
-  arriving while three others decode, follow-up turns, a client that disconnects mid-stream, stop strings,
-  `max_tokens`): every greedy comparison was identical (45 of 45, also with UD-Q4_K_XL) and every sampled reply alone,
-  while 13 of the 15 sampled replies decoded beside others differed. A 1.6k-token prompt decoded to the end of a
-  2,048-position slot beside three others gave the greedy reply it gets alone, and long prompts (3.8k-5.7k tokens) fed
-  in 256-token chunks between other slots' cycles gave the replies of the same prompts fed whole, with q8_0 and preset
-  D', on Q4_K_M and UD-Q4_K_XL (2026-10-28).
+  arriving while three others decode, follow-up turns, a client that disconnects mid-stream, stop strings and
+  `max_tokens`: every greedy comparison was identical (45 of 45, also with UD-Q4_K_XL), every sampled reply alone was
+  reproducible, and 13 of the 15 sampled replies decoded beside others differed. A 1.6k-token prompt decoded to the
+  end of a 2,048-position slot beside three others gave the greedy reply it gets alone, and long prompts (3.8k-5.7k
+  tokens) fed in 256-token chunks between other slots' cycles gave the replies of the same prompts fed whole, with q8_0
+  and preset D', on Q4_K_M and UD-Q4_K_XL.
 - **Scheduling:** requests wait for a free slot in arrival order. A request takes the free slot whose cached sequence
   shares the most with its prompt, less what that discards of the slot's last prompt: a conversation's next turn goes
   back to its own slot, and a new conversation takes an empty slot before it evicts another one for the few template
@@ -473,24 +468,16 @@ MK_AGENTS=4 scripts/serve.sh 8080 0                                        # the
 
 ### Speed with several agents
 
-Open-jet's `bench/parallel_bench.py` (unchanged) against this server and against open-jet's own server (f246ff0) running
-the same engine library: Q4_K_M, `--agents 4 -d 7`, one session on an RTX 3090 with open-jet's server first and last,
-2026-10-28. A total adds the four requests' decode rates (512 tokens each, temperature 0.6).
+Four agents at once (Q4_K_M, `--agents 4 -d 7`, RTX 3090) decode 380 tok/s in total on short coding prompts and 319
+tok/s with a ~23k-token context each; one agent alone runs 167-204 tok/s on short prompts, depending on how many
+sampled drafts it accepts. Exact mode (`MK_EXACT=1`, the `--agents` default) costs nothing measurable, and open-jet's
+own server running the same engine library measures the same within run-to-run noise. Numbers and method:
+[BENCHMARKS.md](BENCHMARKS.md#parallel-agents).
 
-| | open-jet's server | this server | this server, `MK_EXACT=0` | open-jet's server again |
-|---|---|---|---|---|
-| 4 short requests at once, total tok/s (2 runs) | 288 / 350 | 328 / 354 | 341 / 357 | 291 / 344 |
-| 4 requests with ~23k-token contexts, total tok/s | 286 | 305 | 302 | 304 |
-| a 20k-token prompt sent while another request decodes: its first token after | 15.7 s | 15.8 s | 15.8 s | 15.7 s |
-| the other request meanwhile | 11.5 tok/s | 12.9 tok/s | 12.8 tok/s | 10.6 tok/s |
-| 1 short request alone, tok/s (2 runs) | 193 / 184 | 190 / 201 | 185 / 205 | 163 / 187 |
-| 1 request with a ~23k-token context alone, tok/s | 161 | 203 | 158 | 173 |
-
-The decoding is the engine's either way, so the totals differ by run-to-run noise (one request alone with a long
-context varies most). Exact mode (`MK_EXACT=1`, the `--agents` default) costs nothing measurable here. Feeding a
-waiting prompt whole instead (`MK_PF_MIX=0 MK_PF_CHUNK=0`; another session that day, open-jet's server 15.7 s and
-11.5 / 10.7 tok/s there) got the 20k-token prompt's first token after 11.0 s, while the other request made 0.6 tok/s
-meanwhile.
+A prompt that arrives while others decode is fed beside their cycles (`MK_PF_MIX`), so they keep going: a ~20k-token
+prompt got its first token after 13.7 s while the other request decoded at 11.2 tok/s. Feeding it whole instead
+(`MK_PF_MIX=0 MK_PF_CHUNK=0`) gets the first token about 30% sooner, but the other request all but stops meanwhile
+(0.6 tok/s).
 
 ## APIs and endpoints
 
@@ -728,13 +715,13 @@ curl -s http://127.0.0.1:8080/v1/chat/completions -H 'Content-Type: application/
 - **Reuse:** an image's placeholder tokens are all alike, so the reused prefix ends at the first image that is not the
   same file (content hash) at the same place. Decoded and encoded images are cached (`--image-cache` [8] images between
   requests; a request holds every image it references until it ends, so it may use more).
-- **Encode time** (Ryzen 9 5900XT, 16 cores, BF16 mmproj, steady state, 2026-10-16): 0.51 s for a 448 x 448 image (196
+- **Encode time** (Ryzen 9 5900XT, 16 cores, BF16 mmproj, steady state): 0.51 s for a 448 x 448 image (196
   tokens), 0.78 s for 640 x 480 (300), 3.56 s for 1024 x 1024 (1,024). The first encode after the load costs ~0.5 s
   more, which the server absorbs with a warm-up encode at startup; a new image after the CPU has been idle takes
   ~1.2-1.5 s for 300 tokens while the cores ramp up. The encoder uses every logical CPU but two (`--vision-threads`):
   its workers meet at a barrier after every step, so one other busy thread on a CPU they use doubles the encode time,
   and the keep-warm load is such a thread (a 220-token frame pair took 1.15 s next to it with all 32 threads, 0.65 s
-  without it; 2026-10-18).
+  without it).
 - `--vision-backend auto|cpu|mtmd` picks the encoder; the encoder itself and its accuracy are in
   [ENGINE.md](ENGINE.md#images-vision).
 
@@ -774,7 +761,7 @@ curl -s http://127.0.0.1:8080/v1/chat/completions -H 'Content-Type: application/
 - **Limits:** at most `MK_MAX_VIDEO_FRAMES` [256] frames per request (all of its videos; 64 s at 4 fps), and frames of
   more than `MK_IMAGE_MAX_PIXELS` pixels are refused from their header ([Limits](#limits)).
 
-Cost (Ryzen 9 5900XT, BF16 mmproj, 30 threads, steady state, 2026-10-18; tokens per second of video include each frame
+Cost (Ryzen 9 5900XT, BF16 mmproj, 30 threads, steady state; tokens per second of video include each frame
 or pair's `<|vision_start|>` / `<|vision_end|>` and the timestamps):
 
 | frames | tokens per pair | encode per pair | tokens per second of video at 1 / 2 / 4 fps |
@@ -792,9 +779,9 @@ their one-token reply, and ask a question whenever you want an answer. Each requ
 new segment (the earlier ones are reused up to the checkpoint at the generation prompt), so a tick costs the same at
 any stream age. Set `--video-cache` to at least the number of segments in the conversation, or every request decodes
 the earlier segments again; cached segments keep their rows (~20 KB per token, bounded by the context). When the
-context fills, start a new conversation from a summary plus the latest segments (one prefill, no re-encode). Measured
-on 2026-10-18: 3 s segments of 480 x 272 at 4 fps, 10 ticks of 3.7-4.2 s each (3.0 s of encoding), and the model placed
-a color change at the right time after 30 s of feed.
+context fills, start a new conversation from a summary plus the latest segments (one prefill, no re-encode). Tested
+with 3 s segments of 480 x 272 at 4 fps: 10 ticks of 3.7-4.2 s each (3.0 s of encoding), and the model placed a color
+change at the right time after 30 s of feed.
 
 ## Keep-warm
 
@@ -802,7 +789,7 @@ The driver lowers the GPU's clocks after a few seconds without work, and a reply
 ~2 s at ramping clocks. After each request (and at startup) the engine therefore keeps a light load on the GPU, a
 one-block polling kernel relaunched every 50 ms, for `MK_KEEP_WARM_S` seconds [120; 0 = off]; the next request stops it
 within microseconds. The driver keys its power state to utilization, so only a continuous load holds full clocks; the
-driver's power settings are left alone. Measured on 2026-10-17 (RTX 3090): ~165 W while warm against 30-35 W idle; from
+driver's power settings are left alone. On an RTX 3090: ~165 W while warm against 30-35 W idle; from
 idle the clocks take 2.2-2.7 s to come up. An image the request encodes on the CPU re-arms it first, so the GPU stays
 warm until the prefill's first launch. `MK_KEEP_WARM_LOAD` changes the load (for measurements;
 [CONFIGURATION.md](CONFIGURATION.md)).
@@ -965,12 +952,12 @@ Read from the environment at startup ([CONFIGURATION.md](CONFIGURATION.md)):
   dropped; a malformed size line (not hex, over 16 digits, no CRLF within 4,096 bytes), chunk data without its CRLF or
   more than 64 trailer lines is a 400 that closes the connection; another transfer coding is a 501, and a
   `Content-Length` next to it a 400. A refused upload still gets its answer (the server drains the rest, bounded).
-- **Why the pixel limit:** measured on 2026-10-17 without it, a 446 KB PNG declaring 12000 x 12000 pixels took 39 s and
+- **Why the pixel limit:** without it, a 446 KB PNG declaring 12000 x 12000 pixels took 39 s and
   0.9 GB of server memory (decode, then 4,096 tokens encoded); a 20000 x 20000 one asks stb_image for ~2.4 GB. For
   video, ffmpeg does not decode frames past the limit plus 8 Mpx (its `-max_pixels`; the slack covers its decoders' row
   alignment; its default takes frames up to 2^31 pixels, so a clip of a few hundred KB declaring 40,000 x 40,000 frames
-  meant 4.8 GB of RGB per frame). Measured on 2026-10-19: a clip of 11000 x 10000 frames took 5.2 s, 0.66 GB in the
-  server and 2 GB in ffmpeg before its frames were refused; with the header check, 0.05 s and ~50 MB.
+  means 4.8 GB of RGB per frame). Without the header check, a clip of 11000 x 10000 frames took 5.2 s, 0.66 GB in the
+  server and 2 GB in ffmpeg before its frames were refused; with it, 0.05 s and ~50 MB.
 - **Context:** no more images are decoded once the prompt cannot fit the context (see the 400 above).
 
 ## Engine calls behind the server
@@ -1001,12 +988,12 @@ line that says to rebuild (with `--mmproj`, a library without `mk_prefill_img` s
 - `scripts\serve.bat` takes the same settings as `scripts/serve.sh` (`set MK_KV=K*=6,V*=5` and `set MK_KV_WIN=2048` for
   preset D, `MK_HOST=0.0.0.0` for the LAN, `MK_MMPROJ=off` for no images); images are on when `mmproj-BF16.gguf` sits
   next to the model or `MK_MMPROJ` names it. Set `MK_PYTHON` to a Python with the server's requirements.
-- The Windows build gives the same replies as the Linux build, bit for bit: text, thinking, images and follow-up turns
-  (first compared 2026-10-16, fdad907), and every release since passes the same identity checks; since 2026-10-19 they
-  include the side-request and parked-conversation gates under q8_0 and preset D ([BENCHMARKS.md](BENCHMARKS.md)).
+- The Windows build gives the same replies as the Linux build, bit for bit: text, thinking, images and follow-up turns.
+  Every release is checked for it, side-request and parked-conversation gates under q8_0 and preset D included
+  ([BENCHMARKS.md](BENCHMARKS.md#windows-and-linux)).
 - The port is bound exclusively, so a second server cannot share it silently: it fails at startup with a message.
 - A client inside WSL2 with NAT networking does not reach a server running natively on Windows at `127.0.0.1`; run the
   client on Windows, or the server inside WSL2.
 - Memory: a native server with the 8 GiB store took ~35 GB of Windows commit charge during the client replays
-  (2026-10-21: the model's host copy, the store and the checkpoint pool), so leave room for it next to other large
+  (the model's host copy, the store and the checkpoint pool), so leave room for it next to other large
   programs.

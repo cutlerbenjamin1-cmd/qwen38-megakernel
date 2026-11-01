@@ -251,6 +251,27 @@ of open-jet's `bench/parallel_bench.py`) on unsloth's plain `Qwen3.8-27B-Q4_K_M.
   sampling beside other slots keeps its distribution, not its tokens
   ([SERVER.md](SERVER.md#several-agents-at-once---agents)).
 
+### Against open-jet's server
+
+Open-jet's `bench/parallel_bench.py` (unchanged) against this server and against open-jet's own server (f246ff0) running
+the same engine library: Q4_K_M, `--agents 4 -d 7`, one session on an RTX 3090 with open-jet's server first and last,
+2026-10-28. A total adds the four requests' decode rates (512 tokens each, temperature 0.6).
+
+| | open-jet's server | this server | this server, `MK_EXACT=0` | open-jet's server again |
+|---|---|---|---|---|
+| 4 short requests at once, total tok/s (2 runs) | 288 / 350 | 328 / 354 | 341 / 357 | 291 / 344 |
+| 4 requests with ~23k-token contexts, total tok/s | 286 | 305 | 302 | 304 |
+| a 20k-token prompt sent while another request decodes: its first token after | 15.7 s | 15.8 s | 15.8 s | 15.7 s |
+| the other request meanwhile | 11.5 tok/s | 12.9 tok/s | 12.8 tok/s | 10.6 tok/s |
+| 1 short request alone, tok/s (2 runs) | 193 / 184 | 190 / 201 | 185 / 205 | 163 / 187 |
+| 1 request with a ~23k-token context alone, tok/s | 161 | 203 | 158 | 173 |
+
+The decoding is the engine's either way, so the totals differ by run-to-run noise (one request alone with a long
+context varies most). Exact mode (`MK_EXACT=1`, the `--agents` default) costs nothing measurable here. Feeding a
+waiting prompt whole instead (`MK_PF_MIX=0 MK_PF_CHUNK=0`; another session that day, open-jet's server 15.7 s and
+11.5 / 10.7 tok/s there) got the 20k-token prompt's first token after 11.0 s, while the other request made 0.6 tok/s
+meanwhile.
+
 ## KV cache presets
 
 `MK_KV` stores K and V below 8 bits, and `MK_KV_WIN=2048` keeps the most recent 2,048 positions in an 8-bit ring next
