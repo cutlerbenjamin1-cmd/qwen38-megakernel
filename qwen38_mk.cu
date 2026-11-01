@@ -10335,6 +10335,34 @@ struct MKEngine::Impl {
             lctx = lo / ATT_BUCKET * ATT_BUCKET;
             if (lctx < 2 * ATT_BUCKET) throw std::runtime_error("parallel slots: not enough free device memory");
         }
+        // the slots' device memory against the device's free memory (+ what the allocation pool holds unused), before any of
+        // it is allocated: past it a driver with the CUDA sysmem fallback (Windows and WSL2, on by default) does not fail but
+        // puts the rest in system memory, charged to Windows commit, and the KV cache is then read over PCIe (4 x 200000
+        // positions beside a ctx 8192 engine on a 24 GB GPU: ~26 GB of it, Windows commit down to 0 free, 2026-11-01).
+        // MK_SLOT_SPILL=1: no check (the driver decides).
+        if (!(getenv("MK_SLOT_SPILL") && atoi(getenv("MK_SLOT_SPILL")) != 0)) {
+            const size_t need = (size_t) n * lane_bytes(lctx) +
+                                (lctx + KV_PAD > hb.ctx ? (size_t) (lctx + KV_PAD) * 32 * sizeof(float2) : 0); // (+ the RoPE rows)
+            size_t free_b = 0, total_b = 0;
+            CK(cudaMemGetInfo(&free_b, &total_b));
+            if (use_pool) {
+                cudaMemPool_t pool;
+                unsigned long long res = 0, used = 0;
+                if (cudaDeviceGetMemPool(&pool, cuda_dev) == cudaSuccess &&
+                    cudaMemPoolGetAttribute(pool, cudaMemPoolAttrReservedMemCurrent, &res) == cudaSuccess &&
+                    cudaMemPoolGetAttribute(pool, cudaMemPoolAttrUsedMemCurrent, &used) == cudaSuccess && res > used)
+                    free_b += res - used;
+                cudaGetLastError();
+            }
+            if (need > free_b) {
+                char msg[384];
+                snprintf(msg, sizeof msg,
+                         "parallel slots: %d x %d positions need %.2f GB of device memory, %.2f GB is free (fewer or shorter slots, or "
+                         "0 positions: the most that fit; MK_SLOT_SPILL=1 lets a driver's system-memory fallback take the rest)",
+                         n, lctx, need / 1e9, free_b / 1e9);
+                throw std::runtime_error(msg);
+            }
+        }
         // RoPE rows for the lanes (plain positions; the engine's own table when it is long enough)
         float2 * rope = const_cast<float2 *>(hb.rope);
         if (lctx + KV_PAD > hb.ctx) {
