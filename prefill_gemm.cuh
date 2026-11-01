@@ -239,7 +239,7 @@ template <int TG, int TU, int NB> __host__ __device__ constexpr int hm_smem2() {
 // the rest from W2), or one half (BM/2 rows) of a mixed-type gate / up. HB: the rows' offset in a stage; TB: the first
 // thread of the per-row copies (scale streams, Q6_K meta, Q3_K / IQ3_S extra bytes): threads TB .. TB + ROWS - 1.
 template <int TYPE, int LAY, int ROWS, bool TW2, int HB, int TB, bool OWN = false> struct HalfW {
-    static constexpr bool FMT = LAY && (TYPE == TIQ4 || (MK_WV_FMK && (TYPE == TQ4K || TYPE == TQ5K))); // fragment-ordered
+    static constexpr bool FMT = LAY && (TYPE == TIQ4 || TYPE == TQ4K || TYPE == TQ5K); // fragment-ordered
     static constexpr bool FM6 = LAY && TYPE == TQ6K;
     static constexpr int BLK = WT<TYPE>::BLK, NCH = WT<TYPE>::NCH, SR = HT<TYPE>::SR;
     static constexpr bool SEP = HT<TYPE>::SEP;

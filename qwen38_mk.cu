@@ -76,27 +76,9 @@ extern char ** environ; // (state files: the MK_* settings in the key)
 #endif
 // wv: the main-pass GEMV phases run the int8 tensor-core verify GEMM (wv.cuh) on a load-time fragment-ordered
 // tile-major weight layout, at every T (T-invariant, not bit-identical to the dp4a GEMVs).
-// MK_WV_FMK (default 1): Q4_K / Q5_K main-pass matrices fragment-ordered like IQ4_XS. 0: tile-major whole blocks (the
-// prefill reads whole 16-B chunks, but decode is slower)
-#ifndef MK_WV_FMK
-#define MK_WV_FMK 1
-#endif
-// MK_WV_OUT (default 0): out / ssm_out of the offset types (Q6_K / Q3_K / IQ3_S) in the wv layout too (tile-major,
-// as ffn_down's) on the split MMAs at every T, instead of dp4a resid32 (padded to 8 rows at T 6-7). Changes those matrices'
-// summation order (wv vs dp4a): opt-in, KLD-gated.
-#ifndef MK_WV_OUT
-#define MK_WV_OUT 0
-#endif
 // MK_K2_TB: tokens per batch of resid_wv's last-arrival combine (their partial loads issued together)
 #ifndef MK_K2_TB
 #define MK_K2_TB 8
-#endif
-// MK_K6_LD (exact): the tile-major Q8_0 wv tile load. 0: eight 8-byte loads per row and super-block (lanes tq 0-1
-// and 2-3 each read half of a 32-B sector; the other half comes with the next k: every sector crosses L2 -> SM twice).
-// 1: four 16-byte loads (whole sectors per lane pair) and one shuffle exchange of 8 bytes per load: the same bytes reach
-// the same registers.
-#ifndef MK_K6_LD
-#define MK_K6_LD 1
 #endif
 #ifndef MK_K6_DEF // MK_K6's default (env overrides)
 #define MK_K6_DEF 4
@@ -162,7 +144,7 @@ constexpr int MAXT = 8;
 // (16: 16-row passes are faster than 24-row ones at 3-4 lanes)
 #define MK_PAR_RMAX 16
 #endif
-#define MK_PAR_WIDE (!MK_WV_OUT && MK_PAR_RMAX > 8) // (8: MAXT, which the preprocessor cannot see)
+#define MK_PAR_WIDE (MK_PAR_RMAX > 8) // (8: MAXT, which the preprocessor cannot see)
 constexpr int RMAX = MK_PAR_WIDE ? MK_PAR_RMAX : MAXT;
 static_assert(RMAX % 8 == 0 && RMAX <= 32, "RMAX: whole 8-row lm_head passes, store_lane_t's 32 lanes");
 constexpr int MAXT_PF = 5; // rows of prefill-mode and scoring launches (T >= 6 runs only as a decode verify pass)
@@ -336,7 +318,7 @@ struct Bufs {
 #endif
     int dattn;   // decode attention of all-q8 slots: 1 attn_core_q8 (default), 0 attn_core_t (MK_DATTN=0)
     int mtp_win; // MK_MTP_WIN > 0: the MTP block's decode attention sees the last mtp_win positions only (drafts only)
-    int mtp_kvc; // MK_MTP_KVC builds: K / V-only MTP catch-up rows (mtp_kv_pass) on (default), 0 with env MK_MTP_KVC=0
+    int mtp_kvc; // K / V-only MTP catch-up rows (mtp_kv_pass) on (default), 0 with env MK_MTP_KVC=0
     float * wvpart;  // wv split-K partial sums [WV_S][MAXT][D] (resid_wv)
     unsigned * wvcnt; // [2][D / 32] arrivals per 32-row group (out, ffn_down); the last arrival resets it to 0
     // runtime switches (env, read at init; uniform per launch, outside the inner loops; all bit-exact):
@@ -3508,10 +3490,7 @@ __device__ __forceinline__ void kv_slice_expand(uint8_t * st, int wn) {
 // conversions take (xm / sub). The softmax warps take 12 rows each (two sub-passes). Per-row arithmetic is attn_core_t's
 // (the same S / softmax / P V code per row): the partials equal attn_core_q8_t's and attn_core_t's for every format.
 constexpr int SM_ATTN_W48 = 48 * (256 + 8) * 2 + 6 * AQ_STG + 2 * 48 * AQ_LDS * 4 + 2 * 48 * (ATP + 8) * 2;
-static_assert(SM_ATTN_W48 + NW * 8 * 4 <= SM_TOTAL, "attn_core_w48 shared memory (+ MK_W48S's per-warp scalars)");
-#ifndef MK_W48S
-#define MK_W48S 1 // attn_core_w48's scalars (n, ws, CS, L_ctx, nch) from shared memory (0: registers / spill slots)
-#endif
+static_assert(SM_ATTN_W48 + NW * 8 * 4 <= SM_TOTAL, "attn_core_w48 shared memory (+ the per-warp call scalars)");
 template <int T, bool MIX>
 __device__ __forceinline__ void attn_core_w48(const LayerW & W, int slot, int n) {
     uint8_t * const sm = smem;
@@ -3527,10 +3506,9 @@ __device__ __forceinline__ void attn_core_w48(const LayerW & W, int slot, int n)
     const int ws = mtp_ws(slot, n); // MK_MTP_WIN
     int nch, CS;
     attn_dims_w(L_ctx, ws, nch, CS);
-    // the call's scalars in shared memory, one copy per warp (MK_W48S), read with volatile loads where used: kept in
+    // the call's scalars in shared memory, one copy per warp, read with volatile loads where used: kept in
     // registers, ptxas spills them and their reload at each item's start waits on local memory (L2) behind the K / V
     // stream
-#if MK_W48S
     if ((threadIdx.x & 31) < 5) {
         const int l = threadIdx.x & 31;
         reinterpret_cast<int *>(sm + SM_ATTN_W48)[8 * (threadIdx.x >> 5) + l] = l == 0 ? n : l == 1 ? ws : l == 2 ? CS : l == 3 ? L_ctx : nch;
@@ -3542,13 +3520,6 @@ __device__ __forceinline__ void attn_core_w48(const LayerW & W, int slot, int n)
 #define W48_CS w48s(2)
 #define W48_LC w48s(3)
 #define W48_NCH w48s(4)
-#else
-#define W48_N n
-#define W48_WS ws
-#define W48_CS CS
-#define W48_LC L_ctx
-#define W48_NCH nch
-#endif
     __half * sQ = reinterpret_cast<__half *>(sm);                 // [RP][LDH]
     uint8_t * kring = reinterpret_cast<uint8_t *>(sQ + RP * LDH); // NSK stages
     uint8_t * vring = kring + NSK * AQ_STG;                       // NSV stages
@@ -4766,10 +4737,7 @@ __device__ __noinline__ void mtp_pass(const Launch & PL, int li, int row0, bool 
     }
 }
 
-#ifndef MK_MTP_KVC
-#define MK_MTP_KVC 1 // K / V-only MTP catch-up rows (mtp_kv_pass); 0: every catch-up row runs the full pass
-#endif
-#define MTP_KVC (MK_MTP_KVC && !MK_KV_EMU)
+#define MTP_KVC (!MK_KV_EMU)
 #if MTP_KVC
 // K / V-only MTP catch-up rows (MK_MTP_KVC). Of a cycle's catch-up rows (the accepted drafts + the bonus, R = a + 1) only
 // the last row's MTP output is ever read (write_h_rows keeps the last row: it feeds the draft head and the chain); the
@@ -7574,13 +7542,7 @@ struct MKEngine::Impl {
                 L.q = up_mat(blk(i, "attn_q.weight"), D, QG);
                 L.k = up_mat(blk(i, "attn_k.weight"), D, KVD);
                 L.v = up_mat(blk(i, "attn_v.weight"), D, KVD);
-#if MK_WV_OUT
-                wv_fd = true; // MK_WV_OUT: the offset types of out / ssm_out in the wv layout too
-#endif
                 L.o = up_mat(blk(i, "attn_output.weight"), VD, D);
-#if MK_WV_OUT
-                wv_fd = false;
-#endif
                 needq(blk(i, "attn_q.weight"), L.q.type);
                 needq(blk(i, "attn_k.weight"), L.k.type);
                 needq(blk(i, "attn_v.weight"), L.v.type);
@@ -7590,13 +7552,7 @@ struct MKEngine::Impl {
             } else {
                 L.qkv = up_mat(blk(i, "attn_qkv.weight"), D, QKV);
                 L.gate = up_mat(blk(i, "attn_gate.weight"), D, VD);
-#if MK_WV_OUT
-                wv_fd = true;
-#endif
                 L.sout = up_mat(blk(i, "ssm_out.weight"), VD, D);
-#if MK_WV_OUT
-                wv_fd = false;
-#endif
                 needq(blk(i, "attn_qkv.weight"), L.qkv.type);
                 needq(blk(i, "attn_gate.weight"), L.gate.type);
                 needq(blk(i, "ssm_out.weight"), L.sout.type);
@@ -7662,9 +7618,8 @@ struct MKEngine::Impl {
         }
         mem_mark("weights: 64 layers + MTP");
         wv_lay = false;
-        fprintf(stderr, "[mk] wv: %d main-pass matrices in the wv layout (%d on the device, the others re-laid-out on the host in %.1f s; %s), MAXT %d\n", wv_n, wv_dev_n, wv_s,
-                MK_WV_OUT ? "Q6_K everywhere (FM), ffn_down / out / ssm_out every type; elsewhere Q3_K / IQ3_S stay on dp4a"
-                          : "Q6_K everywhere (FM), ffn_down every type; elsewhere Q3_K / IQ3_S stay on dp4a", MAXT);
+        fprintf(stderr, "[mk] wv: %d main-pass matrices in the wv layout (%d on the device, the others re-laid-out on the host in %.1f s; "
+                        "Q6_K everywhere (FM), ffn_down every type; elsewhere Q3_K / IQ3_S stay on dp4a), MAXT %d\n", wv_n, wv_dev_n, wv_s, MAXT);
         if (has_mtp) {
             req_q4 = true;
             hw.eh = up_mat(blk(NL, "nextn.eh_proj.weight"), 2 * D, D);
@@ -7840,7 +7795,7 @@ struct MKEngine::Impl {
             throw std::runtime_error("MK_K6=" + std::to_string(hb.k6) + ": bit 1 (the K-split of the Q8_0 k / v tiles) was removed; bits 2 and 4 remain (default 4)");
         k8 = getenv("MK_K8") ? atoi(getenv("MK_K8")) : MK_K8_DEF;
         if (const char * e = getenv("MK_K8_NT")) k8_nt = atoi(e) == 8 ? 8 : 4;
-        fprintf(stderr, "[mk] stock2: K6 %d (ld %d), K8 %d (nt %d)\n", hb.k6, MK_K6_LD, k8, k8_nt);
+        fprintf(stderr, "[mk] stock2: K6 %d, K8 %d (nt %d)\n", hb.k6, k8, k8_nt);
         fprintf(stderr, "[mk] K5: split dn_proj -> dn_core barrier, delta-net heads in dn_proj arrival order\n");
         fprintf(stderr, "[mk] C1: ffn_gu -> ffn_down per-chunk waits instead of a grid barrier\n");
         hb.ctx = ctx + KV_PAD; // rows per kv head (KV_PAD: the MTP draft rows written past the last admitted position)
@@ -7859,7 +7814,7 @@ struct MKEngine::Impl {
             // the KV layout are unchanged). Drafts are verified, so the output is exact; acceptance can change.
             hb.mtp_win = getenv("MK_MTP_WIN") ? atoi(getenv("MK_MTP_WIN")) : 0;
             if (hb.mtp_win > 0) fprintf(stderr, "[mk] MTP decode attention window %d positions (MK_MTP_WIN)\n", hb.mtp_win);
-            // MK_MTP_KVC builds: the catch-up rows before the last 5 run K / V only (same drafts); env MK_MTP_KVC=0: off
+            // the catch-up rows before the last 5 run K / V only (same drafts; not in MK_KV_EMU builds); env MK_MTP_KVC=0: off
             hb.mtp_kvc = !(getenv("MK_MTP_KVC") && atoi(getenv("MK_MTP_KVC")) == 0);
             // MK_KV (q8 cache): per attention slot and K / V, q8_0 (default), q4 (kv_store_q4) or q5 / q6 / q7
             // (kv_store_qn), e.g. "V*=6r,K16=4r": comma-separated <K|V|*><slot>=<4..8>[r], slot 0..15 = attention layer

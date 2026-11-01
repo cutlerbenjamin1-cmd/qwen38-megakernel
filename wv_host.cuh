@@ -90,7 +90,7 @@ size_t wv_relayout(int type, int N, int K, int rb, const uint8_t * w, const uint
 // ---- device re-layout (MK_LOAD_GPURL, default 1): the same permutation on the GPU, from the bytes as uploaded ---------
 // The loader uploads a matrix in its pre-wv layout into a staging buffer and one of these kernels writes the wv layout into
 // the matrix's own buffer (exact: the same bytes as wv_relayout; checked against the host path by MK_WDIGEST).
-// - fragment-major types (wv_fm: IQ4_XS, Q4_K / Q5_K with MK_WV_FMK) move whole 8-byte words: their gather table is made by
+// - fragment-major types (wv_fm: IQ4_XS, Q4_K / Q5_K) move whole 8-byte words: their gather table is made by
 //   running wv_relayout itself on a probe of 16 rows whose words hold their own (row, word) positions (wv_probe), so this
 //   path follows any change of the host code;
 // - tile-major types move whole blocks of 4-byte words (wv_tm_dev: the host's tm(), word for word);

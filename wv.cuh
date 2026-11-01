@@ -37,9 +37,7 @@ __device__ __forceinline__ float mag23(unsigned w, int k) { return __int_as_floa
 // the weight types the wv path serves (the others stay on dp4a at every T: per tensor T-invariant)
 __host__ __device__ constexpr bool wv_type(int t) { return t == T_Q4K || t == T_Q5K || t == T_IQ4X || t == T_IQ4NL || t == T_Q8_0; }
 // fragment-ordered (FM) types; the other wv types are tile-major whole blocks
-// (MK_WV_FMK=0: Q4_K / Q5_K tile-major whole blocks instead: their prefill GEMMs read whole 16-B chunks, but the
-// decode GEMMs lose most of the wv gain (8-B loads at stride 32))
-__host__ __device__ constexpr bool wv_fm(int t) { return t == T_IQ4X || (MK_WV_FMK && (t == T_Q4K || t == T_Q5K)); }
+__host__ __device__ constexpr bool wv_fm(int t) { return t == T_IQ4X || t == T_Q4K || t == T_Q5K; }
 // per-16 weight scales (the ffn_down offset types): split MMAs only
 __host__ __device__ constexpr bool wv_s16(int t) { return t == T_Q6K || t == T_Q3K; }
 
@@ -82,26 +80,12 @@ template <> struct WV<T_Q4K> { // 144 B: d, dmin | scales[12] | qs[128]
         w0 = (r.q[k >> 1].x >> sh) & M4;
         w1 = (r.q[k >> 1].y >> sh) & M4;
     }
-    // tile-major whole blocks (MK_WV_FMK=0)
-    static __device__ __forceinline__ void load(Raw & r, const Mat & m, int tile, int row, int sb, int tq) {
-        const uint8_t * blk = wv_tblk(m, tile, row, sb, 144);
-        r.h = ldw4(blk);
-#pragma unroll
-        for (int p = 0; p < 4; p++) r.q[p] = ldw2(blk + 16 + 32 * p + 8 * tq);
-    }
 };
 
 template <> struct WV<T_Q5K> { // 176 B: d, dmin | scales[12] | qh[32] | qs[128]
     static constexpr int MIN = 1, BS = 176;
     struct Raw { int4 h; int2 qh; int2 q[4]; };
     using Sc = WV<T_Q4K>::Sc;
-    static __device__ __forceinline__ void load(Raw & r, const Mat & m, int tile, int row, int sb, int tq) { // (MK_WV_FMK=0)
-        const uint8_t * blk = wv_tblk(m, tile, row, sb, 176);
-        r.h = ldw4(blk);
-        r.qh = ldw2(blk + 16 + 8 * tq);
-#pragma unroll
-        for (int p = 0; p < 4; p++) r.q[p] = ldw2(blk + 48 + 32 * p + 8 * tq);
-    }
     static __device__ __forceinline__ void scales(const Raw & r, Sc & s) {
         WV<T_Q4K>::Raw t;
         t.h = r.h;
@@ -171,10 +155,10 @@ template <> struct WV<T_Q8_0> { // repacked: per unit 32 B (A 16 | B 16); fp16 d
     static __device__ __forceinline__ void load(Raw & r, const Mat & m, int tile, int row, int sb, int tq) {
         const uint8_t * rp = wv_tblk(m, tile, row, sb, 256);
         r.d = ldw4(wv_tmeta(m, tile, row, sb, 16));
-#if MK_K6_LD
-        // (MK_K6_LD) q[k] = the 8 bytes at 32 (2 kk + (tq >> 1)) + 16 kb + 8 (tq & 1), k = 2 kk + kb. The lane pair tq = 2 h,
+        // q[k] = the 8 bytes at 32 (2 kk + (tq >> 1)) + 16 kb + 8 (tq & 1), k = 2 kk + kb. The lane pair tq = 2 h,
         // 2 h + 1 shares the 32-B sector 2 kk + h: the even lane loads its bytes 0-15 (its kb 0 | the odd lane's kb 0), the odd
-        // lane 16-31 (the even lane's kb 1 | its kb 1); one exchange of 8 bytes completes both: whole sectors, half the loads.
+        // lane 16-31 (the even lane's kb 1 | its kb 1); one exchange of 8 bytes completes both: whole sectors, half the loads
+        // (8-byte loads per k bring every sector from L2 twice, half each time).
         const bool odd = tq & 1;
 #pragma unroll
         for (int kk = 0; kk < 4; kk++) {
@@ -184,10 +168,6 @@ template <> struct WV<T_Q8_0> { // repacked: per unit 32 B (A 16 | B 16); fp16 d
             r.q[2 * kk] = odd ? make_int2(s0, s1) : make_int2(v.x, v.y);
             r.q[2 * kk + 1] = odd ? make_int2(v.z, v.w) : make_int2(s0, s1);
         }
-#else
-#pragma unroll
-        for (int k = 0; k < 8; k++) r.q[k] = ldw2(rp + 32 * (2 * (k >> 1) + (tq >> 1)) + 16 * (k & 1) + 8 * (tq & 1));
-#endif
     }
     static __device__ __forceinline__ void scales(const Raw & r, Sc & s) { s.d = r.d; }
     static __device__ __forceinline__ void wsc(const Sc & s, int k, float & fA, float & gA) {
@@ -728,7 +708,7 @@ __device__ __forceinline__ WvAcc<WvCfg<T, X16>::NG> wv_tile_q6f(const Mat & m, i
 }
 
 // (the activations: wv_fill<T, X16, ldu - 2>'s, rebuilt here by wv_xs)
-template <int TYPE, int T, bool X16, int ROLE = 0> // ROLE: separate instances for MK_WV_OUT's out role (wv_tile_off)
+template <int TYPE, int T, bool X16>
 __device__ __noinline__ WvAcc<WvCfg<T, X16>::NG> wv_tile(const Mat m, int tile, int sb0, int nsb, int ldu) {
     const WvXS xs = wv_xs<T, X16>(ldu);
     if constexpr (TYPE == T_Q6K) {
@@ -785,18 +765,6 @@ __device__ __forceinline__ WvAcc<WvCfg<T, X16>::NG> wv_tile_any(const Mat & m, i
     }
 }
 
-#if MK_WV_OUT
-// MK_WV_OUT's out role (offset types only): its own wv_tile instances (ROLE 1). Sharing ffn_down's makes ptxas re-split the
-// registers around those calls (ffn_down's resid_wv<8, true> then spills 60 / 228 B instead of 16 / 40)
-template <int T>
-__device__ __forceinline__ WvAcc<WvCfg<T, true>::NG> wv_tile_off(const Mat & m, int tile, int sb0, int nsb, const WvXS & xs) {
-    switch (m.type) {
-        case T_Q6K: return wv_tile<T_Q6K, T, true, 1>(m, tile, sb0, nsb, xs.ld / 16);
-        case T_Q3K: return wv_tile<T_Q3K, T, true, 1>(m, tile, sb0, nsb, xs.ld / 16);
-        default: return wv_tile<T_IQ3S, T, true, 1>(m, tile, sb0, nsb, xs.ld / 16);
-    }
-}
-#endif
 
 // ---- phases ----------------------------------------------------------------------------------------------------------
 // Work split of a phase (bench k_wv): block b takes the tiles [ntile b / G, ntile (b + 1) / G) of the phase's tile space
@@ -1205,7 +1173,7 @@ __device__ __noinline__ void ffn_gu_wv(const LayerW & W, bool c1 = false) {
 // (G = gridDim / WV_S blocks per chunk). Each chunk's partial sums go to cB.wvpart; the last of the 2 WV_S (tile, chunk)
 // arrivals at a 32-row group adds the chunks in order 0 .. WV_S - 1 (fixed: T-invariant), adds the residual and
 // re-quantises it for the next RMS-normed consumer (weight wnext), like resid32's epilogue.
-template <int T, bool X16, int K, bool OFF = false> // OFF: MK_WV_OUT's out role (wv_tile_off)
+template <int T, bool X16, int K>
 __device__ __noinline__ void resid_wv(const Mat Wm, const QBuf in, const float * wnext, int role) {
     constexpr int NSB = K / 256, CH = NSB / WV_S, US = 8 * CH;
     static_assert(NSB % WV_S == 0, "split-K chunks of whole super-blocks");
@@ -1222,13 +1190,7 @@ __device__ __noinline__ void resid_wv(const Mat Wm, const QBuf in, const float *
     unsigned * cnt = cB.wvcnt + (role & 1) * (D / 32); // (role bit 1: the C1 wait above)
     float * x = cB.x;
     for (int tile = t0 + (NW - 1 - warp); tile < t1; tile += NW) {
-#if MK_WV_OUT
-        WvAcc<C::NG> a;
-        if constexpr (OFF) a = wv_tile_off<T>(Wm, tile, CH * kc, CH, xs);
-        else a = wv_tile_any<T, X16>(Wm, tile, CH * kc, CH, xs);
-#else
         const WvAcc<C::NG> a = wv_tile_any<T, X16>(Wm, tile, CH * kc, CH, xs);
-#endif
         float * part = cB.wvpart + (size_t) kc * RMAX * D;
         if (!X16 || tq < 2) {
 #pragma unroll
@@ -1292,16 +1254,9 @@ __device__ __noinline__ void resid_wv(const Mat Wm, const QBuf in, const float *
 }
 
 // out / ssm_out (K = VD) in the wv layout, residual add into x, re-quantised for the next normed consumer (role 0).
-// MK_WV_OUT: the offset types run the split MMAs (X16, min2 fill): their per-16 weight scales need them, and
-// the q32 activations fit the split view as they are (a block's two 16-chunks are units with the block's scale each)
+// (The offset types' out / ssm_out stay on dp4a resid32.)
 template <int T>
 __device__ __forceinline__ void resid_out_wv(const Mat & Wm, const float * wnext) {
-#if MK_WV_OUT
-    if (wv_min2(Wm.type) && Wm.type != T_Q6K) { // (Q6_K runs the q32 FM tiles below)
-        resid_wv<T, true, VD, true>(Wm, cB.qo, wnext, 0);
-        return;
-    }
-#endif
     resid_wv<T, false, VD>(Wm, cB.qo, wnext, 0);
 }
 
