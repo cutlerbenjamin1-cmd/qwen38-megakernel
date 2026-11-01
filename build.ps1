@@ -40,13 +40,18 @@ $cl = @("/nologo", "/O2", "/EHsc", "/MD", "/std:c++17", "/D_CRT_SECURE_NO_WARNIN
 
 function Run([string] $exe, [string[]] $a, [string] $errFile = "") {
     Write-Host "> $exe $($a -join ' ')" -ForegroundColor DarkGray
-    if ($errFile) {
-        # stdout and stderr both to the file (nvcc reports compile errors on stdout, ptxas -v on stderr)
-        & $exe @a *> $errFile
-        if ($LASTEXITCODE -ne 0) { Get-Content $errFile | Where-Object { $_ -match "error" } | Select-Object -First 20; throw "$exe failed ($LASTEXITCODE), see $errFile" }
-    } else {
-        & $exe @a
-        if ($LASTEXITCODE -ne 0) { throw "$exe failed ($LASTEXITCODE)" }
+    # (the exit code decides: under Stop, a warning on stderr is a terminating error once the output is redirected)
+    $eap = $ErrorActionPreference
+    $ErrorActionPreference = "Continue"
+    try {
+        # with errFile: stdout and stderr both to the file (nvcc reports compile errors on stdout, ptxas -v on stderr)
+        if ($errFile) { & $exe @a *> $errFile } else { & $exe @a }
+    } finally {
+        $ErrorActionPreference = $eap
+    }
+    if ($LASTEXITCODE -ne 0) {
+        if ($errFile) { Get-Content $errFile | Where-Object { $_ -match "error" } | Select-Object -First 20 }
+        throw "$exe failed ($LASTEXITCODE)$(if ($errFile) { ", see $errFile" })"
     }
 }
 
@@ -96,8 +101,10 @@ if (& $want "engine") {
     Set-Content -Encoding ascii "build_win\mk_build_info.h" @("#define MK_BUILD_COMMIT `"$commit`"",
         "#define MK_BUILD_FLAGS `"$(($MkFlags -split '\s+' | Where-Object { $_ }) -join ' ')`"")
     $link = @("-O3", "-std=c++17", "-arch=$Arch", "-Xcompiler", $hostFlags) + $llInc
-    Run $nvcc ($link + @("-shared", "-Ibuild_win", "capi.cpp", "build_win\qwen38_mk.obj", "build_win\compat_win32.obj") + $llLib +
-               @("-Xlinker", "/DEF:build_win\qwen38mk.def", "-o", "qwen38mk.dll"))
+    # /EHc-: libllama's extern "C" API throws C++ exceptions, and under nvcc's -EHsc MSVC drops capi.cpp's catches around
+    # its calls (/EHs does not undo the c; cl warns D9025)
+    Run $nvcc ($link + @("-Xcompiler", "/EHc-", "-shared", "-Ibuild_win", "capi.cpp", "build_win\qwen38_mk.obj", "build_win\compat_win32.obj") +
+               $llLib + @("-Xlinker", "/DEF:build_win\qwen38mk.def", "-o", "qwen38mk.dll"))
     Run $nvcc ($link + @("main.cu", "build_win\qwen38_mk.obj", "build_win\compat_win32.obj") + $llLib + @("-o", "qwen38_mk.exe"))
     Copy-LlamaDlls $PSScriptRoot
 }
