@@ -38,7 +38,8 @@ prompts and model file. RTX 3090, unsloth's UD-Q4_K_XL, 120k context, q8_0 KV ca
 It does this in 1.5 GiB less VRAM (21.2 against 22.7 GiB, idle at 120k). With drafting off on both sides it's still 7%
 faster on short prompts and 41% faster at 101.6k context, so the gain isn't only speculation. Token-weighted rates,
 the 7-draft llama.cpp column, the no-draft table and the method are in [docs/BENCHMARKS.md](docs/BENCHMARKS.md). The
-question totals for this engine come from the previous day's full run; every other row is one session.
+question totals for this engine come from its [full run](docs/BENCHMARKS.md#full-run-2026-10-30); every other row is
+one session.
 
 ## What you get
 
@@ -106,9 +107,9 @@ environment variables (`MK_HOST=0.0.0.0` for the LAN, `MK_KV` / `MK_KV_WIN` for 
 ## Exact output
 
 Speculative decoding is lossless on paper, but verifying several tokens in one pass rounds differently from verifying
-one, so in practice greedy output drifts with the draft count: on 8 of the 282 benchmark questions, llama.cpp b12024
-gives a different greedy answer at 4 drafts than at 7. A reused cache or another compiler can drift the same way. This
-engine is built so none of them change the output:
+one, so in practice greedy output drifts with the draft count: on 9 of the 282 benchmark questions, llama.cpp b12024
+gives a different greedy answer at 4 drafts than at 7 (8 of them reproducibly from the depth). A reused cache or another
+compiler can drift the same way. This engine is built so none of them change the output:
 
 - **Drafting never changes the answer.** Greedy token ids are identical at 0, 4 and 7 drafts. Sampled output keeps the
   distribution of sampling without drafts (chi-square and PIT tests).
@@ -142,7 +143,7 @@ attention puts most of its weight and where low-bit storage costs accuracy.
 | | q8_0 (default) | preset D | preset F |
 |---|---|---|---|
 | K / V bits (newest 2k positions at 8) | 8 / 8 | 6 / 5 | 5, rotated / 5 |
-| VRAM, idle server at 120k context | 21.3 GiB | 20.1 GiB | 20.0 GiB |
+| VRAM, idle server at 120k context | 21.3 GiB (21.2 in the llama.cpp session above) | 20.1 GiB | 20.0 GiB |
 | full 262,144-token context on 24 GB | no | yes | yes |
 | KL against llama.cpp at 32k / 100k context | 0.00219 / 0.00217 | 0.00236 / 0.00226 | 0.00242 / 0.00218 |
 | 282 benchmark questions | 230 right | 230 right | 229 right |
@@ -200,8 +201,8 @@ fix a failing test, follow-ups, questions about a large file, an image):
 | DeepSeek Harness (`dsh`) | 0.2.1-rc.2 | OpenCode | 2.0.32 |
 | Crush | v0.98.1 | | |
 
-The others use chat completions. Each needs the base URL, any API key and the model id (the GGUF's file name); a few
-also need the context window or image support set by hand. Per-client settings and quirks:
+The others use chat completions. Each needs the base URL, any API key and the model id (the GGUF's file name); most
+also need the context window set by hand, some the image flag or the thinking level. Per-client settings and quirks:
 [docs/CLIENTS.md](docs/CLIENTS.md).
 
 ## How it's fast

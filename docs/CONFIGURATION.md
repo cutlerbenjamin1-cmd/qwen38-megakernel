@@ -126,20 +126,12 @@ is byte-identical to q8_0's; E and F store rotated rows (F only K), which change
 | E | `MK_KV='K*=6r,V*=4r' MK_KV_WIN=2048` | 6 / 4, both stored Hadamard-rotated |
 | F | `MK_KV='K*=5r,V*=5' MK_KV_WIN=2048` | 5 / 5, K stored Hadamard-rotated; `serve.bat` above 240k |
 
-The three presets side by side (one session, 4 drafts, A-B-A against q8_0; KL against llama.cpp's reference, relative
-to q8_0's own). 120k is the benchmark anchor (the launchers' default context),
-so memory is compared at that size: the third column is how much context fits in the VRAM q8_0 uses at 120k, not how
-far a preset was tested. D and F run the model's full 262,144 tokens (below, and
-[BENCHMARKS.md](BENCHMARKS.md#the-full-context)).
+C, D and E side by side (what each frees at 120k, the launchers' default context, how much context fits in the VRAM
+q8_0 uses there, KL, decode and prefill cost): [BENCHMARKS.md](BENCHMARKS.md#c-d-and-e-side-by-side). D and F run the
+model's full 262,144 tokens (below, and [BENCHMARKS.md](BENCHMARKS.md#the-full-context)).
 
-| Preset | Frees at 120k | Context that fits in q8_0's 120k VRAM | KL: short / 32k / 64k | Decode, ms per cycle at 38k / 101.6k | Prefill speed at 38k / 101.6k |
-|---|---|---|---|---|---|
-| C | 691 MiB | 144k | same / +4% / +2% | +1.2% / +3.7% | -1.3% / -2.7% |
-| D | 1,132 MiB | 165k | same / +1% / +5% | +2.9% / +5.0% | -3.3% / -6.7% |
-| E | 1,381 MiB | 180k | +2% / +5% / +10% | +2.4% / +4.9% | -2.0% / -4.2% |
-
-D' is D with the MTP layer's cache at 8 bits: ~70 MB more, and the drafts read q8_0 K / V; at 7 drafts it decoded
-1.2% / 2.9% faster than D at 101.6k / 38k with the same output ids and 32k KL as D.
+D' is D with the MTP layer's cache at 8 bits: ~70 MB more, and the drafts read q8_0 K / V (its speed against D:
+[BENCHMARKS.md](BENCHMARKS.md#c-d-and-e-side-by-side)).
 
 **Preset D** frees ~1.1 GB at 120k context and fits the model's full 262,144-token context on 24 GB. A prompt that
 fits in the window reads only q8_0 rows, so its output is q8_0's; past the window, KL at 32k is 0.00236 against
@@ -154,10 +146,10 @@ at 120k context (2.99 against 3.25 GB) and 0.58 GB less at 262,144 (6.39 against
 (0.00163), at 100k (0.00218 against 0.00217; D 0.00226) and on 160k tokens of prose (0.00472 against 0.00467), and is
 10% above q8_0's at 32k (0.00242; D 0.00236; the set's noise is about 0.00008 either way), and a larger window did not
 change the 32k number. On the 282 questions it answered 229 right (D and q8_0: 230; three items
-differ, one of them an answer cut by its token cap). It reads prompts as fast as D (101.6k tokens in 76.97 s against
-77.40 s in one session). `scripts\serve.bat` uses it above 240k unless `MK_KV` is set: natively on
-Windows, with the desktop on the same card, preset D at the full context passes what the driver keeps resident, and F
-stays inside it with the default prefill chunk and draft head. Numbers: [BENCHMARKS.md](BENCHMARKS.md#preset-f).
+differ, one of them an answer cut by its token cap). It reads prompts as fast as D. `scripts\serve.bat` uses it above
+240k unless `MK_KV` is set: natively on Windows, with the desktop on the same card, preset D at the full context passes
+what the driver keeps resident, and F stays inside it with the default prefill chunk and draft head. Numbers:
+[BENCHMARKS.md](BENCHMARKS.md#preset-f).
 
 ### MK_KV syntax
 
@@ -188,9 +180,10 @@ noise floor of the 32k test set; at 1,024 they were still near-lossless, but mea
 
 - **The ring is small and does not grow with the context.** With preset D (K and V low-bit in the 16 attention layers
   and the MTP layer: 34 rings) it takes 46 / 69 / 114 / 182 MiB at `MK_KV_WIN` 512 / 1024 / 2048 / 4096, at 32k context
-  or at 262k; preset C (V only) half of that. The savings in the tables above are net of it. A smaller window saves
-  tens of MiB at a measurable cost in accuracy. Larger windows were not measured: at 2,048 preset D already read at
-  the noise floor of the 32k set in the emulator.
+  or at 262k; preset C (V only) half of that. The presets' savings
+  ([BENCHMARKS.md](BENCHMARKS.md#c-d-and-e-side-by-side)) are net of it. A smaller window saves tens of MiB at a
+  measurable cost in accuracy. Larger windows were not measured: at 2,048 preset D already read at the noise floor of
+  the 32k set in the emulator.
 - **The window is rounded up to steps of 640 positions**, the attention kernel's tile partition (which also keeps
   greedy output independent of the draft depth): `MK_KV_WIN=2048` keeps the last 2,561 to 3,200 positions at 8 bits,
   and any value from 1,921 to 2,560 gives the same ring. The startup line `[mk] KV recent window: ...` prints the range
@@ -378,7 +371,7 @@ keeps its distribution). The defaults were tuned on replayed logs and live A/B r
 | `h1` | `1` | when sampling, draft by sampling the MTP head (`0`: its top-1 token) |
 | `dq4` | - | with the draft head's Q4_K copy (`MK_DRAFT_Q4`, on by default): `1` the copy, `0` lm_head (from the next launch) |
 
-The policy before the gates was `depth=0,drop=0,stop=0,chain=0,h1=0`.
+No gates: `depth=0,drop=0,stop=0,chain=0,h1=0` (adaptive depth, top-1 drafts), the A/B baseline for the defaults.
 
 ### Prefill
 
@@ -467,9 +460,9 @@ fragment-ordered on the tensor-core path (ms per cycle -1.5% at 101.6k and -2.6%
 DeltaNet barrier, the per-chunk ffn_down waits and the host egress ([ENGINE.md](ENGINE.md)). ptxas peaked at 18.8 GiB
 of RAM for it on Linux and natively on Windows ([BUILDING.md](BUILDING.md#requirements)).
 
-Against the dp4a verify it replaced (at most 4 drafts), wide verify at 7 drafts decodes 17.6% faster greedy, 19.5%
-faster sampled with thinking and 9.2% faster at 101.6k context. The dp4a build is gone, with the other compile-time
-A/B switches ([Former flags](#former-flags)).
+Wide verify replaced a dp4a verify pass of at most 4 drafts, which summed in another order; what it gained:
+[BENCHMARKS.md](BENCHMARKS.md#wide-verify-2026-10-13). The dp4a build is gone, with the other compile-time A/B switches
+([Former flags](#former-flags)).
 
 ### Former flags
 
@@ -529,7 +522,9 @@ released or gated, and nothing measured them any more. A `-D` for one of them ha
 
 `build.ps1` skips the engine's compile when its object is newer than every engine source and was built
 with the same flags. Make targets: `all` (the default: CLI, engine library, tools, and the vision library when
-llama.cpp's build has libmtmd), `vision`, `tools/vit_check`, `tests/gguf_fuzz`, `clean`. `NVFLAGS`, `VISION_INC`,
+llama.cpp's build has libmtmd), `vision`, `check` (the kernel checks without a model), `exactness` and `gate`
+(`scripts/exactness.py` and `scripts/gate.sh` on the build, with `MK_MODEL=<gguf>`;
+[BUILDING.md](BUILDING.md#checking-a-build)), `tools/vit_check`, `tests/gguf_fuzz`, `clean`. `NVFLAGS`, `VISION_INC`,
 `VISION_LIBS`, `VIT_OBJ` and `VIT_DEF` are the Makefile's internal variables (`VIT_DEF` is `-DMKV_NO_VIT` on CPUs
 other than x86-64); BUILDING.md has the build itself.
 
@@ -671,6 +666,9 @@ code:
 | `MK_MAX_GRID` | constant 128: the most blocks of the persistent kernel; a GPU with more SMs runs 128 |
 | `MK_BAR_LT`, `MK_EPOCH`, `MK_C1E` | helper macros of the barrier counters that run on across launches (egress, C1) |
 | `MK_GLU_MIX_PAIRS`, `MK_GLU_ATTR`, `MK_GLU_GO` | macro lists of the fused gate / up weight-type pairs |
+| `MK_SHARED_NS` | the namespace `mk_shared.cuh` puts its definitions in: `mk` in the host files, anonymous in `qwen38_mk.cu` (which defines it empty) |
+| `MK_VIEW_INIT` | macro at the entry of every device kernel: the block reads which buffer view (`cView`) it runs on |
+| `MK_LANE_OUT` | macro in `lanes.cu`: a scope guard that leaves the engine's own sequence live again when a slot call returns |
 | `MK_STR`, `MK_STR2` | stringify helpers |
 | `MTP_KVC` | derived: not `MK_KV_EMU` (the K / V-only MTP catch-up rows are compiled in) |
 | `MK_STATE`, `MK_LOAD_`, `MK_BENCH` | prefixes in the state-file key's list of ignored variables (`MK_STATE_WARM_MS`, the `MK_LOAD_*` family). No variable named `MK_BENCH...` is read anywhere |

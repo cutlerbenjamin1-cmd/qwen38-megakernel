@@ -10,10 +10,10 @@ Contents: [prebuilt packages](#prebuilt-packages) - [requirements](#requirements
 ## Prebuilt packages
 
 Each [release](https://github.com/cutlerbenjamin1-cmd/qwen38-megakernel/releases) has a Windows x64 zip and a Linux
-x86-64 tarball of the served configuration (`MKFLAGS` as below), built from the tagged
-commit. Each holds the engine library, the CLI, the vision library, the tools, llama.cpp b10246's libraries (CPU only:
-the engine uses its tokenizer and image library), the server, the launcher, the docs, the licenses
-(`THIRD_PARTY_NOTICES.md`), `BUILD_INFO.txt` (commit, flags, toolchain) and `QUICKSTART.txt`. They need:
+x86-64 tarball of the served configuration, built from the tagged commit. Each holds the engine library, the CLI, the
+vision library, the tools, llama.cpp b10246's libraries (CPU only: the engine uses its tokenizer and image library),
+the server, the launcher, the docs, the licenses (`THIRD_PARTY_NOTICES.md`), `BUILD_INFO.txt` (commit, flags,
+toolchain) and `QUICKSTART.txt`. They need:
 
 - **GPU:** the engine is compiled for sm_86 (RTX 30-series; tested on an RTX 3090) and needs at least 80 SMs for more
   than 4 drafts. Compute capability 8.9 GPUs (RTX 40-series) can run sm_86 code but are untested; RTX 50-series
@@ -175,14 +175,15 @@ hf download unsloth/Qwen3.8-27B-GGUF Qwen3.8-27B-UD-Q4_K_XL.gguf mmproj-BF16.ggu
 - **Every GPU check in one run:** `scripts/gate.sh -m <gguf> --record <dir>` on a build you trust keeps its outputs in
   `<dir>` as a reference; `scripts/gate.sh -m <gguf> --ref <dir>` on the next build runs the same checks and requires
   every output to equal the reference's (`make gate MK_MODEL=<gguf> GATE_ARGS="--ref <dir>"` builds first). It runs
-  `make check`, the exactness checks below, MK_EXACT=1 with a prefill cap below two staging slots, sampled CLI runs at 0 and
-  7 drafts (with a presence penalty and a draft-chain policy), the four bench prompts' greedy ids at 0, 4 and 7 drafts,
-  parallel slots against solo runs (`bench/slots_bench.py`: 4 and 2 slots, the MTP window, a slot prefilled between the
-  others' steps) and their sampled outputs, the C API checks (`scripts/capi_checks.py`: errors, roll-backs and
-  out-of-memory kept inside the free VRAM), and with `--kld-ref <file>` the KL report against llama.cpp; `--model2 <gguf>` adds a second model. Each check prints ok /
-  FAIL / skip and the exit status is 1 if one failed. A reference is kept only if all its own checks passed, and holds
-  for the GPU, driver and model files it was recorded with (the manifest names them; another model is refused). Linux
-  or WSL2, the GPU to itself, about 16 minutes on an RTX 3090.
+  `make check`, the exactness checks below, MK_EXACT=1 with a prefill cap below two staging slots, sampled CLI runs at
+  0 and 7 drafts (with a presence penalty and a draft-chain policy), the four bench prompts' greedy ids at 0, 4 and 7
+  drafts, parallel slots against solo runs (`bench/slots_bench.py`: 4 and 2 slots, the MTP window, a slot prefilled
+  between the others' steps) and their sampled outputs, the C API checks (`scripts/capi_checks.py`: errors, roll-backs
+  and out-of-memory kept inside the free VRAM), and with `--kld-ref <file>` the KL report against llama.cpp;
+  `--model2 <gguf>` adds a second model. Each check prints ok / FAIL / skip and the exit status is 1 if one failed. A
+  reference is kept only if all its own checks passed, and holds for the GPU, driver and model files it was recorded
+  with (the manifest names them; another model is refused). Linux or WSL2, the GPU to itself, about 16 minutes on an
+  RTX 3090.
 - **Kernels without a model:** `make check` builds and runs `bench/wvgemm_bench check` (the tensor-core verify GEMM
   bit-identical at every token count and against fp64 and the engine's dp4a GEMVs, whose code `bench/wv_extract.py`
   copies from `mk_shared.cuh` and `qwen38_mk.cu` first) and `bench/dattn_bench` with `TINV=1` (the decode attention

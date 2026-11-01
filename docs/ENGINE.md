@@ -312,10 +312,10 @@ frame or frame pair is an image (the same M-RoPE positions, so the engine needs 
 - **Wide verify**: the main-pass phases run int8 tensor-core GEMMs over the fragment-ordered weights
   (every lane load one 16-byte LDG of contiguous bytes; integer to float without I2F through a magic-number add), so
   the cost of a verify pass grows little from 1 to 8 rows.
-- **dp4a GEMV with shared activations** (the matrices wide verify does not take: the hybrid types, the MTP block): activations are
-  int8 (per-16/32 scales, as llama.cpp's q8_1), each warp streams 2-4 weight rows at once and reuses every
-  shared-memory activation load across them, so T = 4 costs almost the same memory time as T = 1. Weight loads bypass
-  L1 and are marked L2 evict-first.
+- **dp4a GEMV with shared activations** (the matrices wide verify does not take: the hybrid types, the MTP block):
+  activations are int8 (per-16/32 scales, as llama.cpp's q8_1), each warp streams 2-4 weight rows at once and reuses
+  every shared-memory activation load across them, so T = 4 costs almost the same memory time as T = 1. Weight loads
+  bypass L1 and are marked L2 evict-first.
 - **No launches, few round trips**: activations are re-quantised by the producing phase (including the next RMS norm's
   weight), so consumers only async-copy (`cp.async`) them.
 - **Gated-DeltaNet rollback by lazy replay**: the recurrent state is committed only through the surely-accepted token;
@@ -382,18 +382,18 @@ those waits use a high-resolution waitable timer, since a plain sleep ends at th
   halves, so 12 warps keep 64 fp32 accumulators each and K / V of the next phase load during the MMAs. P V accumulates
   in fp16 per 32-position tile, then in fp32. The q-tiles of the last, partial wave are split along the keys and merged.
   With the q8 cache (default), Q K^T runs on int8 tensor cores straight from the cache (`pk_attn8`): Q is quantized per
-  32 dims like the cache, each 32-dim block's int32 partial is scaled by q scale x k scale, the raw q8 K / V tiles stream
-  through a cp.async ring and V is converted for the next tile while the current one computes (84 TFLOPS-equivalent
-  against the fp16 form's 59 in the microbenchmark at 100K; attention of a 101.6K-token prompt 25.8 s against 38.2 s,
-  no measurable KLD change). With `MK_EXACT=1` the attention works on absolute key segments, so a row does not depend
-  on where its chunk starts.
+  32 dims like the cache, each 32-dim block's int32 partial is scaled by q scale x k scale, the raw q8 K / V tiles
+  stream through a cp.async ring and V is converted for the next tile while the current one computes
+  (84 TFLOPS-equivalent against the fp16 form's 59 in the microbenchmark at 100K; attention of a 101.6K-token prompt
+  25.8 s against 38.2 s, no measurable KLD change). With `MK_EXACT=1` the attention works on absolute key segments, so
+  a row does not depend on where its chunk starts.
 
 ## Limitations
 
 - Specialised to this model's shapes (27B) and the weight types under [The GGUF](#the-gguf) (tested: unsloth's Q4_K_M
   and UD-Q4_K_XL); the loader rejects any other model or type. Tuned and tested on sm_86 (RTX 3090); built for sm_86,
   sm_89 and sm_120 GPUs with 24 GB or more. `make` builds for the installed GPU (`make ARCH=sm_89` to override).
-- More than 4 drafts needs the served build and the q8 KV cache (`--kv q8`; low-bit `MK_KV` presets are fine).
+- More than 4 drafts needs the q8 KV cache (`--kv q8`; low-bit `MK_KV` presets are fine).
 - The decode kernel runs one block per SM and needs at least 80 SMs for more than 4 drafts (50 for up to 4): the
   engine refuses a smaller GPU at load, naming the requirement (an RTX 3090 has 82). On a GPU with more than 128 SMs it
   runs 128 blocks.
@@ -422,7 +422,8 @@ those waits use a high-resolution waitable timer, since a plain sleep ends at th
   the prefill attention
 - `loader.cuh` - the host side of the model load (read-ahead, reusable buffers); `gguf.h` - minimal mmap GGUF reader
 - `capi.cpp` - C API (engine + libllama tokenizer + keep-warm) for `libqwen38mk.so`
-- `server/mk_server.py` - the HTTP server ([SERVER.md](SERVER.md)); `scripts/serve.sh` / `scripts/serve.bat` - the launchers
+- `server/mk_server.py` - the HTTP server ([SERVER.md](SERVER.md)); `scripts/serve.sh` / `scripts/serve.bat` - the
+  launchers
 - `main.cu` - CLI (tokenization via libllama)
 - `compat_win32.h` / `.cpp`, `vision/win32.h` / `.cpp`, `build.ps1` - the native Windows build
 - `draft_vocab_32k.bin` - MTP draft-head token subset (int32 ids)

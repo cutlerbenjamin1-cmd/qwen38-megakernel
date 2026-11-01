@@ -163,14 +163,15 @@ checkpoint saved at the previous generation prompt, and the previous reply is pr
 that re-prefill is what exactness costs. An edit to an earlier message, or to the end of the system prompt, resumes at
 the last checkpoint before the edit.
 
-Prompt processing time of each request (WSL2 server, 120,000-token context, 7 drafts, exact reuse on):
+Prompt processing time of each request (WSL2 server, 120,000-token context, 7 drafts, exact reuse on; the
+[full run](BENCHMARKS.md#full-run-2026-10-30) in BENCHMARKS.md):
 
 | request | q8_0 KV | preset D |
 |---|---|---|
-| follow-up turn of an 11.8k-token chat | 178 ms | 185 ms |
-| edit an earlier message of an 11.7k-token chat | 76 ms | 76 ms |
-| edit the end of a 9.1k-token system prompt | 89 ms | 97 ms |
-| for scale: the 11.6k-token prompt from scratch | 5.98 s | 6.09 s |
+| follow-up turn of an 11.8k-token chat | 176 ms | 184 ms |
+| edit an earlier message of an 11.7k-token chat | 77 ms | 76 ms |
+| edit the end of a 9.1k-token system prompt | 89 ms | 99 ms |
+| for scale: the 11.6k-token prompt from scratch | 5.95 s | 6.06 s |
 
 What exactness costs against appending (exact reuse off; 11.6k-token chat, 7 drafts): a follow-up turn took 167 ms
 against 78 ms, a follow-up that keeps the previous turn's thinking 469 against 86 ms, and edits the same either way.
@@ -423,9 +424,9 @@ MK_AGENTS=4 scripts/serve.sh 8080 0                                        # the
   | UD-Q4_K_XL | preset D' | 2 x 83,840 | 4 x 35,840 |
 
   Slots that need more device memory than is free are refused at startup (the error names both; `MK_SLOT_SPILL=1`
-  skips the check, and a Windows / WSL2 driver's sysmem fallback then puts the rest in system memory). A prompt that does
-  not fit its slot gets the usual 400. The KV cache is q8_0 (`--kv f16` is refused at startup); the
-  presets (`MK_KV`, `MK_KV_WIN`) apply to every slot.
+  skips the check, and a Windows / WSL2 driver's sysmem fallback then puts the rest in system memory). A prompt that
+  does not fit its slot gets the usual 400. The KV cache is q8_0 (`--kv f16` is refused at startup); the presets
+  (`MK_KV`, `MK_KV_WIN`) apply to every slot.
 - **The same replies:** a greedy reply is the one the request gets when it runs alone on the server, bit for bit,
   whatever runs beside it, its follow-up turns included. Each slot decodes as it decodes
   alone, and `--agents` turns on `MK_EXACT` (unless it is set), so a prompt never reuses the rows a slot decoded (their
