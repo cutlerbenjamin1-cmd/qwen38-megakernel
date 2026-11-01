@@ -1,7 +1,8 @@
 // Decode attention microbenchmark: the megakernel's attn_core_t<T, true> (variant 0, the simple q8 / q4 decode attention)
 // against attn_core_q8_t<T> (variant 1, all-q8 slots) and attn_core_q8_t<T, true> (variant 2, attn_core_q8m: q8 or q4 K / V)
 // on a random KV cache: bitwise comparison of the split-K partials (apart, aml), a T-invariance check and the time per call
-// at a given depth. The kernels are verbatim copies spliced out of qwen38_mk.cu (regenerate after changing one).
+// at a given depth. The kernels are the bench's own copies of the decode attention kernels, taken from an older engine
+// (q8 / q4 K / V, T up to 5) and not regenerated automatically: they do not follow changes to the engine's kernels.
 //   nvcc -O3 -arch=sm_86 -std=c++17 -Xptxas -dlcm=cg -Xptxas -v dattn_bench.cu -o dattn_bench
 //   ./dattn_bench <n> <T> <reps> 0 1 2    (positions 0 .. n-1 cached, T new rows at n .. n+T-1; TINV=1 checks T-invariance)
 //   exit status 1 when a variant's partials differ from the first variant's or a T-invariance check fails (`make check`)
@@ -84,7 +85,7 @@ __constant__ LayerW cWL;
 __constant__ Bufs cB;
 extern __shared__ __align__(16) uint8_t smem[];
 
-// ===== verbatim from qwen38_mk.cu =====
+// ===== the bench's copies of the decode attention kernels (from an older qwen38_mk.cu, not kept in step) =====
 __device__ __forceinline__ float wsum(float v) {
 #pragma unroll
     for (int o = 16; o > 0; o >>= 1) v += __shfl_xor_sync(0xffffffffu, v, o);
@@ -949,7 +950,7 @@ __device__ __forceinline__ void attn_core_q8_t(const LayerW & W, int slot, int n
     }
 }
 
-// ===== end of verbatim part =====
+// ===== end of the copied kernels =====
 
 // ===== driver =====
 
