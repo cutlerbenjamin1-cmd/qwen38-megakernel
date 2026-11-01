@@ -767,8 +767,8 @@ __global__ void __launch_bounds__(A2_NT, 1) pk_attn8(int T, int n0, int slot, in
         }
     }
     // this slot's q8_0 K / V through the MK_KV slot pointers (as pk_attn2): slots are packed in kc / vc, so with a q4
-    // slot before this one the uniform [slot][head][ctx][HD] offset lands in another slot's rows (C3a); for an all-q8
-    // cache kvp / kvs give exactly the old addresses
+    // slot before this one the uniform [slot][head][ctx][HD] offset lands in another slot's rows; for an all-q8
+    // cache kvp / kvs give exactly the [slot][head][ctx][HD] addresses
     // Per tile (kv_src): the slot's main buffer (K q8 or q4..q7, expanded to int8 in its stage by kv_tile_expand during the
     // previous tile; V q8 or q4..q7, converted to fp16 by a8_cv_v) or, with MK_KV_WIN, the q8 ring for tiles at positions
     // >= wsr. kbt(it) / vbt(it) = the K / V format of tile it.

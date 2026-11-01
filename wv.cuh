@@ -1,6 +1,6 @@
 // wv: int8 tensor-core verify GEMM (mma.m16n8k32, tokens on N) for the main-pass GEMV phases (MK_WV builds).
-// Included by qwen38_mk.cu inside its anonymous namespace, after the dp4a phases. Port of the bench kernel
-// megakernel/bench/wvgemm_bench.cu @ exp-wvgemm 5e653f7 (k_wv<TYPE, T, X16, PF = 0>, -DWV_TILEMAJ=2), which checks
+// Included by qwen38_mk.cu inside its anonymous namespace, after the dp4a phases. Counterpart of the bench kernel
+// bench/wvgemm_bench.cu (k_wv<TYPE, T, X16, PF = 0>, -DWV_TILEMAJ=2), which checks
 // T = 1..8 bit-identical per row and errors vs fp64 at fp32-rounding level.
 //
 // A warp computes a 16-row tile (thread (g, tq): rows g, g + 8) x 8 tokens (one C column per token) per MMA over a K
@@ -172,7 +172,7 @@ template <> struct WV<T_Q8_0> { // repacked: per unit 32 B (A 16 | B 16); fp16 d
         const uint8_t * rp = wv_tblk(m, tile, row, sb, 256);
         r.d = ldw4(wv_tmeta(m, tile, row, sb, 16));
 #if MK_K6_LD
-        // (stock2 K6_LD) q[k] = the 8 bytes at 32 (2 kk + (tq >> 1)) + 16 kb + 8 (tq & 1), k = 2 kk + kb. The lane pair tq = 2 h,
+        // (MK_K6_LD) q[k] = the 8 bytes at 32 (2 kk + (tq >> 1)) + 16 kb + 8 (tq & 1), k = 2 kk + kb. The lane pair tq = 2 h,
         // 2 h + 1 shares the 32-B sector 2 kk + h: the even lane loads its bytes 0-15 (its kb 0 | the odd lane's kb 0), the odd
         // lane 16-31 (the even lane's kb 1 | its kb 1); one exchange of 8 bytes completes both: whole sectors, half the loads.
         const bool odd = tq & 1;
@@ -199,7 +199,7 @@ template <> struct WV<T_Q8_0> { // repacked: per unit 32 B (A 16 | B 16); fp16 d
 };
 
 #if MK_MAXT > 5
-// Offset types (MK_MAXT > 5: every main-layer ffn_down is on wv, these too), bench WV<..> ported: tile-major whole value
+// Offset types (MK_MAXT > 5: every main-layer ffn_down is on wv, these too): tile-major whole value
 // blocks (16 x BS bytes per unit) and a tile-major meta stream (Q6_K / Q3_K: the loader's 36-B block pairs, IQ3_S: 16 B per
 // block). Values are fed with offset 32 (MIN 2: the accumulator input is MAGIC - 32 qsum, wv_fill's min2 mx), so the
 // weight is fA q'. Q6_K / Q3_K carry per-16 scales (S16): split MMAs only (X16), where h = tq >> 1 is the thread's chunk.
@@ -260,7 +260,7 @@ template <> struct WV<T_Q6K> {
 //   [2336, 3360) qhi: 4 groups p x 256 B, lane l: {row g H | row g + 8 H}; byte m of H = the high 2 bits of element 4 tq + m
 //                of (sub-block, chunk) (2p, 0) at bits 4-5, (2p + 1, 0) at 6-7, (2p, 1) at 0-1, (2p + 1, 1) at 2-3
 // Thread tq supplies elements 4 tq .. + 3 of both 16-chunks of each sub-block (11 coalesced loads per unit; the TM layout
-// took 26 loads of 4-8 B). Two MMA forms on it, bit-identical to each other and to the TM split path (the same exact integer
+// takes 26 loads of 4-8 B). Two MMA forms on it, bit-identical to each other and to the TM split path (the same exact integer
 // 16-chunk sums, the same float sequence per (row, token, chunk), chunk 0's and chunk 1's sums added last):
 //   X16 (ffn_down's q16 activations): split m16n8k32, chunk 0 in k-slots 0-15 and chunk 1 in 16-31, B column n = token n & 3
 //   of chunk n >> 2 (the split md / mx tables of the X16 fill);
@@ -812,8 +812,8 @@ __device__ __forceinline__ WvAcc<WvCfg<T, X16>::NG> wv_tile_any(const Mat & m, i
 }
 
 #if MK_MAXT > 5 && MK_WV_OUT
-// MK_WV_OUT's out role (offset types only): its own wv_tile instances (ROLE 1). Sharing ffn_down's made ptxas re-split the
-// registers around those calls: ffn_down's resid_wv<8, true> spilled 16 / 40 -> 60 / 228 B and ran slower (spill track)
+// MK_WV_OUT's out role (offset types only): its own wv_tile instances (ROLE 1). Sharing ffn_down's makes ptxas re-split the
+// registers around those calls (ffn_down's resid_wv<8, true> then spills 60 / 228 B instead of 16 / 40)
 template <int T>
 __device__ __forceinline__ WvAcc<WvCfg<T, true>::NG> wv_tile_off(const Mat & m, int tile, int sb0, int nsb, const WvXS & xs) {
     switch (m.type) {
@@ -855,7 +855,7 @@ __device__ __forceinline__ LaneT<T> rows16_dp(const Mat & m, int j) {
     }
 }
 
-// out / ssm_out not in the wv layout: dp4a resid32 (T <= 5: any type, as before; T >= 6: only the hybrid types remain)
+// out / ssm_out not in the wv layout: dp4a resid32 (T <= 5: any type; T >= 6: only the hybrid types)
 template <int T, int IT>
 __device__ __forceinline__ void resid_dp(const Mat & W, const QBuf & in, float * x, bool add, const float * wnext, uint8_t * sm) {
     if constexpr (T <= 5) {
@@ -929,12 +929,12 @@ __device__ __noinline__ void dn_proj_wv(const LayerW & W, int dl, int n, int dn_
     const float * s_rs = misc(nullptr);
     float * conv = cB.conv + (size_t) dl * CONV_RING * QKV;
     const int n_ab = AB_SPLIT * 2 * NVH;
-    // alpha / beta items. Upstream's dealing (gwarp: warps 0-3 (+ 4) of every block) put them on warps that also take a
-    // qkv / z tile below (tiles start at warp NW - 1 going down): those warps finished ~10 us after the others (stockfix K1).
+    // alpha / beta items. Upstream's dealing (gwarp: warps 0-3 (+ 4) of every block) puts them on warps that also take a
+    // qkv / z tile below (tiles start at warp NW - 1 going down), so those warps finish after the others.
     // K1 (cB.k1, every matrix of the phase in the wv layout): block b takes the items [n_ab b / G, n_ab (b + 1) / G) and
     // deals them round-robin to its warps with one tile fewer than the others (warps 0 .. NW - 1 - nb % NW, nb = the block's
     // tiles: at 82 blocks the 3-4 warps without a tile, <= 2 items each). Each item computes the same row / K-chunk as
-    // before: bit-exact.
+    // with upstream's dealing: bit-exact.
     int ab0 = gwarp(), ab1 = n_ab, astep = nwarps();
     if (cB.k1 && W.qkv.fm && W.gate.fm) {
         constexpr int NTL = QKV / 16 + VD / 16; // (the tile space below when both are FM)
@@ -1036,7 +1036,7 @@ __device__ __noinline__ void dn_proj_wv(const LayerW & W, int dl, int n, int dn_
     }
 }
 
-// stock2 K6 (MK_K6 bit 4, EXACT): rows 16 lt + 8 rh .. + 7 of Q8_0 k / v tile lt (w = 1 k, 2 v), the whole K. The thread
+// K6 (MK_K6 bit 4, EXACT): rows 16 lt + 8 rh .. + 7 of Q8_0 k / v tile lt (w = 1 k, 2 v), the whole K. The thread
 // loads only its row g + 8 rh (half the tile's bytes per warp) and feeds it as both MMA rows (g and g + 8): an MMA row's
 // int32 sums and its scale use only that row's data, so the C values of the first row (c < 2) are bit-identical to the
 // whole tile's values of that row; the duplicates (c >= 2) are dropped. Same store as wv_store.
@@ -1087,7 +1087,7 @@ __device__ __noinline__ void attn_proj_wv(const LayerW & W, int slot, int n, boo
     }
     if (!W.v.fm) gemv_pairs_dp<T, 5>(W.v, lo, lo + KVD / 2, PairOut{cB.vbuf, KVD, -1});
     const int nq = W.q.fm ? QG / 16 : 0, nk = W.k.fm ? KVD / 16 : 0, nv = W.v.fm ? KVD / 16 : 0;
-    // stock2 K6: items = the q tiles, then the k tiles, then the v tiles; with bit 4 a Q8_0 k / v tile (87 KB vs 56 KB for a
+    // K6: items = the q tiles, then the k tiles, then the v tiles; with bit 4 a Q8_0 k / v tile (87 KB vs 56 KB for a
     // Q5_K q tile: the phase's tail in the 10 Q8_0-v layers) is 2 items of 8 rows each (attn_kv_rh, exact). Dealing:
     // contiguous runs per block (upstream), or with bit 2 item i -> block i % G (the heavy k / v items spread over the blocks)
     const int k6 = cB.k6, ks = (k6 & 4) ? 2 : 1;
@@ -1320,7 +1320,7 @@ __device__ __noinline__ void resid_wv(const Mat Wm, const QBuf in, const float *
             __threadfence();
             const int j = tile >> 1, row = 32 * j + lane;
             if (cB.k2) {
-                // K2 (stockfix): the loop below made one dependent L2 round trip (+ q32_store's shuffle chains) per token,
+                // K2: the K2-off loop below makes one dependent L2 round trip (+ q32_store's shuffle chains) per token,
                 // serially. Here a batch of TB tokens issues all its partial / residual loads first, then runs the tokens'
                 // epilogues (independent: their shuffle chains interleave). Same per-element order (((p0 + p1) + p2) + p3)
                 // + x: bit-exact.

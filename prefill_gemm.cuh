@@ -149,7 +149,7 @@ template <> struct HT<TQ3K> { static constexpr int SR = 48, NS = 4; static const
 template <> struct HT<TIQ3S> { static constexpr int SR = 48, NS = 4; static constexpr bool SEP = true; };
 // Per-super-block bytes that the 4 stages of a super-block share (Q5_K: header 16 + qh 32 B per row) go to a double buffer
 // (SBB, by super-block parity) once per super-block instead of into every stage: Q5_K's stage is then 32 B per row, so it
-// gets 4 stages like the 48-B types (3 before: 2-5% slower). R: bytes per row, NC: 16-B chunks per row.
+// gets 4 stages like the 48-B types. R: bytes per row, NC: 16-B chunks per row.
 template <int TYPE> struct SBT { static constexpr int R = 0, NC = 0; };
 template <> struct SBT<TQ5K> { static constexpr int R = 48, NC = 3; };
 constexpr int HCH = 2; // stages accumulated in fp16 before adding to the fp32 accumulators
@@ -159,13 +159,13 @@ constexpr int HMI = 1, HWR = 16 * HMI, HNWM = BM / HWR; // warp tiles: 8 warps o
 // not depend on which other tokens share the CTA), so every NB gives bit-identical results.
 template <int NB> __host__ __device__ constexpr int hm_x() { return NB * 128; } // activation tile per stage: NB tokens x 64 halves, 16 B chunks XOR-swizzled
 template <int TYPE, int NB = BN> __host__ __device__ constexpr int hm_stage() { return HT<TYPE>::SR * BM + hm_x<NB>(); }
-// (A deeper cp.async pipeline for the narrow tiles, up to 8 stages, measured no faster.)
+// (A deeper cp.async pipeline for the narrow tiles, up to 8 stages, is no faster.)
 // At NB = 32 every type fits two CTAs per SM (<= 48 KB smem, <= 96 registers), at NB = 64 / 128 one.
 // Per-stage mbarriers (MBL) instead of the per-stage CTA barrier: full[b] completes when the 256 threads' copies of the
 // stage in buffer b have landed (cp.async.mbarrier.arrive), empty[b] when the 8 warps are done reading it; the copies run
-// two stages ahead (not three), so a warp waits for the others only to reuse the buffer of two stages back. Measured per
-// kernel: Q6_K, Q3_K, IQ3_S and these mixed-type gate / up pairs 1.5-8% faster; Q4_K, IQ4_XS and Q8_0 1-5%
-// slower (Q5_K / IQ4_NL: pf_wown). Needs 4 stages; MBB bytes at the end of the dynamic shared memory.
+// two stages ahead (not three), so a warp waits for the others only to reuse the buffer of two stages back. Per
+// kernel: faster for Q6_K, Q3_K, IQ3_S and these mixed-type gate / up pairs, slower for Q4_K, IQ4_XS and Q8_0
+// (Q5_K / IQ4_NL: pf_wown). Needs 4 stages; MBB bytes at the end of the dynamic shared memory.
 __host__ __device__ constexpr bool pf_mbl(int tg, int tu, bool mix) {
     if (!mix) return tg == TQ6K || tg == TQ3K || tg == TIQ3S;
     return (tg == TQ4K && (tu == TQ5K || tu == TIQ4)) || (tg == TIQ4 && (tu == TQ4K || tu == TQ3K)) ||
@@ -211,9 +211,8 @@ __device__ __forceinline__ unsigned h2u(__half2 h) { return *reinterpret_cast<un
 // order is the thread order of rawq (lane l = 4 g + t4: rows g / g + 8, elements 4 t4 .. + 3 of each 16-chunk), so rawq
 // reads one 16-B and one 8-B word and builds the same wd words as from the row-major stage: exact.
 
-// The MMA group (0-3) of a stage after which the next stage's scales + fragments are made (pipelined step): measured per
-// kernel on the microbenchmark (launcher layouts, 1024 tokens; groups 1 vs 2 differ by up to 4%; re-measured with
-// 4-stage Q5_K, pf_wown and pf_mbl: Q4_K GLU 1).
+// The MMA group (0-3) of a stage after which the next stage's scales + fragments are made (pipelined step): tuned per
+// kernel on the microbenchmark (launcher layouts, 1024 tokens).
 __host__ __device__ constexpr int frag_g(int tg, int tu, bool glu, bool mix) {
     if (MK_PF_FRAG_G >= 0) return MK_PF_FRAG_G;
     if (!mix) return tg == TQ5K || tg == TQ80 || (tg == TIQ4 && !glu) || (tg == TQ4K && glu) ? 1 : 2;
@@ -221,8 +220,8 @@ __host__ __device__ constexpr int frag_g(int tg, int tu, bool glu, bool mix) {
 }
 // Warp-owned weight copies (HalfW OWN): each warp copies the weight bytes of its own 16 rows (the only ones it reads), so a
 // warp-level wait covers them and the CTA barrier is needed for the activation tiles only, which are then copied in pairs:
-// one barrier per two stages instead of one per stage. Measured per kernel: Q5_K and IQ4_NL GEMMs (plain and
-// the Q5_K fused gate / up) 4-5% faster; Q4_K, IQ4_XS, Q6_K, Q3_K, IQ3_S and the mixed-type kernels 1-14% slower: they keep
+// one barrier per two stages instead of one per stage. Faster for the Q5_K and IQ4_NL GEMMs (plain and
+// the Q5_K fused gate / up); slower for Q4_K, IQ4_XS, Q6_K, Q3_K, IQ3_S and the mixed-type kernels, which keep
 // the per-stage barrier. Needs the 4 cp.async stages of the same-type kernels.
 __host__ __device__ constexpr bool pf_wown(int t, bool mix) { return !mix && (t == TQ5K || t == TIQ4NL); }
 
@@ -800,11 +799,11 @@ __global__ void __launch_bounds__(256, 1)
 #pragma unroll
     for (int G = 0; G < 4; G++) xo[G] = xl + (((2 * G + ((lane >> 3) & 1)) ^ (lane & 7)) << 4);
 
-    // Software pipeline (S4): a stage's MMAs use fragments made during the previous stage, and the next stage's
+    // Software pipeline: a stage's MMAs use fragments made during the previous stage, and the next stage's
     // scales + fragments are made between this stage's MMAs (the warp's own rows: scales -> fragments needs only
     // __syncwarp). ch: the fp16 sums of the current 128-k group; they go into acc at the start of the next group
     // (interleaved with its first MMAs) and after the loop. ch starts at 0, so the first add is 0 + 0 (exactly 0):
-    // every acc element gets the same sequence of fp32 adds as before.
+    // every acc element gets the same sequence of fp32 adds as without the pipeline.
     static_assert(HCH == 2, "pipelined step: fp16 groups of two stages");
     unsigned ch[HMI][HNI][2];
 #pragma unroll

@@ -120,8 +120,7 @@ class MKEngine {
     void prefill_progress(int * done, int * total) const;
     // Runs one verify+draft cycle; appends 1..n_draft+1 accepted tokens to `out`.
     int step(std::vector<int> & out);
-    // Debug helper: copy of the last main-model logits row selection (argmax ids) is not kept;
-    // instead expose the final normalised hidden row of the last processed position.
+    // Debug helper: the final normalised hidden row of the last processed position (the logits are not kept).
     std::vector<float> last_hidden();
     // Test helper (exact-reuse probes): 64-bit digests of the sequence state, layout in qwen38_mk.cu (state_digest).
     std::vector<unsigned long long> state_digest();

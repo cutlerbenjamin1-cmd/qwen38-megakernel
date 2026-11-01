@@ -84,12 +84,12 @@ extern char ** environ; // (state files: the MK_* settings in the key)
 #define MK_DA_Q4 1
 #endif
 // MK_WV=1: the main-pass GEMV phases run the int8 tensor-core verify GEMM (wv.cuh) on a load-time fragment-ordered
-// tile-major weight layout, at every T (T-invariant, not bit-identical to the dp4a GEMV). Default 0: today's dp4a path.
+// tile-major weight layout, at every T (T-invariant, not bit-identical to the dp4a GEMV). Default 0: the dp4a path.
 #ifndef MK_WV
 #define MK_WV 0
 #endif
 // MK_WV_FMK (default 1): Q4_K / Q5_K main-pass matrices fragment-ordered like IQ4_XS. 0: tile-major whole blocks (the
-// prefill reads whole 16-B chunks, but decode loses: -d 0 -5.8%, -d 4 +-0 vs dp4a instead of +3% / +7%)
+// prefill reads whole 16-B chunks, but decode is slower)
 #ifndef MK_WV_FMK
 #define MK_WV_FMK 1
 #endif
@@ -123,7 +123,7 @@ extern char ** environ; // (state files: the MK_* settings in the key)
 // drops Q5_K, Q8_0, IQ4_NL (and Q6_K with MK_WV_Q6F): ~185 k SASS instructions of mk_cycle's tree (ptxas time and
 // memory). The loader refuses any matrix these kernels would not read.
 #define DP4A_NARROW (MK_WV && MK_MAXT > 5)
-// MK_GSYNC (stockfix K4): the grid barrier's form. 0 (default): upstream's (every block's thread 0 red.release-adds one word
+// MK_GSYNC: the grid barrier's form. 0 (default): upstream's (every block's thread 0 red.release-adds one word
 // and ld.acquire-polls that same word). 1: flag broadcast with relaxed polling (arrivals atom.acq_rel-add the count word;
 // the last arriver st.release-writes the generation to a separate "go" line; the others poll go with ld.relaxed and re-read
 // it with ld.acquire once it is reached). 2: flag broadcast, ld.acquire polling. 3: upstream's arrival, relaxed polling.
@@ -132,7 +132,7 @@ extern char ** environ; // (state files: the MK_* settings in the key)
 #ifndef MK_GSYNC
 #define MK_GSYNC 0
 #endif
-// MK_K5 (k5, LEAD 4, compile-time; 0 = default = the code without it): the dn_proj -> dn_core grid barrier becomes a split
+// MK_K5 (compile-time; 0 = default = the code without it): the dn_proj -> dn_core grid barrier becomes a split
 // barrier (k5_arrive after dn_proj, k5_wait inside dn_core) and the 48 heads go to the first 48 blocks to finish dn_proj,
 // which load the head's state and replay its accepted drafts (inputs of earlier launches) before the wait. Bitwise exact.
 #ifndef MK_K5
@@ -141,40 +141,35 @@ extern char ** environ; // (state files: the MK_* settings in the key)
 #if MK_K5 && MK_GSYNC != 0
 #error "MK_K5 needs MK_GSYNC=0 (its split barrier is form 0's arrival / poll on the same counter)"
 #endif
-// MK_C1 (review idea C1-I1, compile-time; on in every MK_WV build, 0 = the code without it): the ffn_gu -> ffn_down grid
+// MK_C1 (compile-time; on in every MK_WV build, 0 = the code without it): the ffn_gu -> ffn_down grid
 // barrier becomes per-chunk waits. ffn_down (resid_wv) runs in WV_S split-K chunks of G = gridDim / WV_S blocks, and
 // chunk kc reads only the gate / up tiles 272 kc .. 272 kc + 271; ffn_gu_wv deals exactly those tiles to chunk kc's
 // blocks, each block counts its arrival on the chunk's counter, and resid_wv waits for its own chunk's G arrivals before
 // it reads cB.qa. Bitwise exact (the same tiles and arithmetic; only which block computes a gate / up tile and when
 // ffn_down starts change). Layers whose gate and up are both on dp4a at T <= 5 (ffn_gu: warp-cyclic rows, every block
-// feeds every chunk) keep the barrier. A-B-A 2026-10-20 (served flags, -d 7): decode +0.41% at 38k, +0.59% at 101.6k,
-// +0.44% short; MK_PROFILE ffn_gu + ffn_down -3.3 .. -3.6 us per layer at T 7 / 8.
+// feeds every chunk) keep the barrier.
 #ifndef MK_C1
 #define MK_C1 MK_WV
 #endif
 #if MK_C1 && !MK_WV
 #error "MK_C1 needs MK_WV=1 (the split-K ffn_down it waits in)"
 #endif
-// MK_EGRESS (compete C4's host egress, agent_xdec's e2caa08 bit 2; compile-time, on in every MK_WV build, 0 = the code
+// MK_EGRESS (host egress; compile-time, on in every MK_WV build, 0 = the code
 // without it): block 0 copies
 // the launch's Ctl to a mapped host mirror after the launch's last grid barrier (step() reads the mirror instead of a
 // device-to-host copy), the barrier counts run on across launches (each launch starts from the counts the previous one
 // left, kept in cB.bar words; wrap-safe compares) so launch() zeroes them only once, and dv_add uploads asynchronously
 // from pinned staging on the launch stream. Bitwise exact (no device arithmetic changes). Aimed at the native Windows
-// build (fewer copy-engine switches per launch). Linux A-B-A 2026-10-20 (served flags, -d 7, two timing holds): decode
-// +0.97 / +1.28% at 38k, +0.74 / +1.20% at 101.6k, +1.05 / +1.34% short; in MK_PROFILE the DRAM-bound phases run ~1-2%
-// faster per call too (cause not established; agent_xdec's 10-17 run, with its resid_wv change, saw no change).
-// Native Windows A-B-A 2026-10-20 (same commit, the flag only): +1.0% at 38k, +0.8% at 101.6k, +1.0% short.
+// build (fewer copy-engine switches per launch).
 // +16 B mk_cycle stack frame (+2 MiB local memory).
 #ifndef MK_EGRESS
 #define MK_EGRESS MK_WV
 #endif
-// MK_K2_TB (stockfix K2): tokens per batch of resid_wv's last-arrival combine (their partial loads issued together; 8 beat 4
-// by 0.5-0.8 us per call at 38k, no new spills)
+// MK_K2_TB: tokens per batch of resid_wv's last-arrival combine (their partial loads issued together)
 #ifndef MK_K2_TB
 #define MK_K2_TB 8
 #endif
-// MK_K7 (stock2 K7): the DeltaNet state layout of each head (64 KB, logical S[col][row], col = value, row = key dim).
+// MK_K7: the DeltaNet state layout of each head (64 KB, logical S[col][row], col = value, row = key dim).
 // 0: upstream [col][row]: dn_core's thread (col, quarter r) owns 32 contiguous floats, so a warp's float4 load / store hits
 // 32 lines 512 B apart (16 B of each 32-B sector: 50% sector efficiency). 1: permuted so that dn_core's warp w reads float4 i of
 // its 32 lanes as 512 contiguous bytes: float4 (8 w + i) 32 + lane holds rows 32 r + 4 i .. + 3 of col (lane = 4 (col & 7) + r,
@@ -183,7 +178,7 @@ extern char ** environ; // (state files: the MK_* settings in the key)
 #ifndef MK_K7
 #define MK_K7 1
 #endif
-// MK_K6_LD (stock2 K6, exact): the tile-major Q8_0 wv tile load. 0: eight 8-byte loads per row and super-block (lanes tq 0-1
+// MK_K6_LD (exact): the tile-major Q8_0 wv tile load. 0: eight 8-byte loads per row and super-block (lanes tq 0-1
 // and 2-3 each read half of a 32-B sector; the other half comes with the next k: every sector crosses L2 -> SM twice).
 // 1: four 16-byte loads (whole sectors per lane pair) and one shuffle exchange of 8 bytes per load: the same bytes reach
 // the same registers.
@@ -193,7 +188,7 @@ extern char ** environ; // (state files: the MK_* settings in the key)
 #ifndef MK_K6_DEF // MK_K6's default (env overrides)
 #define MK_K6_DEF 4
 #endif
-// MK_K8 (stock2 K8, prefill small kernels, exact; env bits, default MK_K8_DEF = 6: bit 1 is unmeasured, opt-in): 1 pk_ab on a
+// MK_K8 (prefill small kernels, exact; env bits, default MK_K8_DEF = 6: bit 1 is unmeasured, opt-in): 1 pk_ab on a
 // second stream next to
 // gemm_dn_in, 2 pk_norm_quant keeps x in registers (one read), 4 pk_dn_prep_t: MK_K8_NT tokens per block, conv taps read once
 #ifndef MK_K8_DEF
@@ -207,7 +202,7 @@ extern char ** environ; // (state files: the MK_* settings in the key)
 // the engine, a slot call's slots at their next prompt; the server answers with an HTTP error and keeps serving). A
 // sticky error (the context is unusable: a faulting kernel, illegal address, trap, ECC, ...) cannot be recovered
 // in-process: every later CUDA call fails too, so the process exits with code 4 after the message (the launcher / user
-// restarts it). The library used to exit(1) on every error, which took the server down without an answer.
+// restarts it).
 [[noreturn]] static void mk_cuda_fail(cudaError_t e, const char * expr, const char * file, int line) {
     char msg[768];
     snprintf(msg, sizeof msg, "CUDA error %s at %s:%d: %s", expr, file, line, cudaGetErrorString(e));
@@ -248,7 +243,7 @@ constexpr int MAXT = MK_MAXT;
 // batched launches (parallel slots) wider than a solo pass: RMAX rows over the lanes, the wv phases in K sub-chunk fills
 // (wv.cuh "batched passes wider than MAXT rows"); the row buffers hold RMAX rows
 #ifndef MK_PAR_RMAX
-// (16, 2026-10-28: 16-row passes beat 24-row ones at 3-4 lanes, temp 0.6 n=4 345 vs 322 tok/s, n=3 292 vs 274)
+// (16: 16-row passes are faster than 24-row ones at 3-4 lanes)
 #define MK_PAR_RMAX 16
 #endif
 #define MK_PAR_WIDE (MK_MAXT > 5 && MK_EGRESS && MK_WV && !MK_WV_OUT && MK_PAR_RMAX > MK_MAXT)
@@ -302,8 +297,8 @@ constexpr int AQ_NSKM = 4;            // MIX (low-bit MK_KV slots): K(t) issued 
 #define MK_XP_SM 0 // MIX tile expansion: rows per tile done by the softmax warps (0: all 12 non-S warps round-robin)
 #endif
 #ifndef MK_AQ_EARLY
-#define MK_AQ_EARLY 0 // MIX: 1 = issue the interval's K / V copies at the top of the interval (measured -2% per cycle at 101.6k
-#endif                // vs after the MMA work: the copies' lead time does not limit the MIX kernel; kept as a knob)
+#define MK_AQ_EARLY 0 // MIX: 1 = issue the interval's K / V copies at the top of the interval, 0 = after
+#endif                // the MMA work (the copies' lead time does not limit the MIX kernel)
 constexpr int AQ_LDS = ATP + 4;       // S row stride (floats): the softmax quads of 8 rows hit distinct banks; the pad
                                       // columns 32 .. 34 hold the rows' m, l and alpha (the 99 KB budget with AQ_NSKM)
 constexpr int AQ_STG = ATP * KVQ_ROW; // one K or V ring stage
@@ -348,7 +343,7 @@ struct ModelW {
     const float *enorm, *hnorm, *shnorm, *onorm;
     const uint8_t * embd;
     // MK_DRAFT_Q4: a Q4_K copy of head_d's first dq4_n rows (row r = lm_head row draft_ids[r], DQ4_RB bytes) that the
-    // draft head reads instead; 0 rows: off. Rows past it (tokens dv_add appended) come from lm_head as before.
+    // draft head reads instead; 0 rows: off. Rows past it (tokens dv_add appended) come from lm_head.
     const uint8_t * dq4;
     int dq4_n;
     int embd_t; // token_embd's type: T_Q4K, T_Q6K or T_Q8_0 (ggml rows, embd_rb<type>() bytes)
@@ -439,12 +434,12 @@ struct Bufs {
     float * wvpart;  // wv split-K partial sums [WV_S][MAXT][D] (resid_wv)
     unsigned * wvcnt; // [2][D / 32] arrivals per 32-row group (out, ffn_down); the last arrival resets it to 0
 #endif
-    // stockfix runtime switches (env, read at init; uniform per launch, outside the inner loops; all bit-exact):
+    // runtime switches (env, read at init; uniform per launch, outside the inner loops; all bit-exact):
     int k1;          // K1, MK_K1 (default 1): dn_proj_wv deals the alpha / beta items to the warps without a qkv / z tile
     int k2;          // K2, MK_K2 (default 1): resid_wv's last-arrival combine issues MK_K2_TB tokens' partial loads together
-    // stock2: K6 (MK_K6, bits; attn_proj_wv's dealing, uniform per launch): 2 deal the phase's items across the blocks (item
+    // K6 (MK_K6, bits; attn_proj_wv's dealing, uniform per launch): 2 deal the phase's items across the blocks (item
     // i -> block i % G) instead of in contiguous runs, 4 split each Q8_0 k / v tile into two 8-row items (attn_kv_rh: EXACT).
-    // (Bit 1, a K-split of those tiles, is gone: no gain, not bitwise; the host refuses it.)
+    // (The host refuses bit 1.)
     int k6;
     int * err; // mapped host words, set only on failure: [0] no finite main logit / invalid token, [1] MTP catch-up out of range
 #if MK_EGRESS
@@ -527,7 +522,7 @@ __device__ __forceinline__ int rt_lane(const RowTab & rt, int t, int & r0) {
         }
     return ln;
 }
-// a batched launch's row table, built at each call that takes it (held across the layer loop, its fields stayed live)
+// a batched launch's row table, built at each call that takes it (held across the layer loop, its fields would stay live)
 __device__ __forceinline__ RowTab row_tab(const Launch & P) {
     RowTab rt;
     rt.nl = P.nl;
@@ -822,7 +817,7 @@ __device__ __forceinline__ float * misc(uint8_t * /*sm*/) {
 
 // threadIdx.x read afresh (an S2R the compiler can neither hoist nor CSE): for values derived from the thread index that
 // would otherwise stay live across a long loop. At the 128-register cap ptxas parks such values in spill slots, and a
-// reload after a long gap misses L1 (the W48 item prologue's reload: ~0.3% of a 38k -d 7 cycle's stall samples, spill track)
+// reload after a long gap misses L1 (e.g. the W48 item prologue's reload)
 __device__ __forceinline__ int tid_x() {
     int t;
     asm volatile("mov.u32 %0, %%tid.x;" : "=r"(t));
@@ -1165,8 +1160,8 @@ __device__ __forceinline__ void rows_iq4x(const uint8_t * const (&rp)[R], const 
 
 // IQ4_NL re-laid-out at load into 144-byte blocks of 256 weights (repack_iq4nl): the fp16 scales d of the eight
 // 32-weight blocks, then the 128 index bytes in Q4_K order (as IQ4_XS).  A weight is d * kvalues_iq4nl[index].
-// Same integer products and the same float arithmetic (accR with zero mins) as the Q8_0 path these tensors were
-// re-encoded for before, so the results are bit-identical to it at 0.53x the bytes.
+// Same integer products and the same float arithmetic (accR with zero mins) as a Q8_0 re-encode of these tensors,
+// so the results are bit-identical to it at 0.53x the bytes.
 template <int T, int IT, int R, int XP = 0>
 __device__ __forceinline__ void rows_iq4nl(const uint8_t * const (&rp)[R], const SX & s, float (&acc)[R][T]) {
     const int lane = threadIdx.x & 31;
@@ -1199,14 +1194,14 @@ __device__ __forceinline__ void rows_iq4nl(const uint8_t * const (&rp)[R], const
 // Native Q3_K (repack_q3k): per row a value stream of Q3_BLK = 96 B per 256-block, unit u' = 2p + hh at 8 u' (the 2-bit
 // lows: A's 16 in the first word, B's in the second, element 4j + m at bits 2j of byte m) and its high bits at 64 + 4 u'
 // (byte m: bit j = A element 4j + m, bit 4 + j = B), plus the Q6_K meta stream (sc - 32 as int8, d; Mat::d). A weight is
-// d (sc - 32) (u3 - 4), u3 = lows + 4 high. The GEMV feeds u3 + 28 = the Q6_K value (q + 32) the load-time re-encode
-// stored, with the same scales and the same float arithmetic as rows_q6k: bit-identical to it at 114 / 210 the bytes.
+// d (sc - 32) (u3 - 4), u3 = lows + 4 high. The GEMV feeds u3 + 28 = the Q6_K value (q + 32) of a Q6_K re-encode,
+// with the same scales and the same float arithmetic as rows_q6k: bit-identical to it at 114 / 210 the bytes.
 constexpr int Q3_BLK = 96;
 template <int T, int IT, int R, int XP = 0>
 __device__ __forceinline__ void rows_q3k(const uint8_t * const (&rp)[R], const __half * const (&dp)[R], const SX & s,
                                          float (&acc)[R][T]) {
     const int lane = threadIdx.x & 31;
-#pragma unroll(IT > 8 ? (T >= 5 ? 1 : 2) : IT) // (4 at T < 5 spilled 84-152 B in resid32<1, 17 / 10, Q3_K>)
+#pragma unroll(IT > 8 ? (T >= 5 ? 1 : 2) : IT) // (4 at T < 5 spills 84-152 B in resid32<1, 17 / 10, Q3_K>)
     for (int i = 0; i < IT; i++) {
         const int u = lane + 32 * i, b = u >> 3, p = (u >> 1) & 3, hh = u & 1, w = u & 7;
         int2 lo[R];
@@ -1253,14 +1248,14 @@ __device__ __forceinline__ unsigned iq3s_grid(unsigned idx) { return ldg_l1(g_iq
 // the four grid indices of A (sub-block 2p, indices 4 hh ..) then of B (sub-block 2p + 1)) and its signs at 64 + 4 u'
 // (byte m: bit c = A element 4c + m, bit 4 + c = B), and a meta stream of 16 B per block (Mat::d): qh[8] (byte u': the
 // index high bits, A's in bits 0-3, B's in 4-7) | scales[4] (as in the file: byte p = sub-block 2p | 2p + 1 << 4) | fp16 d
-// | pad. A weight is d (1 + 2 s) (+-grid). As rows_q3k, the GEMV feeds 32 +- grid = the Q6_K value of the load-time
-// re-encode with the same scales and arithmetic as rows_q6k: bit-identical to it at 112 / 210 the bytes.
+// | pad. A weight is d (1 + 2 s) (+-grid). As rows_q3k, the GEMV feeds 32 +- grid = the Q6_K value of a Q6_K
+// re-encode, with the same scales and arithmetic as rows_q6k: bit-identical to it at 112 / 210 the bytes.
 constexpr int IQ3S_META = 16;
 template <int T, int IT, int R, int XP = 0>
 __device__ __forceinline__ void rows_iq3s(const uint8_t * const (&rp)[R], const __half * const (&dp)[R], const SX & s,
                                           float (&acc)[R][T]) {
     const int lane = threadIdx.x & 31;
-#pragma unroll(IT > 8 ? (T >= 5 ? 1 : 2) : IT) // (4 at T < 5 spilled 200-280 B in resid32<*, 17 / 10, IQ3_S>)
+#pragma unroll(IT > 8 ? (T >= 5 ? 1 : 2) : IT) // (4 at T < 5 spills 200-280 B in resid32<*, 17 / 10, IQ3_S>)
     for (int i = 0; i < IT; i++) {
         const int u = lane + 32 * i, b = u >> 3, p = (u >> 1) & 3, w = u & 7;
         int2 qs[R], sd[R];
@@ -1363,7 +1358,7 @@ __device__ __noinline__ void gemv_pairs(const Mat m, int lo, int hi, Out out) {
 // lambda would take the address of the caller's locals and push them to local memory.
 // (mk_cycle's stack frame is the deepest call chain incl. the callees' spills: a spilling GEMV instantiation of any
 // type raises the local memory of the whole kernel, ~0.12 MiB per byte. A second out-of-line switch for the newer types
-// was worse, 816 -> 1232 B.)
+// raises it, 816 -> 1232 B.)
 template <int T, int IT, class Out>
 __device__ __forceinline__ void gemv_pairs_any(const Mat & m, int lo, int hi, Out out) {
     switch (m.type) {
@@ -1506,8 +1501,8 @@ __device__ __forceinline__ const uint8_t * stage_embd_row(int tok, uint8_t * dst
 }
 
 // token embedding rows -> x, plus quantised attn_norm input for layer 0.  Block s of row t handles the 16 units of
-// super-blocks 2s, 2s+1 (one per warp; 10 blocks per row, U_D / 16): a single block per row spent ~12 us in its
-// serial per-unit quantise chain while the grid waited (the row fetch itself is ~free, MK_EMBD_DEVICE A/B)
+// super-blocks 2s, 2s+1 (one per warp; 10 blocks per row, U_D / 16): with a single block per row the grid would wait
+// on its serial per-unit quantise chain (the row fetch itself is ~free)
 constexpr int EMB_UB = 16; // units per embed block
 static_assert(U_D % EMB_UB == 0 && EMB_UB == NW, "embed_prologue: one unit per warp");
 // Grid size (one block per SM): phases that hand one block to each item (embed_prologue U_D / EMB_UB blocks per row,
@@ -1581,13 +1576,13 @@ __device__ __noinline__ void embed_prologue(RowTab rt = RowTab{}) {
 }
 
 // ffn_down (K = FF) whole-K rows out of line (half_rows) at the T of mask bit T: inlined into resid32's item loop,
-// resid32<2..4,17,*> spilled 20-88 B and the phase ran 0.17-0.25 ms per pass slower. T = 5
-// splits K anyway; the K = 5120 / 6144 roles stay inline (out of line they got slower).
+// resid32<2..4,17,*> spills 20-88 B. T = 5
+// splits K anyway; the K = 5120 / 6144 roles stay inline (out of line they are slower).
 #ifndef MK_FD_NOINL
 #define MK_FD_NOINL 0x1c
 #endif
-// T = 5 ffn_down K-half, out of line: inlined, resid32<5,17,*> spilled 136-188 B into this loop. The sums go in and out
-// by value (registers): by reference, resid32's a lived in local memory.
+// T = 5 ffn_down K-half, out of line: inlined, resid32<5,17,*> spills 136-188 B into this loop. The sums go in and out
+// by value (registers): by reference, resid32's a lives in local memory.
 template <int T> struct PairT { float a[2][T]; };
 template <int T, int IT, int TYPE>
 __device__ __noinline__ PairT<T> half_rows(const Mat W, int row0, const SX s, PairT<T> b, int u0) {
@@ -1719,8 +1714,7 @@ __device__ __noinline__ void ffn_gu_q4k(const LayerW & W, uint8_t * /*sm*/) {
         float act[T];
 #pragma unroll
         for (int t = 0; t < T; t++) act[t] = 0.f;
-        // one row per matrix per step at every T: the 2 + 2-row step T <= 2 used to take was slower (T = 1 / 2 ffn_gu
-        // 10.2 / 10.9 -> 9.0 / 9.4 ms per pass on UD-Q4_K_XL, where it spilled)
+        // one row per matrix per step at every T (a 2 + 2-row step at T <= 2 spills and is slower)
         constexpr int RG = 1;
 #pragma unroll 1
         for (int r = 0; r < 16; r += RG) {
@@ -1764,7 +1758,7 @@ __device__ __noinline__ LaneT<T> rows16(const Mat m, int j) {
     const SX sx = make_sx(nullptr, U_D);
 #endif
     const float * s_rs = misc(nullptr);
-    constexpr int R = 2; // at every T (4 rows at T <= 2 spilled 44-160 B and ran 1.1-1.5 ms per pass slower)
+    constexpr int R = 2; // at every T (4 rows at T <= 2 spill 44-160 B)
     LaneT<T> res;
 #pragma unroll
     for (int t = 0; t < T; t++) res.v[t] = 0.f;
@@ -1852,7 +1846,7 @@ __device__ __forceinline__ void store_pair_t(float * base, int stride, int idx, 
 }
 
 #if MK_WV
-// MK_WV builds: one store functor type for every gemv_pairs call site. A lambda per site made one gemv_pairs instance per
+// MK_WV builds: one store functor type for every gemv_pairs call site. A lambda per site would make one gemv_pairs instance per
 // (T, type, site): ~47% of the module's PTX, and ptxas's memory grows with it (> 25 GB for the merged MK_WV build).
 // Rows t of base (or, ring >= 0, the conv ring rows (ring + t) % CONV_RING), scaled by
 // the RMS-norm scale s_rs[t]: the stores of dn_proj's / attn_proj's lambdas, the same values.
@@ -1862,7 +1856,7 @@ struct PairOut {
     template <int T> __device__ __forceinline__ void operator()(int r, const float (&a)[2][T]) const {
         const int lane = threadIdx.x & 31, t = lane >> 1;
         const float * s_rs = misc(nullptr);
-        // selects, not a store per t (merged into a runtime index into a: gemv_pairs' a went to local memory)
+        // selects, not a store per t (merged into a runtime index into a, gemv_pairs' a would go to local memory)
         float v = 0.f;
 #pragma unroll
         for (int k = 0; k < T; k++) v = t == k ? ((lane & 1) ? a[1][k] : a[0][k]) : v;
@@ -2390,7 +2384,7 @@ __device__ __forceinline__ int kv_tbits(int w, int slot, int p0, int ws) {
 __device__ __forceinline__ int kv_wsm(int ws) { return cB.kvrc > 0 ? ws % cB.kvrc : 0; }
 // Per-slot KV format facts, loaded once per launch: the hot kernels then decide a tile's format and source with one integer
 // compare of the tile index against kv_ring_tile (kv_tbits / kv_src per tile cost a uniform-datapath chain with R2UR
-// conversions of the ring pointer right after the tile barrier: 10% of pk_attn8<_, true>'s stall samples).
+// conversions of the ring pointer right after the tile barrier).
 struct KvFmt { int kb, vb, kr, vr; }; // main-buffer bits of K / V; 1 if the side has a q8 ring (MK_KV_WIN)
 __device__ __forceinline__ KvFmt kv_fmt(int slot) {
     return {cB.kvb[0][slot], cB.kvb[1][slot], cB.kvrp[0][slot] != nullptr, cB.kvrp[1][slot] != nullptr};
@@ -2800,7 +2794,7 @@ __device__ __forceinline__ void kv_stage(uint8_t * dst, const int8_t * Kq, const
 // ATT_BUCKET, and the host never lets one launch's rows straddle such a boundary (att_cap_T). So the
 // chunk boundaries below any query position p (and the float summation order of its attention) depend
 // on p alone, not on how many tokens the cycle verifies: greedy output is independent of the draft depth.
-// Same tiles per item as the previous ceil(L / 20) split for L > 1280; one tile per item up to 640.
+// Same tiles per item as a ceil(L / 20) split for L > 1280; one tile per item up to 640.
 __device__ __forceinline__ void attn_dims(int L_ctx, int & nch, int & cs) {
     cs = ATP * max(1, (L_ctx + ATT_BUCKET - 1) / ATT_BUCKET);
     nch = max(1, (L_ctx + cs - 1) / cs);
@@ -2969,7 +2963,7 @@ __device__ __forceinline__ void attn_core_t(const LayerW & W, int slot, int n) {
         float2 rc[2][8];
         load8(W.qn + lane * 8, qw);
         // Unconditional loads (rows >= R and lanes >= 8 load valid, unused data): conditionally assigned arrays
-        // were carried across the item loop in local memory (~1.5 KB of mk_cycle's stack frame, which the driver
+        // would be carried across the item loop in local memory (~1.5 KB of mk_cycle's stack frame, which the driver
         // reserves for all 1,536 thread slots of every SM).
 #pragma unroll
         for (int k2 = 0; k2 < 2; k2++) {
@@ -2984,7 +2978,7 @@ __device__ __forceinline__ void attn_core_t(const LayerW & W, int slot, int n) {
         for (int k2 = 0; k2 < 2; k2++) {
             const int r = warp + 16 * k2;
             if (r < R) {
-                // a copy, not a pointer into qv: a pointer made ptxas keep qv / qw / rc in local memory (~2 KB of
+                // a copy, not a pointer into qv: a pointer makes ptxas keep qv / qw / rc in local memory (~2 KB of
                 // mk_cycle's 2.8 KB stack frame over the 10 attn_core_t instances, reserved for 1,536 threads per SM)
                 float v[8];
 #pragma unroll
@@ -3172,9 +3166,7 @@ __device__ __forceinline__ void attn_core_t(const LayerW & W, int slot, int n) {
 
 // ---------------------------------------------------------------------------------------------------------------------
 // Decode attention on the all-q8 cache: attn_core_t's per-row arithmetic (bit-identical partials, so also T-invariant),
-// restructured for long contexts (one 32-position tile per SM every ~4.8 us before: 5 dependent stages and 5 block
-// barriers per tile, ~290 GB/s of q8 KV at 101k; this kernel: ~600 GB/s for 3-5 query tokens, ~740 GB/s = the DRAM
-// stream rate for 1-2). Microbenchmark: bench/dattn_bench.cu.
+// restructured for long contexts. Microbenchmark: bench/dattn_bench.cu.
 // - Three-deep software pipeline with ONE block barrier per tile: interval j computes S(j) = Q K(j)^T, the online softmax
 //   of tile j - 1 and O = O * alpha + P(j - 2) V(j - 2) on specialised warps, and issues the next copies:
 //     warps 0-3   S for positions 8 w .. 8 w + 7, all row tiles (one K fragment conversion feeds the MT chains)
@@ -3577,7 +3569,7 @@ __device__ __forceinline__ void attn_core_q8_t(const LayerW & W, int slot, int n
                 }
             }
             // ---- copies: K(jt + 2) into the stage of K(jt - 1), V(jt + 1) into the stage of V(jt - 3) (both read in
-            // interval jt - 1), issued by warps 4-15 (the S warps carry the longest MMA chains: -5% per tile at T >= 3);
+            // interval jt - 1), issued by warps 4-15 (the S warps carry the longest MMA chains);
             // then wait for K(jt + 1) and V(jt)
             if (warp >= 4) {
                 if constexpr (MIX) {
@@ -3698,7 +3690,7 @@ __device__ __forceinline__ void kv_slice_expand(uint8_t * st, int wn) {
 }
 
 // T >= 6 (MK_MAXT > 5), MK_W48: decode attention over all R = 6 T <= 48 query rows of a kv head in ONE pass, so K / V are read
-// once (attn_core_q8_t's two head-group passes read them twice: ~+4.5 ms per cycle at 101.6k). Shared memory: 48-row sQ, sS,
+// once (attn_core_q8_t's two head-group passes read them twice). Shared memory: 48-row sQ, sS,
 // sP, 3 K and 3 V stages (99,072 B): V(t) is issued in interval t (not t - 1), lands by the end of t + 1, read in t + 2. MIX:
 // no expansion stage; the consumers expand in place right before use: S warp wn its K rows 8 wn .. 8 wn + 7 of K(jt)
 // (kv_rows_expand, row-local), P V warp wn its dims of V(jt - 2) (kv_slice_expand), both to the biased bytes the MIX
@@ -3725,8 +3717,8 @@ __device__ __forceinline__ void attn_core_w48(const LayerW & W, int slot, int n)
     int nch, CS;
     attn_dims_w(L_ctx, ws, nch, CS);
     // the call's scalars in shared memory, one copy per warp (MK_W48S), read with volatile loads where used: kept in
-    // registers, ptxas spilled them and their reload at each item's start waited on local memory (L2) behind the K / V
-    // stream (~0.3% of a 38k -d 7 cycle's stall samples)
+    // registers, ptxas spills them and their reload at each item's start waits on local memory (L2) behind the K / V
+    // stream
 #if MK_W48S
     if ((threadIdx.x & 31) < 5) {
         const int l = threadIdx.x & 31;
@@ -3761,8 +3753,8 @@ __device__ __forceinline__ void attn_core_w48(const LayerW & W, int slot, int n)
     const KvFmt kf = MIX ? kv_fmt(slot) : KvFmt{8, 8, 0, 0};
 
     for (int item = blockIdx.x; item < NKV * W48_NCH; item += gridDim.x) {
-        // thread indices per item (tid_x): hoisted out of the item loop, their derived offsets were spilled and the
-        // prologue's reload missed L1
+        // thread indices per item (tid_x): hoisted out of the item loop, their derived offsets are spilled and the
+        // prologue's reload misses L1
         const int tid = tid_x(), lane = tid & 31, warp = tid >> 5, g8 = lane >> 2, tig = lane & 3;
         const int nch_ = W48_NCH, g = item / nch_, c = item % nch_;
         int c0, c1;
@@ -4634,8 +4626,8 @@ __device__ __forceinline__ int draft_sample(const Launch & P, const float2 * src
 }
 
 // draft_sample out of line, the launch's sampling fields as values (as sample_targets_ol). Inlined into the five
-// mtp_pass<R>, cicc unrolled its candidate loops and kept the 32 p[j] in registers, ptxas spilled them, and the five
-// spill blocks took disjoint slots of the stack frame (5 x 128 B above the MTP chain)
+// mtp_pass<R>, cicc unrolls its candidate loops and keeps the 32 p[j] in registers, ptxas spills them, and the five
+// spill blocks take disjoint slots of the stack frame (5 x 128 B above the MTP chain)
 __device__ __noinline__ int draft_sample_ol(int top_k, float temp, float top_p, float min_p, unsigned long long seed,
                                             const float2 * src, float2 * dst, unsigned long long pos) {
     Launch S{}; // (the fields draft_sample and cand_probs read)
@@ -4927,8 +4919,8 @@ __device__ __noinline__ void mtp_pass(const Launch & PL, int li, int row0, bool 
     else pos0 = vc->mtp_pos[row0];
 
     // M0: concat(enorm(embed(tok)), hnorm(h_prev)) -> qe.  M0_NB blocks per row: each computes the row's two norms
-    // (the same sums in the same order in every block) and quantises its share of the 2 U_D units (was: one block per
-    // row doing all 320 units, ~20 us while the grid waited)
+    // (the same sums in the same order in every block) and quantises its share of the 2 U_D units (one block doing
+    // all 320 units of a row would keep the grid waiting)
     constexpr int M0_NB = MTP_M0_NB;
     if (blockIdx.x < R * M0_NB) {
         const int r = blockIdx.x / M0_NB, s = blockIdx.x - r * M0_NB;
@@ -5043,9 +5035,9 @@ __device__ __noinline__ void mtp_pass(const Launch & PL, int li, int row0, bool 
 #if MTP_KVC
 // K / V-only MTP catch-up rows (MK_MTP_KVC). Of a cycle's catch-up rows (the accepted drafts + the bonus, R = a + 1) only
 // the last row's MTP output is ever read (write_h_rows keeps the last row: it feeds the draft head and the chain); the
-// other rows are there for their K / V rows in the MTP slot. With R > 5 the catch-up took two full passes (the dp4a
-// ffn_down holds <= 5 rows); now rows 0 .. R - 6 run this pass (M0, eh, the k / v projections, K norm + RoPE + store: the
-// same code and per-row arithmetic as the full pass, hence the same K / V bits) and the last 5 rows the full pass.
+// other rows are there for their K / V rows in the MTP slot. Rows 0 .. R - 6 run this pass (M0, eh, the k / v projections,
+// K norm + RoPE + store: the same code and per-row arithmetic as the full pass, hence the same K / V bits) and the last 5
+// rows the full pass (the dp4a ffn_down holds <= 5 rows).
 // The K / V store runs in the next pass's M0 phase (nothing there reads kbuf / vbuf or the MTP slot): no barrier of its own.
 template <int R>
 __device__ __noinline__ void mtp_kv_pass(int row0, unsigned & epoch) {
@@ -5427,7 +5419,7 @@ __device__ void bench_phase(int which, int layer, uint8_t * /*sm*/, unsigned & e
     }
 }
 
-// K4 (stockfix): n grid barriers of form V (gs_arrive_wait) with no work in between (bench mode, MK_GSB)
+// n grid barriers of form V (gs_arrive_wait) with no work in between (bench mode, MK_GSB)
 template <int V>
 __device__ __noinline__ void gsync_bench(int n) {
     unsigned epoch = 0;
@@ -5906,9 +5898,9 @@ uint16_t f2h_bits(float f) {
     return *reinterpret_cast<uint16_t *>(&h);
 }
 
-// A persistent thread pool for parallel_rows: the loader calls it ~1000 times, and spawning hardware_concurrency()
-// threads per call cost ~0.5 s per load. One job at a time; a call while the pool is busy (another thread's job, or a
-// call from inside a job) runs on threads of its own, as before. Rows go out in chunks from a shared counter (every
+// A persistent thread pool for parallel_rows: the loader calls it ~1000 times, too often to spawn
+// hardware_concurrency() threads per call. One job at a time; a call while the pool is busy (another thread's job, or a
+// call from inside a job) spawns threads of its own. Rows go out in chunks from a shared counter (every
 // row's work is independent; nothing depends on which thread runs it). MK_LOAD_POOL=0: spawn per call.
 class RowPool {
   public:
@@ -6265,7 +6257,7 @@ struct MKEngine::Impl {
     // draft-depth policy (MKEngine::set_policy). Default: up to n_draft drafts, the on-device gate on the running
     // product c_k of the MTP's own top-1 probabilities stops drafting after draft k >= 2 when c_k < 0.4 and drops
     // the 4th draft (the T = 5 verify row) when c_4 < 0.4; sampled drafts when sampling. Tuned on replayed logs
-    // + live A/B. The previous behaviour: "depth=0,drop=0,stop=0,chain=0,h1=0".
+    // + live A/B. Without gates and sampled drafts: "depth=0,drop=0,stop=0,chain=0,h1=0".
     struct Policy {
         int depth = 1;       // 0: n_draft - 1 after a cycle with a rejection (at least 3), 1: always n_draft,
                              // 2: 1 + the accepted count of the last cycle (clamped to [dmin, n_draft])
@@ -6280,8 +6272,8 @@ struct MKEngine::Impl {
         int dctx = INT_MAX;
         // g7 (default on): at depth > 5 (the wide tier T 6-8 costs the same per cycle, a draft there only its ~0.5 ms MTP
         // pass) the gates are stop after drafts 2-4 below 0.25, drop draft 5 below 0.3 (stay at T <= 5), stop after drafts
-        // 5-6 below 0.3, never drop the deepest draft (offline policy search on open-policy logs,
-        // live 38k / 101.6k greedy +1..3% over the gates above, same output). Any explicit stop / drop key turns it off.
+        // 5-6 below 0.3, never drop the deepest draft (from an offline policy search on open-policy logs; greedy output
+        // is unchanged). Any explicit stop / drop key turns it off.
         int g7 = 1;
 #else
         float gate_drop[4] = {0.f, 0.f, 0.f, 0.4f}, gate_stop[4] = {0.f, 0.4f, 0.4f, 0.4f}; // on-device early stop
@@ -6312,7 +6304,7 @@ struct MKEngine::Impl {
     // everything after it down by nx * ny - max(nx, ny). Attention stays causal in sequence order (llama.cpp's 2D mask
     // over (t, h, w) orders a span's rows by raster position, which is their sequence order). Only hb.rope changes: its
     // row n holds the (cos, sin) of position n's rope angles, so the decode and prefill kernels index it by sequence
-    // position as before. rope_base keeps the plain table (row p = position p): every rewritten row is a gather from it.
+    // position (as for text). rope_base keeps the plain table (row p = position p): every rewritten row is a gather from it.
     struct Span {
         int pos, nx, ny;
         bool operator==(const Span & o) const { return pos == o.pos && nx == o.nx && ny == o.ny; }
@@ -6401,8 +6393,8 @@ struct MKEngine::Impl {
     //   (on the device) only before reusing a staging slot and before the MTP part. The scan is split only at points
     //   of its 32-token grid, which changes no arithmetic: saving a checkpoint never changes what the prefill computes.
     //   A position off the grid (the exact ck_at of a chat turn) is saved by a side scan from the grid point before
-    //   it (the state a prefill ending there computes, as the earlier split into two pf_runs did).
-    // - At the end of a prompt (ck_save_end, F9): a device-to-device snapshot into the idle batched-prefill scratch
+    //   it (the state a prefill ending there computes).
+    // - At the end of a prompt (ck_save_end): a device-to-device snapshot into the idle batched-prefill scratch
     //   on stream 0 (~0.4 ms), then the device-to-host copy on ck_sv, which runs under the first decode launch.
     // - Restore: the host-to-device copy runs on ck_st in CK_NG groups of DeltaNet layers, issued once the next
     //   prefill has uploaded its tokens (ck_issue_restore: nothing on stream 0 then queues behind it on the copy
@@ -6410,7 +6402,7 @@ struct MKEngine::Impl {
     //   (pf_run: dn_prep of the group's first layer). Same bytes, same order of use: bit-identical.
     // If the scratch is too small for the end snapshot (MK_PF_CAP below ~640), the end save copies straight from the
     // state and stream 0 waits for it before the state is next modified; below ~340 there are too few staging slots
-    // too, and a checkpoint inside a prompt splits the prefill into two pf_runs around it (the earlier scheme).
+    // too, and a checkpoint inside a prompt splits the prefill into two pf_runs around it.
     static constexpr size_t CK_SL = (size_t) NVH * 128 * 128, CK_CL = (size_t) CONV_RING * QKV; // floats per DeltaNet layer
     static constexpr size_t CK_NS = 48 * CK_SL, CK_NC = 48 * CK_CL, CK_NH = (size_t) H_RING * D;
     static constexpr int CK_NG = 5;
@@ -6469,8 +6461,8 @@ struct MKEngine::Impl {
     cudaEvent_t stg_ev[STG_MAX] = {};
     bool stg_busy[STG_MAX] = {};
 
-    // Allocated at construction: cudaHostAlloc of 0.17 GB takes 0.1-0.5 s under WSL2, which used to land in the
-    // first prompt's time. A pinned slot that fails to allocate ends the pool there (the first: one device slot).
+    // Allocated at construction: cudaHostAlloc of 0.17 GB takes 0.1-0.5 s under WSL2, which would otherwise land
+    // in the first prompt's time. A pinned slot that fails to allocate ends the pool there (the first: one device slot).
     void ck_alloc() {
         const char * cd = getenv("MK_CK_DEVICE");
         ck_dev = cd && cd[0] == '1';
@@ -6979,8 +6971,8 @@ struct MKEngine::Impl {
     // Watchdog. Every wait for the device in the run-time paths goes through wait_device(), which records an
     // event and polls it with a deadline (MK_WATCHDOG: seconds per decode launch, default 60; prefill chunks and
     // checkpoint copies get at least 120 s; 0 = the runtime's plain blocking waits). The CUDA runtime's own waits
-    // never time out: a GPU / driver fault the WSL2 guest is not told about (2026-10-12 04:43, nvlddmkm event 153
-    // on the Windows side, no error in the guest) left the host thread spinning for 33 minutes with an idle GPU.
+    // never time out: after a GPU / driver fault the WSL2 guest is not told about (nvlddmkm event 153 on the Windows
+    // side, no error in the guest) the host thread would spin indefinitely with an idle GPU.
     // The watchdog turns that into a message and exit code 3. The first wd_spin_s of a wait spin (a decode launch
     // finishes in 20-35 ms, so no latency is added); after that it sleeps between polls.
     cudaEvent_t wd_ev = nullptr;
@@ -7163,13 +7155,13 @@ struct MKEngine::Impl {
         CK(cudaMemcpyToSymbol(cW, &hw.dq4_n, sizeof(int), offsetof(ModelW, dq4_n)));
     }
 
-    // MK_REENC3=1: Q3_K and IQ3_S re-encoded to Q6_K at load (the path before native Q3_K / IQ3_S; A/B tests)
+    // MK_REENC3=1: Q3_K and IQ3_S re-encoded to Q6_K at load (instead of their native layouts; A/B tests)
     const bool reenc3 = getenv("MK_REENC3") && atoi(getenv("MK_REENC3")) != 0;
     int n_nat = 0; // Q3_K / IQ3_S tensors repacked to their native layouts
     double nat_s = 0;
     bool iq3s_grid_up = false;
 
-    // The MTP block's source (M3 / M4): the model file; a second GGUF (MKEngine's mtp argument: --mtp FILE, MK_MTP=FILE),
+    // The MTP block's source: the model file; a second GGUF (MKEngine's mtp argument: --mtp FILE, MK_MTP=FILE),
     // whose blk.<NL>.* tensors replace the model file's (its token_embd / output copies are not used: the MTP block shares
     // the model's embedding and lm_head); or none (a file without the MTP layer, or --no-mtp / MK_NO_MTP=1): plain
     // decoding at depth 0, no MTP weights, no MTP KV slot, no draft head.
@@ -7209,7 +7201,7 @@ struct MKEngine::Impl {
         return t == gguf::Q5_K || t == gguf::Q6_K || t == gguf::Q8_0 || t == gguf::Q4_0 || (DP4A_NARROW && t == gguf::IQ4_NL);
     }
     // The MTP block's re-quantisation (~2.5 s of CPU on UD-Q4_K_XL) runs on a background thread from early in the load
-    // (rq_start; MK_LOAD_RQBG=0: inline as before); want() takes its results. Same rows, same calls, same bytes.
+    // (rq_start; MK_LOAD_RQBG=0: inline); want() takes its results. Same rows, same calls, same bytes.
     std::map<std::string, std::vector<uint8_t>> rq_res;
     double rq_s = 0; // the background thread's own time
     struct Joiner {
@@ -7315,8 +7307,8 @@ struct MKEngine::Impl {
     // ---- weight upload ----
     // Every weight goes up through `upl` (loader.cuh Uploader: a worker thread, MK_LOAD_ASYNC=0 synchronous). Tensors the
     // kernels read as stored are copied straight from the GGUF mapping; repacked ones are built in one of two reused host
-    // buffer sets (hset), so the next tensor is prepared while the previous one is copied. The bytes are the same as
-    // before (the repacks write every byte they upload).
+    // buffer sets (hset), so the next tensor is prepared while the previous one is copied. Reusing a set changes
+    // no uploaded byte (the repacks write every byte they upload).
     struct HSet {
         HBuf q, m, o, om;
         uint64_t seq = 0; // last upload reading this set
@@ -7576,7 +7568,7 @@ struct MKEngine::Impl {
     }
     // MK_LOAD_GPURL (default 1): the wv layout made on the device (wv_host.cuh wv_dev_launch, on the upload worker: the
     // pre-wv bytes go to a staging buffer, a kernel writes them re-laid into the matrix's buffer); 0, or a layout / size the
-    // device path does not take: wv_relayout on the host as before. Same bytes either way.
+    // device path does not take: wv_relayout on the host. Same bytes either way.
     const bool gpurl = !(getenv("MK_LOAD_GPURL") && atoi(getenv("MK_LOAD_GPURL")) == 0);
     std::map<int, WvProbe> wv_probes;
     uint8_t * stg_d = nullptr;   // device staging (cudaMalloc, freed after the weights)
@@ -7738,7 +7730,7 @@ struct MKEngine::Impl {
         } upl_halt{upl};
         model_path = path;
         if (file.strs["general.architecture"] != "qwen35") throw std::runtime_error("expected qwen35 architecture");
-        // block_count NLA: the 64 layers + the MTP layer; NL: a conversion without the MTP layer (M3)
+        // block_count NLA: the 64 layers + the MTP layer; NL: a conversion without the MTP layer
         if ((file.ints["qwen35.block_count"] != NLA && file.ints["qwen35.block_count"] != NL) || file.ints["qwen35.embedding_length"] != D)
             throw std::runtime_error("unexpected model dimensions (this kernel is specialised for the 27B)");
         if (ctx > ctx_limit())
@@ -7809,7 +7801,7 @@ struct MKEngine::Impl {
 #endif
         upl.start(!(getenv("MK_LOAD_ASYNC") && atoi(getenv("MK_LOAD_ASYNC")) == 0));
         // token_embd's mapped pinned table (0.7 GB: ~0.8 s under WSL2) allocated by a helper thread while the weights load
-        // (MK_LOAD_PINBG=0: at its turn, as before)
+        // (MK_LOAD_PINBG=0: at its turn)
         const bool embd_dev = getenv("MK_EMBD_DEVICE") && getenv("MK_EMBD_DEVICE")[0] == '1';
         Joiner embd_th;
         cudaError_t embd_err = cudaSuccess;
@@ -8152,7 +8144,7 @@ struct MKEngine::Impl {
                 cudaGetLastError();
                 embd_host = nullptr;
                 hw.embd = dput<uint8_t>(t.data, t.nbytes);
-                wbytes -= t.nbytes; // (not counted as weights, as before)
+                wbytes -= t.nbytes; // (not counted as weights)
             }
         }
         wrec_on = false;
@@ -8583,7 +8575,7 @@ struct MKEngine::Impl {
             for (char * c : p.second.blob.chunks) cudaFreeHost(c);
         for (char * c : sw_blob.chunks) cudaFreeHost(c);
         for (char * c : hs_free) cudaFreeHost(c);
-        if (pf_s2) { // (stock2 K8a)
+        if (pf_s2) { // (MK_K8 bit 1)
             cudaStreamSynchronize(pf_s2);
             cudaStreamDestroy(pf_s2);
         }
@@ -8780,7 +8772,7 @@ struct MKEngine::Impl {
         }
     }
 
-    // K4 (stockfix): grid barrier cost. MK_GSB=N: launches of N barriers with no work (and of 0 barriers: the launch cost) for
+    // grid barrier cost. MK_GSB=N: launches of N barriers with no work (and of 0 barriers: the launch cost) for
     // every gsync form (gs_arrive_wait) at nsm and nsm / 2 blocks, round-robin over the configurations so clock drift hits
     // them alike; per barrier = (median t(N) - median t(0)) / N. MK_GSB_REPS (default 15) rounds; 1.5 s GPU warm-up first.
     void gsync_bench_host(int N) {
@@ -8884,7 +8876,7 @@ struct MKEngine::Impl {
     // ---------------- batched prefill (prefill.cuh) ----------------
     PBufs hp{};
     bool pf_ready = false;
-    // C5: the host enqueues prefill chunk k + 1 before it waits for chunk k (pf_cev); MK_PF_SYNC=1: the token upload of every
+    // the host enqueues prefill chunk k + 1 before it waits for chunk k (pf_cev); MK_PF_SYNC=1: the token upload of every
     // chunk is synchronous and the host waits for each chunk's trunk before its MTP part (the GPU idles for the host's wake-up
     // and launches at both points). MK_PF_GAPS=1: report the GPU's idle time at those points per prefill run.
     bool pf_sync = false, pf_gaps = false;
@@ -8982,7 +8974,7 @@ struct MKEngine::Impl {
         CK(cudaDeviceGetAttribute(&nsm, cudaDevAttrMultiProcessorCount, dev));
         CK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&occ, pk_attn2<true, false>, A2_NT, A2_SMEM));
         a2_slots = nsm * occ;
-        // MK_ATTN=1: the original pk_attn; MK_ATTN_SPLIT=0: no tail split; MK_ATTN_PV16=0: fp32-accumulated P V
+        // MK_ATTN=1: pk_attn; MK_ATTN_SPLIT=0: no tail split; MK_ATTN_PV16=0: fp32-accumulated P V
         // (pk_attn2 with both off is bit-identical to pk_attn)
         if (const char * e = getenv("MK_ATTN")) attn_old = atoi(e) == 1;
         if (const char * e = getenv("MK_ATTN_SPLIT")) attn_split = atoi(e) != 0;
@@ -9008,7 +9000,7 @@ struct MKEngine::Impl {
             CK(cudaFuncSetAttribute(pk_attn8<false, true, true, 6, 5>, cudaFuncAttributeMaxDynamicSharedMemorySize, A8_SMEM));
             CK(cudaFuncSetAttribute(pk_attn8<false, true, true, 5, 5>, cudaFuncAttributeMaxDynamicSharedMemorySize, A8_SMEM));
         }
-        if (k8 & 1) { // stock2 K8a: pk_ab's stream (non-blocking: ordered only by pf_e0 / pf_e1)
+        if (k8 & 1) { // MK_K8 bit 1: pk_ab's stream (non-blocking: ordered only by pf_e0 / pf_e1)
             CK(cudaStreamCreateWithFlags(&pf_s2, cudaStreamNonBlocking));
             CK(cudaEventCreateWithFlags(&pf_e0, cudaEventDisableTiming));
             CK(cudaEventCreateWithFlags(&pf_e1, cudaEventDisableTiming));
@@ -9029,8 +9021,8 @@ struct MKEngine::Impl {
     bool kv_k5v5(int slot) const { return hb.kvb[0][slot] == 5 && hb.kvb[1][slot] == 5; }
     bool attn_old = false, attn_split = true, attn_pv16 = true;
     int attn_s8 = 1;
-    // MK_EXACT: key tiles per absolute attention segment (pk_attn8 EXA). 4096 positions: at 98k (cap 1024) fresh prefill
-    // and restore + 32 / 128 / 512 tokens all faster than 8192 or 16384 (agent_reuse.md, reuse2)
+    // MK_EXACT: key tiles per absolute attention segment (pk_attn8 EXA). 4096 positions (long-context prefills, fresh or
+    // after a restore, are faster than with 8192 or 16384)
     int ex_segt = 128;
     // EXA partials, two buffers: y1 (k, v of the layer, dead after pk_attn_prep) as for a2_plan, then xh (the attention
     // input, dead after the q / k / v GEMMs until pk_attn_out). A slot with a KV window ring runs its chunk in pieces
@@ -9174,7 +9166,7 @@ struct MKEngine::Impl {
     // shapes, microbenchmark). NB 64 / 128 run one CTA per SM (shared memory), NB 32 two (a
     // pair takes 1.77x as long as one CTA). It picks 32 for <= 32 tokens; up to 64 tokens 64, or 32 when the GEMM is
     // narrow (40 row tiles x 2 token tiles still fit one wave); up to 128 tokens 128, or 64 when narrow; above that
-    // mostly 128. Chunks of more than 384 tokens always use 128 (the original kernel).
+    // mostly 128. Chunks of more than 384 tokens always use 128.
     int pf_bn_force = 0; // MK_PF_BN
     int pf_nb(int ntok, int nrt) const {
         if (pf_bn_force) return pf_bn_force;
@@ -9390,7 +9382,7 @@ struct MKEngine::Impl {
     struct PfEv { const char * cat; cudaEvent_t a, b; };
     std::vector<PfEv> pf_ev;
     bool pf_prof = getenv("MK_PF_PROFILE") != nullptr;
-    // stock2 K8 (MK_K8 bits, read at init): 1 pk_ab on pf_s2 (after pf_e0 = the layer's pk_norm_quant; pk_dn_prep waits for
+    // K8 (MK_K8 bits, read at init): 1 pk_ab on pf_s2 (after pf_e0 = the layer's pk_norm_quant; pk_dn_prep waits for
     // pf_e1 = pk_ab), 2 pk_norm_quant1, 4 pk_dn_prep_t
     int k8 = MK_K8_DEF;
     cudaStream_t pf_s2 = nullptr;
@@ -9495,7 +9487,7 @@ struct MKEngine::Impl {
         ck_scr_guard(); // the scratch may still be the source of an end save's copy
         ck_guard_state();
         const int N = (int) toks.size(), cap = hp.cap;
-        // C5: chunk c's GPU work is enqueued before the host waits for chunk c - 1 (its pf_cev event), so the GPU does not
+        // chunk c's GPU work is enqueued before the host waits for chunk c - 1 (its pf_cev event), so the GPU does not
         // idle while the host wakes up and launches; the scoring paths (pred / sink) read results back per chunk
         const bool ahead = !pf_sync && !pred && !sink;
         const int nch = (N + cap - 1) / cap;
@@ -9583,7 +9575,7 @@ struct MKEngine::Impl {
                     pf_time("attn_out", [&] { pk_attn_out<<<T, 256>>>(L / 4); });
                     pf_time("gemm_attn_o", [&] { gemm(W.o, T, hp.x, D, pf::OUT_ADD); });
                 } else {
-                    // stock2 K8a: pk_ab (reads x and rs, writes ab: only pk_dn_prep reads it) on pf_s2 next to the GEMMs, which
+                    // MK_K8 bit 1: pk_ab (reads x and rs, writes ab: only pk_dn_prep reads it) on pf_s2 next to the GEMMs, which
                     // read xh; pk_dn_prep waits for it. (MK_PF_PROFILE: in order on stream 0, so it is timed alone.)
                     const bool k8a = (k8 & 1) && pf_s2 && !pf_prof;
                     if (k8a) {
@@ -9991,8 +9983,8 @@ struct MKEngine::Impl {
         // environment: every MK_* setting except those that only change decode, logging, timing or the load path
         static const char * const skip[] = {"MK_STATE", "MK_POLICY", "MK_PROFILE", "MK_SPEC_LOG", "MK_MEMLOG", "MK_LOADLOG", "MK_LOAD_",
                                             "MK_WDIGEST", "MK_WATCHDOG", "MK_CK_SLOTS", "MK_BENCH", "MK_STACK_LIMIT",
-                                            "MK_K1=", "MK_K2=", "MK_GSB", // (stockfix switches: decode only)
-                                            "MK_K6="};                    // (stock2 K6: decode only; MK_K8 = prefill: kept)
+                                            "MK_K1=", "MK_K2=", "MK_GSB", // (K1 / K2 / gsync bench: decode only)
+                                            "MK_K6="};                    // (K6: decode only; MK_K8 = prefill: kept)
         std::vector<std::string> env;
         for (char ** e = environ; *e; e++) {
             if (strncmp(*e, "MK_", 3)) continue;
@@ -10109,7 +10101,7 @@ struct MKEngine::Impl {
             return false;
         }
         CK(cudaDeviceSynchronize()); // (no copy of an earlier sequence still reading the state)
-        { // read the file in with several threads (cold: ~3 GB/s instead of ~0.2 GB/s for one thread's page faults)
+        { // read the file in with several threads (cold: one thread is bound by its page faults)
             const size_t PC = (size_t) 4 << 20, np = (fsz + PC - 1) / PC;
             std::atomic<size_t> next{0};
             std::atomic<unsigned> sink{0};
@@ -10655,9 +10647,9 @@ struct MKEngine::Impl {
         for (size_t i = na; i < allocs.size(); i++) use_pool ? cudaFreeAsync(allocs[i], 0) : cudaFree(allocs[i]);
         allocs.resize(na);
         alloc_bytes = ab;
-        // trimmed: what the lanes held, and what a failed allocation left reserved (~7.7 GB after a 25.6 GB one failed
-        // part way, outside the VRAM), go back to the device. The next open reusing that remainder at once failed with out
-        // of memory, which the context then kept reporting; 60 s later the same reuse worked.
+        // trimmed: what the lanes held, and what a failed allocation left reserved (several GB after a large one failed
+        // part way, outside the VRAM), go back to the device: an open reusing that remainder at once can fail with out of
+        // memory, which the context then keeps reporting.
         pool_trim();
         cudaGetLastError();
     }
@@ -10725,7 +10717,7 @@ struct MKEngine::Impl {
                                      std::to_string(mk_min_grid(MAXT)) + " SMs (batched passes of " + std::to_string(MAXT) +
                                      " rows); this one has " + std::to_string(nsm) + " (1 slot runs)");
         // a slot's positions: at most the model's context length, also for "the most that fit"; checked before anything is
-        // allocated (100,000,000 positions used to build a 26 GB host RoPE table first)
+        // allocated (100,000,000 positions would otherwise build a 26 GB host RoPE table first)
         const int lmax = ctx_limit();
         if (lctx > lmax)
             throw std::runtime_error("parallel slots: " + std::to_string(lctx) + " positions per slot exceed the model's context length (" +
@@ -10934,8 +10926,8 @@ struct MKEngine::Impl {
         // rows per lane: the lanes' slots (lane_slot: T <= 5, or 8 rows) share RMAX rows (par_wide) or MAXT
         const int rmax = par_wide ? RMAX : MAXT;
         int tcap = rmax / nl >= MAXT ? MAXT : std::min(5, rmax / nl);
-        // two lanes: both in one MAXT-row pass (3 drafts each) beat a wide pass with deeper drafts (Q4_K_M, temp 0.6,
-        // 2026-10-28: 226 vs 183 tok/s total; the wide passes still win at 3 and 4 lanes)
+        // two lanes: both in one MAXT-row pass (3 drafts each) are faster than a wide pass with deeper drafts (the
+        // wide passes are faster at 3 and 4 lanes)
         if (nl == 2) tcap = MAXT / 2;
         Launch L{};
         L.mode = MODE_DECODE;
@@ -11097,7 +11089,7 @@ MKEngine::MKEngine(const std::string & path, int ctx, int n_draft, const std::st
 // dq4=0|1 (MK_DRAFT_Q4=1 only: the draft head reads lm_head / its Q4_K copy; kept until changed);
 // MK_MAXT > 5: dropK / stopK up to K = 7, droplast=F (the deepest draft), dctx=N (from position N on at most 4 drafts),
 // chain=2 (sampled drafts: the chain multiplies each drafted token's probability under q' instead of the top-1's);
-// g7=0|1 (the depth > 5 gates, Impl::Policy); blk=0 only (blk=1, block verification of sampled drafts, was removed);
+// g7=0|1 (the depth > 5 gates, Impl::Policy); blk=0 only (blk=1, block verification of sampled drafts, is refused);
 // "" = defaults
 void MKEngine::set_policy(const std::string & spec) {
     Impl::Policy pol;
@@ -11535,7 +11527,7 @@ void MKEngine::truncate(int len) {
     p_->dv_rebuild(len, p_->spans);
 }
 
-// ---- conversation state in host memory: side requests (TODO #15), parked conversations (#9); Impl "host store" ----
+// ---- conversation state in host memory: side requests, parked conversations; Impl "host store" ----
 static double ms_since(std::chrono::steady_clock::time_point t0) {
     return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
 }

@@ -72,7 +72,7 @@ __device__ __forceinline__ float block_sum256(float v, float * red) {
     return wsum(r);
 }
 
-// ET: token_embd's type (ModelW::embd_t; T_Q4K as before, T_Q6K / T_Q8_0: dequant_embd, the decode path's values)
+// ET: token_embd's type (ModelW::embd_t; T_Q4K, or T_Q6K / T_Q8_0: dequant_embd, the decode path's values)
 template <int ET>
 __device__ __forceinline__ float embd_elem_pf(const uint8_t * row, int e) {
     if constexpr (ET == T_Q4K) return dequant_q4k_ldg(row, e);
@@ -118,7 +118,7 @@ __global__ void __launch_bounds__(256) pk_norm_quant(const float * src, const fl
     }
 }
 
-// stock2 K8b: pk_norm_quant with x read once. Thread tid reads e = tid + 256 i (i = 0 .. D / 256 - 1) in the sum of squares
+// MK_K8 bit 2: pk_norm_quant with x read once. Thread tid reads e = tid + 256 i (i = 0 .. D / 256 - 1) in the sum of squares
 // and, as warp w = tid >> 5 / lane, writes the 32-blocks j = w + 8 i (e = 32 j + lane = the same e): the values stay in
 // registers. Same sums in the same order, same products: bit-identical to pk_norm_quant.
 __global__ void __launch_bounds__(256) pk_norm_quant1(const float * src, const float * w) { MK_VIEW_INIT();
@@ -249,7 +249,7 @@ __global__ void __launch_bounds__(256) pk_dn_prep(int T, int n0, int dl, const f
     }
 }
 
-// stock2 K8c: pk_dn_prep for NT tokens per block (t0 = NT blockIdx.x ..): each thread loads the NT + 3 conv inputs of a
+// MK_K8 bit 4: pk_dn_prep for NT tokens per block (t0 = NT blockIdx.x ..): each thread loads the NT + 3 conv inputs of a
 // channel once (pk_dn_prep's blocks re-read every input row 4 times through L2) and forms the NT outputs with the same
 // expressions (same products, sums and order per element): bit-identical to pk_dn_prep.
 template <int NT>

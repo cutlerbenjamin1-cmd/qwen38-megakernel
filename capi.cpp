@@ -37,7 +37,7 @@
 namespace {
 // ---- keep-warm (MK_KEEP_WARM_S) ----
 // A few seconds without GPU work and the driver drops the clocks (P8); a reply that starts there runs its first ~2 s at
-// ramping clocks (a 255-token reply: ~125 instead of ~200 tok/s). mk_keep_warm(h, 1), which the server calls once ready
+// ramping clocks. mk_keep_warm(h, 1), which the server calls once ready
 // and after every request, keeps a light load on the GPU for MK_KEEP_WARM_S seconds (default 120; 0 = off), then lets
 // the card idle. The driver's power settings stay as they are. Every C API call that runs GPU work stops the load
 // first: the kernel polls a host-mapped stop word and ends within microseconds, so it never runs next to an engine
@@ -45,7 +45,7 @@ namespace {
 // itself), and it touches no engine memory. Programs that never call mk_keep_warm (the CLI, benchmarks, tests) never
 // warm. MK_KEEP_WARM_LOAD = "blocks,threads,on_ms,off_ms,spin" (measurements): kernels of on_ms each (far below WDDM's
 // 2 s timeout) with off_ms without a kernel between them; spin 1 = every thread busy-loops, 0 = one polling thread.
-// Measured on an RTX 3090: the driver keys the P-state to utilization, so only a continuous load holds P2 (a 50% duty
+// On an RTX 3090 the driver keys the P-state to utilization, so only a continuous load holds P2 (a 50% duty
 // cycle sits at P5 with 810 MHz memory, 20% stays at P8), and at P2 it runs full boost whatever the load: the default
 // (one polling thread) draws ~165 W against ~30 W idle, one block spinning ~166 W, every SM ~268 W.
 struct WarmLoad {

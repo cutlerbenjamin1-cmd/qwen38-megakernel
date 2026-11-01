@@ -156,7 +156,7 @@ struct HBuf {
     size_t size() const { return n; }
 };
 
-// Weight uploads on a worker thread (MK_LOAD_ASYNC=0: synchronous cudaMemcpy in the caller, the old path). The worker
+// Weight uploads on a worker thread (MK_LOAD_ASYNC=0: synchronous cudaMemcpy in the caller). The worker
 // copies each piece on its own non-blocking stream and synchronises it, so a source buffer is free again once its
 // sequence number is done(); meanwhile the loader prepares the next tensors in its other host buffer set. A failed copy
 // is raised in the caller's thread at the next put / wait / finish.
