@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# The GPU checks of a build in one command (Linux / WSL2; the GPU to itself, ~30 min):
+# The GPU checks of a build in one command (Linux / WSL2; the GPU to itself, ~16 min on an RTX 3090):
 #   scripts/gate.sh -m <gguf> --record DIR   run every check, keep the outputs in DIR as a reference
 #   scripts/gate.sh -m <gguf> --ref DIR      run every check, and every output must equal DIR's
 #   scripts/gate.sh -m <gguf>                run every check against the build itself only
@@ -102,7 +102,7 @@ run() { timeout -s KILL "$TO" "$@" < /dev/null; }
 leg_benches() {
     make -C "$REPO" check > "$O/benches/make_check.log" 2>&1
     local rc=$?
-    grep -E 'differ|FAIL|T-invariance|bad' "$O/benches/make_check.log" | sed 's/^/   /' | head -20
+    grep -E 'CHECK|FAIL|T must|rror' "$O/benches/make_check.log" | sed 's/^/   /' | head -20
     [ $rc = 0 ] && ok "benches: make check" || fail "benches: make check exit $rc (benches/make_check.log)"
 }
 
@@ -222,7 +222,10 @@ leg_capi() {
     local rc=$? nf np
     nf=$(grep -c '^FAIL' "$l"); np=$(grep -c '^PASS' "$l")
     grep -E '^FAIL' "$l" | sed 's/^/   /'
-    if [ $rc = 0 ] && [ "$nf" = 0 ] && [ "$np" -gt 0 ]; then ok "capi: $np PASS"; else fail "capi: exit $rc, $nf FAIL, $np PASS (capi/capi.log)"; fi
+    local sum
+    sum=$(grep -ho 'CAPI_CHECKS_DONE: .*' "$l" | sed 's/CAPI_CHECKS_DONE: //')
+    if [ $rc = 0 ] && [ "$nf" = 0 ] && [ "$np" -gt 0 ]; then ok "capi: $np checks PASS${sum:+ (cases: $sum)}"
+    else fail "capi: exit $rc, $nf FAIL, $np PASS (capi/capi.log)"; fi
 }
 
 # accuracy against llama.cpp (qwen38_mk --kld): the report itself is checked against the reference's

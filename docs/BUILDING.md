@@ -180,7 +180,7 @@ hf download unsloth/Qwen3.8-27B-GGUF Qwen3.8-27B-UD-Q4_K_XL.gguf mmproj-BF16.ggu
   out-of-memory kept inside the free VRAM), and with `--kld-ref <file>` the KL report against llama.cpp; `--model2 <gguf>` adds a second model. Each check prints ok /
   FAIL / skip and the exit status is 1 if one failed. A reference is kept only if all its own checks passed, and holds
   for the GPU, driver and model files it was recorded with (the manifest names them; another model is refused). Linux
-  or WSL2, the GPU to itself, about 30 minutes.
+  or WSL2, the GPU to itself, about 16 minutes on an RTX 3090.
 - **Kernels without a model:** `make check` builds and runs `bench/wvgemm_bench check` (the tensor-core verify GEMM
   bit-identical at every token count and against fp64 and the engine's dp4a GEMVs, whose code `bench/wv_extract.py`
   copies from `qwen38_mk.cu` first) and `bench/dattn_bench` with `TINV=1` (the decode attention variants bit-identical
