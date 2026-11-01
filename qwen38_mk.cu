@@ -379,6 +379,7 @@ struct Ctl {
     int dsmp; // the drafts in tok[1..] were sampled from q' (cB.dq; speculative sampling with sampled drafts)
     int pad[4];
 };
+static_assert(sizeof(Ctl) % 4 == 0 && sizeof(Ctl) / 4 <= NT, "the ctl egress copies Ctl one 4-byte word per thread of a block");
 
 struct Bufs {
     float *x, *xm;
