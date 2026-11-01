@@ -501,21 +501,21 @@ released or gated, and nothing measured them any more. A `-D` for one of them ha
 | `MK_DA_Q4` | `1` | low-bit `MK_KV` layers on the pipelined decode attention (q4 budgets were 9.8-18.4% faster at 101.6k than on the earlier kernel, 2026-10-12) | same | 6287651, 2026-10-12 |
 | `MK_AQ_EARLY` | `0` | the removed arm issued low-bit decode attention's K / V copies at the top of each interval: 2% slower per cycle at 101.6k (2026-10-13) | same | 5532c21, 2026-10-13 |
 | `MK_XP_SM` | `0` | low-bit tile expansion rows on all 12 non-softmax warps (the removed arm put some on the softmax warps; no speed difference, 2026-10-13) | same | 9deb9c0, 2026-10-13 |
+| `MK_K6_LD` | `1` | Q8_0 weight tiles loaded 16 bytes at a time plus one shuffle: the attention projection of the Q8_0-v layers 96 -> 84 us (2026-10-15) | same | 38d0c26, 2026-10-15 |
+| `MK_W48S` | `1` | the one-pass attention keeps its per-call scalars in shared memory (fewer register spills) | same | 6cc40a7, 2026-10-14 |
+| `MK_MTP_KVC` (the `-D`) | `1` | the K / V-only MTP catch-up rows compiled in; the `MK_MTP_KVC` environment variable still turns them off at run time ([Speculation](#speculation-drafts)) | same | 455017a, 2026-10-14 |
+| `MK_WV_FMK` | `1` | Q4_K / Q5_K main-pass matrices fragment-ordered; `0`: tile-major whole blocks (decode -5.8% at 0 drafts, no gain at 4, 2026-10-13) | not checked | 408fa84, 2026-10-13 |
+| `MK_WV_OUT` | `0` | the removed arm put the out / ssm_out matrices of the offset types (Q3_K, IQ3_S) on the tensor-core path at every T: per cycle +1.4% at 38k, no change at 101.6k (2026-10-14) | changes (KL 0.00116 mixed) | 911d288, 2026-10-14 |
 
 ### Engine -D flags
 
 | Flag | Default | Served | What it does | Output | Status | Since |
 |---|---|---|---|---|---|---|
-| `MK_K6_LD` | `1` | `1` | Q8_0 weight tiles loaded 16 bytes at a time plus one shuffle: the attention projection of the Q8_0-v layers 96 -> 84 us (2026-10-15) | same | served | 38d0c26, 2026-10-15 |
-| `MK_W48S` | `1` | `1` | the one-pass attention keeps its per-call scalars in shared memory (fewer register spills) | same | served | 6cc40a7, 2026-10-14 |
-| `MK_MTP_KVC` | `1` | `1` | compiles the K / V-only MTP catch-up rows (`MK_MTP_KVC` env) | same | served | 455017a, 2026-10-14 |
 | `MK_FD_NOINL` | `0x1c` | `0x1c` | bit mask of the token counts whose ffn_down rows run out of line (T 2-4); inline they spilled and the phase ran 0.17-0.25 ms per pass slower (2026-10-12) | same | served | baf2d52, 2026-10-12 |
 | `MK_NSEQ` | `4` | `4` | the most parallel slots the engine opens (`--agents` 1 to this): the lanes of a batched launch, each with its own views of the row buffers | same | served | f09ef59, 2026-10-28 |
-| `MK_PAR_RMAX` | `16` | `16` | rows of a batched slot pass (16 beat 24 at 3-4 slots: 345 vs 322 tok/s at 4, temperature 0.6, 2026-10-28); with `MK_WV_OUT` or a value up to 8 the passes are 8 rows. The wide pass also needs every main matrix but ffn gate / up in the wide-verify layout and enough SMs | same | served | f09ef59, 2026-10-28 |
+| `MK_PAR_RMAX` | `16` | `16` | rows of a batched slot pass (16 beat 24 at 3-4 slots: 345 vs 322 tok/s at 4, temperature 0.6, 2026-10-28); a value up to 8 makes the passes 8 rows. The wide pass also needs every main matrix but ffn gate / up in the wide-verify layout and enough SMs | same | served | f09ef59, 2026-10-28 |
 | `MK_K2_TB` | `8` | `8` | tokens per batch of the split-K residual combine (8 beat 4 by 0.5-0.8 us per call at 38k, 2026-10-15) | same | option | e374f27, 2026-10-15 |
 | `MK_K6_DEF`, `MK_K8_DEF`, `MK_K8_NT` | `4`, `6`, `4` | same | the defaults of the `MK_K6`, `MK_K8`, `MK_K8_NT` environment variables | - | option | 38d0c26, 2026-10-15 |
-| `MK_WV_FMK` | `1` | `1` | Q4_K / Q5_K main-pass matrices fragment-ordered; `0`: tile-major whole blocks (decode -5.8% at 0 drafts, no gain at 4, 2026-10-13) | not checked | slower | 408fa84, 2026-10-13 |
-| `MK_WV_OUT` | `0` | `0` | the out / ssm_out matrices of the offset types (Q3_K, IQ3_S) on the tensor-core path at every T: +1.4% per cycle at 38k, no change at 101.6k (2026-10-14) | changes (KL 0.00116 mixed) | slower | 911d288, 2026-10-14 |
 | `MK_PF_FRAG_G` | `-1` | `-1` | prefill GEMMs: the MMA group of a stage after which the next stage's scales and fragments are made (`-1`: the kernel's own) | not checked | option | a742642, 2026-10-14 |
 | `MK_PF_NS_IQ4` | `4` | `4` | cp.async stages of the IQ4_XS prefill GEMMs (3 stages were 2-5% slower, 2026-10-14) | not checked | option | e649ad4, 2026-10-14 |
 | `MK_PF_INFCHK` | `0` | `0` | debug build: counts fp16 overflows (inf / NaN, clamps) per prefill GEMM and layer, printed after each prefill; none on 38k and 101.6k prompts (2026-10-17) | same | debug | 73fd978, 2026-10-17 |
@@ -680,7 +680,7 @@ code:
 | `MK_BAR_LT`, `MK_EPOCH`, `MK_C1E` | helper macros of the barrier counters that run on across launches (egress, C1) |
 | `MK_GLU_MIX_PAIRS`, `MK_GLU_ATTR`, `MK_GLU_GO` | macro lists of the fused gate / up weight-type pairs |
 | `MK_STR`, `MK_STR2` | stringify helpers |
-| `MTP_KVC` | derived: `MK_MTP_KVC` and not `MK_KV_EMU` |
+| `MTP_KVC` | derived: not `MK_KV_EMU` (the K / V-only MTP catch-up rows are compiled in) |
 | `MK_STATE`, `MK_LOAD_`, `MK_BENCH` | prefixes in the state-file key's list of ignored variables (`MK_STATE_WARM_MS`, the `MK_LOAD_*` family). No variable named `MK_BENCH...` is read anywhere |
 | `environ` | a Windows compatibility name (`compat_win32.h`) |
 | `_CRT_SECURE_NO_WARNINGS`, `_CRT_NONSTDC_NO_WARNINGS` | MSVC warning switches in `build.ps1` |
