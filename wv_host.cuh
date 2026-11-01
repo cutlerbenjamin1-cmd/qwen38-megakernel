@@ -1,5 +1,5 @@
-// wv host side: load-time re-layout of the main-pass matrices (see wv.cuh). Included by engine.cu inside its
-// anonymous namespace, after parallel_rows.
+// wv host side: load-time re-layout of the main-pass matrices (see wv.cuh). Included by engine_impl.h inside
+// namespace mk, after loader.cuh (parallel_rows).
 #pragma once
 
 // ---- host: load-time re-layout (exact byte permutation of the device layout) --------------------------------------
@@ -8,8 +8,8 @@
 // (meta_n 0). Writes the wv layout to out (N rb bytes; Q6_K: N rb + meta_n bytes with the meta inline) and a
 // re-laid meta stream to out_meta. Returns the bytes left in the meta stream (0: none, or folded into out). N % 16 == 0.
 // out / out_meta must not overlap w / meta. Every output byte is written.
-size_t wv_relayout(int type, int N, int K, int rb, const uint8_t * w, const uint8_t * meta, size_t meta_n, uint8_t * out,
-                   uint8_t * out_meta) {
+inline size_t wv_relayout(int type, int N, int K, int rb, const uint8_t * w, const uint8_t * meta, size_t meta_n, uint8_t * out,
+                          uint8_t * out_meta) {
     const int nb = K / 256;
     if (type == T_Q6K) { // FM Q6_K (wv.cuh "FM Q6_K"): units of Q6F_UNIT bytes, the meta stream inline
         const int mrow = nb * Q6_META;

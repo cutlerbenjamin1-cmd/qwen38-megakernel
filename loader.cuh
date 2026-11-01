@@ -1,8 +1,140 @@
-// Host side of the model load (included by engine.cu inside its anonymous namespace): the phase clock, parallel
-// read-ahead of the GGUF and reusable host buffers. Nothing here changes the bytes the loader produces.
+// Host side of the model load (included by engine_impl.h inside namespace mk): the phase clock,
+// row loop (RowPool), parallel read-ahead of the GGUF and reusable host buffers. Nothing here changes the bytes the loader produces.
 #pragma once
 
-// (<condition_variable>, <memory>, <mutex>: included by mk_shared.cuh at file scope; this header sits inside an anonymous namespace)
+// (<condition_variable>, <memory>, <mutex>: included by mk_shared.cuh at file scope; this header sits inside namespace mk)
+
+// A persistent thread pool for parallel_rows: the loader calls it ~1000 times, too often to spawn
+// hardware_concurrency() threads per call. One job at a time; a call while the pool is busy (another thread's job, or a
+// call from inside a job) spawns threads of its own. Rows go out in chunks from a shared counter (every
+// row's work is independent; nothing depends on which thread runs it). MK_LOAD_POOL=0: spawn per call.
+class RowPool {
+  public:
+    static RowPool & get() {
+        static RowPool p;
+        return p;
+    }
+    bool run(int64_t n, const std::function<void(int64_t)> & f) {
+        if (nth_ <= 0) return false;
+        std::unique_lock<std::mutex> job(job_mu_, std::try_to_lock);
+        if (!job.owns_lock()) return false;
+        {
+            std::lock_guard<std::mutex> l(mu_);
+            fn_ = &f;
+            n_ = n;
+            ch_ = std::max<int64_t>(1, n / (8 * (int64_t) (nth_ + 1)));
+            next_ = 0;
+            active_ = nth_;
+            err_ = nullptr;
+            gen_++;
+        }
+        cv_.notify_all();
+        work();
+        std::exception_ptr err;
+        {
+            std::unique_lock<std::mutex> l(mu_);
+            cvd_.wait(l, [&] { return active_ == 0; });
+            fn_ = nullptr;
+            std::swap(err, err_);
+        }
+        if (err) std::rethrow_exception(err); // (the first row that threw, on any thread)
+        return true;
+    }
+    ~RowPool() {
+        {
+            std::lock_guard<std::mutex> l(mu_);
+            stop_ = true;
+            gen_++;
+        }
+        cv_.notify_all();
+        for (auto & t : th_) t.join();
+    }
+
+  private:
+    RowPool() {
+        const char * e = getenv("MK_LOAD_POOL");
+        nth_ = e && atoi(e) == 0 ? 0 : (int) std::max(1u, std::thread::hardware_concurrency()) - 1;
+        try {
+            for (int i = 0; i < nth_; i++) th_.emplace_back([this] { loop(); });
+        } catch (...) { // (no more threads: the pool is the ones that started)
+            nth_ = (int) th_.size();
+        }
+    }
+    // a row that throws stops the job: no more rows are handed out, run() rethrows its exception
+    void work() {
+        try {
+            for (;;) {
+                const int64_t r0 = next_.fetch_add(ch_);
+                if (r0 >= n_) return;
+                const int64_t r1 = std::min(n_, r0 + ch_);
+                for (int64_t r = r0; r < r1; r++) (*fn_)(r);
+            }
+        } catch (...) {
+            next_.store(n_);
+            std::lock_guard<std::mutex> l(mu_);
+            if (!err_) err_ = std::current_exception();
+        }
+    }
+    void loop() {
+        uint64_t seen = 0;
+        for (;;) {
+            {
+                std::unique_lock<std::mutex> l(mu_);
+                cv_.wait(l, [&] { return gen_ != seen; });
+                seen = gen_;
+                if (stop_) return;
+            }
+            work();
+            {
+                std::lock_guard<std::mutex> l(mu_);
+                active_--;
+            }
+            cvd_.notify_all();
+        }
+    }
+    int nth_ = 0;
+    std::vector<std::thread> th_;
+    std::mutex mu_, job_mu_;
+    std::condition_variable cv_, cvd_;
+    const std::function<void(int64_t)> * fn_ = nullptr;
+    int64_t n_ = 0, ch_ = 1;
+    std::atomic<int64_t> next_{0};
+    int active_ = 0;
+    std::exception_ptr err_; // (under mu_)
+    uint64_t gen_ = 0;
+    bool stop_ = false;
+};
+
+template <class F>
+void parallel_rows(int64_t n, F f) {
+    if (n <= 0) return;
+    const std::function<void(int64_t)> fn = [&](int64_t r) { f(r); };
+    if (RowPool::get().run(n, fn)) return;
+    int nt = std::max(1u, std::thread::hardware_concurrency());
+    std::atomic<bool> stop{false};
+    std::mutex mu;
+    std::exception_ptr err;
+    std::vector<std::thread> th;
+    try {
+        for (int i = 0; i < nt; i++) {
+            th.emplace_back([&, i] {
+                try {
+                    for (int64_t r = i; r < n && !stop.load(std::memory_order_relaxed); r += nt) f(r);
+                } catch (...) {
+                    stop = true;
+                    std::lock_guard<std::mutex> l(mu);
+                    if (!err) err = std::current_exception();
+                }
+            });
+        }
+    } catch (...) { // (a thread could not be created: the started ones are joined before the error goes up)
+        stop = true;
+        for (auto & t : th) t.join();
+        throw;
+    }
+    for (auto & t : th) t.join();
+    if (err) std::rethrow_exception(err);
+}
 
 using lclk = std::chrono::steady_clock;
 inline double lsec(lclk::time_point t) { return std::chrono::duration<double>(lclk::now() - t).count(); }

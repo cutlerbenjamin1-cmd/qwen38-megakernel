@@ -94,8 +94,8 @@ if (& $want "engine") {
     Build-Cu "qwen38_mk.cu" @("mk_shared.cuh", "mk_launch.h", "qwen38_mk.h", "gguf.h", "compat_win32.h", "prefill.cuh",
                               "prefill_gemm.cuh", "prefill_attn.cuh", "wv.cuh", "wv_dev.cuh") "ptxas.log"
     # the host side, same flags (the shared definitions must agree)
-    $hostSrc = @("engine.cu")
-    $hostHdr = @("mk_shared.cuh", "mk_launch.h", "qwen38_mk.h", "gguf.h", "compat_win32.h", "loader.cuh", "wv_host.cuh")
+    $hostSrc = @("engine.cu", "ck_pool.cu", "loader.cu", "prefill_host.cu", "state_files.cu", "host_store.cu", "lanes.cu")
+    $hostHdr = @("engine_impl.h", "mk_shared.cuh", "mk_launch.h", "qwen38_mk.h", "gguf.h", "compat_win32.h", "loader.cuh", "wv_host.cuh")
     foreach ($s in $hostSrc) { Build-Cu $s $hostHdr "" }
     $engineObj = @("build_win\qwen38_mk.obj") + ($hostSrc | ForEach-Object { "build_win\" + [IO.Path]::GetFileNameWithoutExtension($_) + ".obj" })
     Write-Def "capi.cpp" "mk_" "qwen38mk.dll" "build_win\qwen38mk.def"

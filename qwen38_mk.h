@@ -74,11 +74,11 @@ class MKEngine {
     // (a verify row counts the drafts before it). 0, 0 (default): off. The engine's own sequence only: parallel slots
     // never apply them.
     void set_penalty(float presence, float frequency);
-    // Draft-depth policy, "key=value,..." (see qwen38_mk.cu); "" restores the default. The env var
+    // Draft-depth policy, "key=value,..." (see engine_impl.h); "" restores the default. The env var
     // MK_POLICY sets it at construction.
     void set_policy(const std::string & spec);
     // KV-cache quantisation emulation (builds with -DMK_KV_EMU=1; accuracy experiments): the MK_KV_EMU_SPEC syntax
-    // (see qwen38_mk.cu), applied to the rows stored from now on. Throws on other builds.
+    // (see engine_impl.h), applied to the rows stored from now on. Throws on other builds.
     void set_kv_emu(const std::string & spec);
     // Drops emitted tokens beyond `len` sequence positions (e.g. those generated after an
     // end-of-turn token within the last cycle) before the next prefill.
@@ -122,12 +122,12 @@ class MKEngine {
     int step(std::vector<int> & out);
     // Debug helper: the final normalised hidden row of the last processed position (the logits are not kept).
     std::vector<float> last_hidden();
-    // Test helper (exact-reuse probes): 64-bit digests of the sequence state, layout in qwen38_mk.cu (state_digest).
+    // Test helper (exact-reuse probes): 64-bit digests of the sequence state, layout in engine.cu (state_digest).
     std::vector<unsigned long long> state_digest();
     // Test helper: the draft vocabulary's rows (token ids) as the device holds them, checked against the host's list
     // (throws if they differ); empty without a draft vocabulary.
     std::vector<int> draft_vocab();
-    // MK_EXACT=1 at construction: prefill results independent of the chunking (see qwen38_mk.cu `exact`).
+    // MK_EXACT=1 at construction: prefill results independent of the chunking (see engine_impl.h `exact`).
     bool exact() const;
     // false: no MTP layer (see the constructor's mtp): depth 0 only
     bool has_mtp() const;

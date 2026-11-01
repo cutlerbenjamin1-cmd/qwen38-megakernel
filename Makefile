@@ -58,8 +58,8 @@ qwen38_mk.o: qwen38_mk.cu mk_shared.cuh mk_launch.h qwen38_mk.h gguf.h prefill.c
 	$(NVCC) $(NVFLAGS) -I$(LLAMA)/ggml/include -c qwen38_mk.cu -o $@ 2> ptxas.log || (cat ptxas.log; false)
 
 # the host side (no device code: a change here does not rebuild qwen38_mk.o); the same flags, so the shared definitions agree
-HOST_SRC = engine.cu
-HOST_HDR = mk_shared.cuh mk_launch.h qwen38_mk.h gguf.h loader.cuh wv_host.cuh
+HOST_SRC = engine.cu ck_pool.cu loader.cu prefill_host.cu state_files.cu host_store.cu lanes.cu
+HOST_HDR = engine_impl.h mk_shared.cuh mk_launch.h qwen38_mk.h gguf.h loader.cuh wv_host.cuh
 HOST_OBJ = $(HOST_SRC:.cu=.o)
 $(HOST_OBJ): %.o: %.cu $(HOST_HDR) build/nvflags
 	$(NVCC) $(NVFLAGS) -I$(LLAMA)/ggml/include -c $< -o $@
