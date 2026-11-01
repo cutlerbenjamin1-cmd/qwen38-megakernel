@@ -145,8 +145,8 @@ extern __shared__ __align__(16) uint8_t smem[]; // dynamic shared memory of the 
 // Form V (gsync runs form 0; the gsync bench, MK_GSB, runs every form): 0 = release-add on arrival, acquire-poll the same word until every block of this generation arrived;
 // 1 / 2 = flag broadcast: acq_rel-add the count word, the last arriver release-writes the generation to the go word (its
 // own 128-byte line, cB.bar + GS_GO) and the others poll only go (1: relaxed polls, then one acquire re-read; 2: acquire
-// polls); 3 = form 0's arrival with relaxed polls and one acquire re-read. Both words start at 0 every launch.
-// The barrier counts run on across launches. Word BAR_BASE holds the barrier count at the end of the previous launch and
+// polls); 3 = form 0's arrival with relaxed polls and one acquire re-read. Bench launches start both words at 0.
+// Other launches carry the counts on. Word BAR_BASE holds the barrier count at the end of the previous launch and
 // C1_BASE the C1 chunk count (every chunk's counter advances alike); block 0 writes both after the launch's last
 // barrier (mk_egress), thread 0 of every block reads them at the start (s_bar0, s_c1b). A count wraps after ~10^5
 // launches: the waits compare wrap-safe (MK_BAR_LT); MK_EPOCH turns a launch-relative count into the absolute one.

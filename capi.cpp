@@ -487,7 +487,7 @@ int mk_set_penalty(void * hp, float presence, float frequency) {
 
 // draft-depth policy "key=value,..." (MKEngine::set_policy); returns 0, or -1 on a bad spec
 int mk_set_policy(void * hp, const char * spec) {
-    try { // (dq4= / mtpq= copy to the draft head's constants: drafts only, the sequence needs no reset after a failure)
+    try { // (dq4= copies to the draft head's constants: drafts only, the sequence needs no reset after a failure)
         gpu_engine(hp)->set_policy(spec ? spec : "");
         return 0;
     } catch (const std::exception & e) {
