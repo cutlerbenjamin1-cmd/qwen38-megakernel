@@ -478,21 +478,37 @@ of RAM for it on Linux and natively on Windows (2026-10-30; [BUILDING.md](BUILDI
 
 When wide verify was first served (2026-10-13, 72a58cd, 7 drafts) it decoded 17.6% faster greedy, 19.5% faster sampled
 with thinking and 9.2% faster at 101.6k context than the dp4a-verify build before it at 4 drafts (999fc68). That build
-(`make MKFLAGS=`, `MK_WV=0 MK_MAXT=5`) stayed available until 2026-11-01 and was removed then, with the `MK_WV`,
-`MK_MAXT`, `MK_C1` and `MK_EGRESS` flags: it was neither released nor gated, and it rounded differently from the served
-build. `MK_WV_Q6F`, `MK_K5` and `MK_GSYNC` went the same day: their served values are built in.
+(`make MKFLAGS=`, `MK_WV=0 MK_MAXT=5`) stayed available until 2026-11-01: it was neither released nor gated, and it
+rounded differently from the served build. It went with the other compile-time A/B switches ([Former flags](#former-flags)).
+
+### Former flags
+
+On 2026-11-01 these compile-time switches were removed and their served values built in: the other arms were not
+released or gated, and nothing measured them any more. A `-D` for one of them has no effect.
+
+| Former flag | Built in | What it does | Output against the removed arm | Since |
+|---|---|---|---|---|
+| `MK_WV` | `1` | wide verify: the main-pass matrix products run as int8 tensor-core GEMMs on a weight layout made at load, at every token count | changes (another summation order; still depth-invariant) | 44e319f, 2026-10-13 |
+| `MK_MAXT` | `8` | most tokens of one verify pass, 1 + drafts: 5 allowed 4 drafts, 8 allows 7. Above 5, every ffn_down runs on the tensor-core path | changes | 408fa84, 2026-10-13 |
+| `MK_C1` | `1` | per-chunk waits instead of a grid barrier between the ffn gate / up and ffn_down phases: +0.41% at 38k, +0.59% at 101.6k, +0.44% short (2026-10-20) | same | e7fec18, 2026-10-20 (on by default since c4210da) |
+| `MK_EGRESS` | `1` | each launch's control block reaches the host through mapped memory, barrier counts carry across launches, draft-vocabulary uploads run asynchronously (+2 MiB): +0.74..+1.34% on Linux over two holds, +0.8..+1.0% native Windows (2026-10-20) | same | 816aced, 2026-10-20 (on by default since 7322fbd) |
+| `MK_WV_Q6F` | `1` | every main-layer Q6_K matrix fragment-ordered on the tensor-core path: ms per cycle -1.5% at 101.6k, -2.6% at 38k (q8_0, 2026-10-14) | changes (KL 0.00119 mixed after it) | f30440d, 2026-10-14 |
+| `MK_K5` | `1` | the DeltaNet projection -> core grid barrier becomes a split barrier: the 48 heads go to the first 48 blocks that finish, which load their state and replay accepted drafts before they wait. +1.11% at 38k, +0.75% at 101.6k (2026-10-17) | same | 4f2d6f9, 2026-10-17 |
+| `MK_GSYNC` | `0` | the grid barrier's form: `0` upstream's; `1`-`3` flag-broadcast and relaxed-polling variants, measured slower (0.61-0.94 us against 0.51-0.55 us per barrier, 2026-10-15). The barrier benchmark (`MK_GSB`) still runs every form | same | e374f27, 2026-10-15 |
+| `MK_K7` | `1` | the DeltaNet state laid out so that each warp access is contiguous: the core phase 26.7 -> 18.3 us per call (2026-10-15); `0`: upstream's layout | same | 38d0c26, 2026-10-15 |
+| `MK_W48` | `1` | decode attention for 6-8 tokens in one pass over all 48 query rows instead of two head-group passes: 101.6k at 7 drafts 41.2 -> 38.0 ms per cycle on q8_0 (2026-10-13) | same | 9dede7f, 2026-10-13 |
+| `MK_DA_ROUTE` | `1` | decode attention chunks of one K / V tile (contexts up to 640) on the simpler kernel: short-context decode +0.4-0.5% (2026-10-12) | same | c482b97, 2026-10-12 |
+| `MK_DA_Q4` | `1` | low-bit `MK_KV` layers on the pipelined decode attention (q4 budgets were 9.8-18.4% faster at 101.6k than on the earlier kernel, 2026-10-12) | same | 6287651, 2026-10-12 |
+| `MK_AQ_EARLY` | `0` | the removed arm issued low-bit decode attention's K / V copies at the top of each interval: 2% slower per cycle at 101.6k (2026-10-13) | same | 5532c21, 2026-10-13 |
+| `MK_XP_SM` | `0` | low-bit tile expansion rows on all 12 non-softmax warps (the removed arm put some on the softmax warps; no speed difference, 2026-10-13) | same | 9deb9c0, 2026-10-13 |
 
 ### Engine -D flags
 
 | Flag | Default | Served | What it does | Output | Status | Since |
 |---|---|---|---|---|---|---|
-| `MK_K7` | `1` | `1` | the DeltaNet state laid out so that each warp access is contiguous: the core phase 26.7 -> 18.3 us per call (2026-10-15); `0`: upstream's layout | same | served | 38d0c26, 2026-10-15 |
 | `MK_K6_LD` | `1` | `1` | Q8_0 weight tiles loaded 16 bytes at a time plus one shuffle: the attention projection of the Q8_0-v layers 96 -> 84 us (2026-10-15) | same | served | 38d0c26, 2026-10-15 |
-| `MK_W48` | `1` | `1` | decode attention for 6-8 tokens in one pass over all 48 query rows instead of two head-group passes: 101.6k at 7 drafts 41.2 -> 38.0 ms per cycle on q8_0 (2026-10-13) | same | served | 9dede7f, 2026-10-13 |
 | `MK_W48S` | `1` | `1` | the one-pass attention keeps its per-call scalars in shared memory (fewer register spills) | same | served | 6cc40a7, 2026-10-14 |
 | `MK_MTP_KVC` | `1` | `1` | compiles the K / V-only MTP catch-up rows (`MK_MTP_KVC` env) | same | served | 455017a, 2026-10-14 |
-| `MK_DA_ROUTE` | `1` | `1` | decode attention chunks of one K / V tile (contexts up to 640) on the simpler kernel: short-context decode +0.4-0.5% (2026-10-12) | same | served | c482b97, 2026-10-12 |
-| `MK_DA_Q4` | `1` | `1` | low-bit `MK_KV` layers on the pipelined decode attention (q4 budgets were 9.8-18.4% faster at 101.6k than on the earlier kernel, 2026-10-12) | same | served | 6287651, 2026-10-12 |
 | `MK_FD_NOINL` | `0x1c` | `0x1c` | bit mask of the token counts whose ffn_down rows run out of line (T 2-4); inline they spilled and the phase ran 0.17-0.25 ms per pass slower (2026-10-12) | same | served | baf2d52, 2026-10-12 |
 | `MK_NSEQ` | `4` | `4` | the most parallel slots the engine opens (`--agents` 1 to this): the lanes of a batched launch, each with its own views of the row buffers | same | served | f09ef59, 2026-10-28 |
 | `MK_PAR_RMAX` | `16` | `16` | rows of a batched slot pass (16 beat 24 at 3-4 slots: 345 vs 322 tok/s at 4, temperature 0.6, 2026-10-28); with `MK_WV_OUT` or a value up to 8 the passes are 8 rows. The wide pass also needs every main matrix but ffn gate / up in the wide-verify layout and enough SMs | same | served | f09ef59, 2026-10-28 |
@@ -500,8 +516,6 @@ build. `MK_WV_Q6F`, `MK_K5` and `MK_GSYNC` went the same day: their served value
 | `MK_K6_DEF`, `MK_K8_DEF`, `MK_K8_NT` | `4`, `6`, `4` | same | the defaults of the `MK_K6`, `MK_K8`, `MK_K8_NT` environment variables | - | option | 38d0c26, 2026-10-15 |
 | `MK_WV_FMK` | `1` | `1` | Q4_K / Q5_K main-pass matrices fragment-ordered; `0`: tile-major whole blocks (decode -5.8% at 0 drafts, no gain at 4, 2026-10-13) | not checked | slower | 408fa84, 2026-10-13 |
 | `MK_WV_OUT` | `0` | `0` | the out / ssm_out matrices of the offset types (Q3_K, IQ3_S) on the tensor-core path at every T: +1.4% per cycle at 38k, no change at 101.6k (2026-10-14) | changes (KL 0.00116 mixed) | slower | 911d288, 2026-10-14 |
-| `MK_AQ_EARLY` | `0` | `0` | low-bit decode attention issues its K / V copies at the top of each interval: 2% slower per cycle at 101.6k (2026-10-13) | same | slower | 5532c21, 2026-10-13 |
-| `MK_XP_SM` | `0` | `0` | low-bit tile expansion: rows per tile done by the softmax warps (`0`: all 12 other warps); no speed difference (2026-10-13) | same | option | 9deb9c0, 2026-10-13 |
 | `MK_PF_FRAG_G` | `-1` | `-1` | prefill GEMMs: the MMA group of a stage after which the next stage's scales and fragments are made (`-1`: the kernel's own) | not checked | option | a742642, 2026-10-14 |
 | `MK_PF_NS_IQ4` | `4` | `4` | cp.async stages of the IQ4_XS prefill GEMMs (3 stages were 2-5% slower, 2026-10-14) | not checked | option | e649ad4, 2026-10-14 |
 | `MK_PF_INFCHK` | `0` | `0` | debug build: counts fp16 overflows (inf / NaN, clamps) per prefill GEMM and layer, printed after each prefill; none on 38k and 101.6k prompts (2026-10-17) | same | debug | 73fd978, 2026-10-17 |
