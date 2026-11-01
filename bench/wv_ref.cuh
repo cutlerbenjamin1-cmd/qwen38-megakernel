@@ -8,6 +8,7 @@ struct Mat {
     const uint8_t * w;
     const __half * d; // per-row block scales for repacked Q6_K / Q8_0
     int type, K, N, rb, nd;
+    int fm; // 1: stored in the wv layout (wv.cuh; main-pass matrices of the wv types), read by the wv phases and mmh<.., 1>
 };
 
 // ---- qwen38_mk.cu: l2_evict_first .. ----
@@ -133,7 +134,7 @@ __device__ __forceinline__ void q4k_scales(const int4 & h, int p, float & fA, fl
     gB = dm.y * (float) m1;
 }
 
-template <int T, int IT, int R>
+template <int T, int IT, int R, int XP = 0>
 __device__ __forceinline__ void rows_q4k(const uint8_t * const (&rp)[R], const SX & s, float (&acc)[R][T]) {
     const int lane = threadIdx.x & 31;
 #pragma unroll(IT > 8 ? (T >= 5 ? 1 : 4) : IT)
@@ -155,11 +156,11 @@ __device__ __forceinline__ void rows_q4k(const uint8_t * const (&rp)[R], const S
             B[k][0] = (q[k].x >> 4) & M4; B[k][1] = (q[k].y >> 4) & M4;
             B[k][2] = (q[k].z >> 4) & M4; B[k][3] = (q[k].w >> 4) & M4;
         }
-        accR<T, R, 32 * IT>(s, u, A, B, fA, gA, fB, gB, acc);
+        accR<T, R, 32 * IT + XP>(s, u, A, B, fA, gA, fB, gB, acc);
     }
 }
 
-template <int T, int IT, int R>
+template <int T, int IT, int R, int XP = 0>
 __device__ __forceinline__ void rows_q5k(const uint8_t * const (&rp)[R], const SX & s, float (&acc)[R][T]) {
     const int lane = threadIdx.x & 31;
 #pragma unroll(IT > 8 ? (T >= 5 ? 1 : 4) : IT)
@@ -188,7 +189,7 @@ __device__ __forceinline__ void rows_q5k(const uint8_t * const (&rp)[R], const S
             B[k][2] = ((q[k].z >> 4) & M4) | (((qh[k].z >> s1) & 0x01010101) << 4);
             B[k][3] = ((q[k].w >> 4) & M4) | (((qh[k].w >> s1) & 0x01010101) << 4);
         }
-        accR<T, R, 32 * IT>(s, u, A, B, fA, gA, fB, gB, acc);
+        accR<T, R, 32 * IT + XP>(s, u, A, B, fA, gA, fB, gB, acc);
     }
 }
 
@@ -197,7 +198,7 @@ __device__ __forceinline__ void rows_q5k(const uint8_t * const (&rp)[R], const S
 //   meta (Mat::d, 18 B per block, in pairs of blocks: sc[16] even | sc[16] odd | d even | d odd, 36 B).
 // A unit reads its 4 scales sc[4p..4p+3] and the pair's two d (one 4-byte load each).
 constexpr int Q6_BLK = 192, Q6_META = 18;
-template <int T, int IT, int R>
+template <int T, int IT, int R, int XP = 0>
 __device__ __forceinline__ void rows_q6k(const uint8_t * const (&rp)[R], const __half * const (&dp)[R], const SX & s,
                                          float (&acc)[R][T]) {
     const int lane = threadIdx.x & 31;
@@ -235,12 +236,12 @@ __device__ __forceinline__ void rows_q6k(const uint8_t * const (&rp)[R], const _
             B[k][2] = ((q[k].z >> 4) & M4) | (int) (((hy >> 4) & 0x03030303u) << 4);
             B[k][3] = ((q[k].w >> 4) & M4) | (int) (((hy >> 6) & 0x03030303u) << 4);
         }
-        accR<T, R, 32 * IT>(s, u, A, B, fA, gA, fB, gB, acc);
+        accR<T, R, 32 * IT + XP>(s, u, A, B, fA, gA, fB, gB, acc);
     }
 }
 
 // repacked Q8_0: per unit 32 B (A 16 int8 | B 16 int8), scales per natural 32-block
-template <int T, int IT, int R>
+template <int T, int IT, int R, int XP = 0>
 __device__ __forceinline__ void rows_q80(const uint8_t * const (&rp)[R], const __half * const (&dp)[R], const SX & s,
                                          float (&acc)[R][T]) {
     const int lane = threadIdx.x & 31;
@@ -258,7 +259,7 @@ __device__ __forceinline__ void rows_q80(const uint8_t * const (&rp)[R], const _
             B[k][0] = bq.x; B[k][1] = bq.y; B[k][2] = bq.z; B[k][3] = bq.w;
             fA[k] = df.x; fB[k] = df.y; gA[k] = 0.f; gB[k] = 0.f;
         }
-        accR<T, R, 32 * IT>(s, u, A, B, fA, gA, fB, gB, acc);
+        accR<T, R, 32 * IT + XP>(s, u, A, B, fA, gA, fB, gB, acc);
     }
 }
 
@@ -302,7 +303,7 @@ __device__ __forceinline__ void accR0(const SX & s, int u, const int (&A)[R][4],
 // IQ4_XS re-laid-out at load in pairs of 256-weight blocks, 272 B per pair (repack_iq4xs): the two GGUF block
 // headers (fp16 d | u16 scales_h | u8 scales_l[4]), then each block's 128 index bytes in Q4_K order.
 // A weight is d * (ls - 32) * kvalues_iq4nl[index], ls the 6-bit scale of its 32-weight sub-block.
-template <int T, int IT, int R>
+template <int T, int IT, int R, int XP = 0>
 __device__ __forceinline__ void rows_iq4x(const uint8_t * const (&rp)[R], const SX & s, float (&acc)[R][T]) {
     const int lane = threadIdx.x & 31;
 #pragma unroll(IT > 8 ? (T >= 5 ? 1 : 4) : IT)
@@ -329,7 +330,7 @@ __device__ __forceinline__ void rows_iq4x(const uint8_t * const (&rp)[R], const 
             iq4_lut(q[k].z, IQ4_T0, IQ4_T1, IQ4_T2, IQ4_T3, A[k][2], B[k][2]);
             iq4_lut(q[k].w, IQ4_T0, IQ4_T1, IQ4_T2, IQ4_T3, A[k][3], B[k][3]);
         }
-        accR0<T, R, 32 * IT>(s, u, A, B, fA, fB, acc);
+        accR0<T, R, 32 * IT + XP>(s, u, A, B, fA, fB, acc);
     }
 }
 
@@ -337,7 +338,7 @@ __device__ __forceinline__ void rows_iq4x(const uint8_t * const (&rp)[R], const 
 // 32-weight blocks, then the 128 index bytes in Q4_K order (as IQ4_XS).  A weight is d * kvalues_iq4nl[index].
 // Same integer products and the same float arithmetic (accR with zero mins) as a Q8_0 re-encode of these tensors,
 // so the results are bit-identical to it at 0.53x the bytes.
-template <int T, int IT, int R>
+template <int T, int IT, int R, int XP = 0>
 __device__ __forceinline__ void rows_iq4nl(const uint8_t * const (&rp)[R], const SX & s, float (&acc)[R][T]) {
     const int lane = threadIdx.x & 31;
 #pragma unroll(IT > 8 ? (T >= 5 ? 1 : 4) : IT)
@@ -362,7 +363,7 @@ __device__ __forceinline__ void rows_iq4nl(const uint8_t * const (&rp)[R], const
             iq4_lut(q[k].z, IQ4_T0, IQ4_T1, IQ4_T2, IQ4_T3, A[k][2], B[k][2]);
             iq4_lut(q[k].w, IQ4_T0, IQ4_T1, IQ4_T2, IQ4_T3, A[k][3], B[k][3]);
         }
-        accR<T, R, 32 * IT>(s, u, A, B, fA, gA, fB, gB, acc);
+        accR<T, R, 32 * IT + XP>(s, u, A, B, fA, gA, fB, gB, acc);
     }
 }
 
@@ -372,7 +373,7 @@ __device__ __forceinline__ void rows_iq4nl(const uint8_t * const (&rp)[R], const
 // d (sc - 32) (u3 - 4), u3 = lows + 4 high. The GEMV feeds u3 + 28 = the Q6_K value (q + 32) of a Q6_K re-encode,
 // with the same scales and the same float arithmetic as rows_q6k: bit-identical to it at 114 / 210 the bytes.
 constexpr int Q3_BLK = 96;
-template <int T, int IT, int R>
+template <int T, int IT, int R, int XP = 0>
 __device__ __forceinline__ void rows_q3k(const uint8_t * const (&rp)[R], const __half * const (&dp)[R], const SX & s,
                                          float (&acc)[R][T]) {
     const int lane = threadIdx.x & 31;
@@ -406,7 +407,7 @@ __device__ __forceinline__ void rows_q3k(const uint8_t * const (&rp)[R], const _
                 B[k][j] = (int) ((((y >> (2 * j)) & 0x03030303u) | (((h >> (4 + j)) & 0x01010101u) << 2)) + 0x1c1c1c1cu);
             }
         }
-        accR<T, R, 32 * IT>(s, u, A, B, fA, gA, fB, gB, acc);
+        accR<T, R, 32 * IT + XP>(s, u, A, B, fA, gA, fB, gB, acc);
     }
 }
 
@@ -426,7 +427,7 @@ __device__ __forceinline__ unsigned iq3s_grid(unsigned idx) { return ldg_l1(g_iq
 // | pad. A weight is d (1 + 2 s) (+-grid). As rows_q3k, the GEMV feeds 32 +- grid = the Q6_K value of a Q6_K
 // re-encode, with the same scales and arithmetic as rows_q6k: bit-identical to it at 112 / 210 the bytes.
 constexpr int IQ3S_META = 16;
-template <int T, int IT, int R>
+template <int T, int IT, int R, int XP = 0>
 __device__ __forceinline__ void rows_iq3s(const uint8_t * const (&rp)[R], const __half * const (&dp)[R], const SX & s,
                                           float (&acc)[R][T]) {
     const int lane = threadIdx.x & 31;
@@ -466,7 +467,7 @@ __device__ __forceinline__ void rows_iq3s(const uint8_t * const (&rp)[R], const 
                 B[k][c] = (int) (0x20202020u + (gb ^ mb) - mb);
             }
         }
-        accR<T, R, 32 * IT>(s, u, A, B, fA, gA, fB, gB, acc);
+        accR<T, R, 32 * IT + XP>(s, u, A, B, fA, gA, fB, gB, acc);
     }
 }
 
@@ -482,19 +483,19 @@ __device__ __forceinline__ int unit_bytes(int u0) {
                                           : 32 * u0;
 }
 // R rows of one weight type given their row pointers (and, for Q8_0, their scale rows)
-template <int T, int IT, int R, int TYPE>
+template <int T, int IT, int R, int TYPE, int XP = 0>
 __device__ __forceinline__ void rows_t(const uint8_t * const (&rp)[R], const __half * const (&dp)[R], const SX & s,
                                        float (&acc)[R][T]) {
-    if constexpr (TYPE == T_Q4K) rows_q4k<T, IT, R>(rp, s, acc);
-    else if constexpr (TYPE == T_Q5K) rows_q5k<T, IT, R>(rp, s, acc);
-    else if constexpr (TYPE == T_Q6K) rows_q6k<T, IT, R>(rp, dp, s, acc);
-    else if constexpr (TYPE == T_IQ4X) rows_iq4x<T, IT, R>(rp, s, acc);
-    else if constexpr (TYPE == T_IQ4NL) rows_iq4nl<T, IT, R>(rp, s, acc);
-    else if constexpr (TYPE == T_Q3K) rows_q3k<T, IT, R>(rp, dp, s, acc);
-    else if constexpr (TYPE == T_IQ3S) rows_iq3s<T, IT, R>(rp, dp, s, acc);
-    else rows_q80<T, IT, R>(rp, dp, s, acc);
+    if constexpr (TYPE == T_Q4K) rows_q4k<T, IT, R, XP>(rp, s, acc);
+    else if constexpr (TYPE == T_Q5K) rows_q5k<T, IT, R, XP>(rp, s, acc);
+    else if constexpr (TYPE == T_Q6K) rows_q6k<T, IT, R, XP>(rp, dp, s, acc);
+    else if constexpr (TYPE == T_IQ4X) rows_iq4x<T, IT, R, XP>(rp, s, acc);
+    else if constexpr (TYPE == T_IQ4NL) rows_iq4nl<T, IT, R, XP>(rp, s, acc);
+    else if constexpr (TYPE == T_Q3K) rows_q3k<T, IT, R, XP>(rp, dp, s, acc);
+    else if constexpr (TYPE == T_IQ3S) rows_iq3s<T, IT, R, XP>(rp, dp, s, acc);
+    else rows_q80<T, IT, R, XP>(rp, dp, s, acc);
 }
-template <int T, int IT, int R, int TYPE>
+template <int T, int IT, int R, int TYPE, int XP = 0>
 __device__ __forceinline__ void mrows(const Mat & m, int row0, const SX & s, float (&acc)[R][T], int u0 = 0) {
     const uint8_t * rp[R];
     const __half * dp[R];
@@ -505,5 +506,5 @@ __device__ __forceinline__ void mrows(const Mat & m, int row0, const SX & s, flo
         dp[k] = m.d + (size_t) (row0 + k) * m.nd +
                 (TYPE == T_Q6K || TYPE == T_Q3K ? (u0 >> 3) * (Q6_META / 2) : TYPE == T_IQ3S ? (u0 >> 3) * (IQ3S_META / 2) : u0);
     }
-    rows_t<T, IT, R, TYPE>(rp, dp, s, acc);
+    rows_t<T, IT, R, TYPE, XP>(rp, dp, s, acc);
 }

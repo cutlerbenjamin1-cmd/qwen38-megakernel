@@ -4,6 +4,7 @@
 // at a given depth. The kernels are verbatim copies spliced out of qwen38_mk.cu (regenerate after changing one).
 //   nvcc -O3 -arch=sm_86 -std=c++17 -Xptxas -dlcm=cg -Xptxas -v dattn_bench.cu -o dattn_bench
 //   ./dattn_bench <n> <T> <reps> 0 1 2    (positions 0 .. n-1 cached, T new rows at n .. n+T-1; TINV=1 checks T-invariance)
+//   exit status 1 when a variant's partials differ from the first variant's or a T-invariance check fails (`make check`)
 //   e.g. ./dattn_bench 101600 4 20 0 1 2;  MK_KV-like formats: KQ4=1 / VQ4=1 (q4 K / V; then compare 0 2), KROT=1 (rotated K)
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
@@ -1008,6 +1009,10 @@ int main(int argc, char ** argv) {
         return 1;
     }
     const int n = atoi(argv[1]), Treq = atoi(argv[2]), reps = atoi(argv[3]);
+    if (Treq < 1 || Treq > MAXT) { // (the copies predate the engine's 6-8 token verify passes: other T launch nothing)
+        fprintf(stderr, "T must be 1..%d\n", MAXT);
+        return 1;
+    }
     std::vector<int> vars;
     for (int i = 4; i < argc; i++) vars.push_back(atoi(argv[i]));
     const int T = att_cap_T(n, Treq);
@@ -1085,6 +1090,7 @@ int main(int argc, char ** argv) {
     };
     std::vector<float> ap0, ap;
     std::vector<float2> ml0, ml;
+    long fails = 0;
     for (int v : vars) {
         CK(cudaMemset(hb.apart, 0xff, napart * 4));
         CK(cudaMemset(hb.aml, 0xff, naml * 8));
@@ -1110,6 +1116,7 @@ int main(int argc, char ** argv) {
             }
         printf("variant %d vs %d: %ld / %ld partials differ (max |d| %.3g, rel rms %.3g), %ld / %d (m, l) differ, %ld NaN\n", v,
                vars[0], ndiff, (long) nitems * R * 256, maxd, sqrt(ss / std::max(sr, 1e-30)), nml, nitems * R, nnan);
+        fails += ndiff || nml || nnan;
     }
 
     // T-invariance: row (hq, t) of the T-row launch at n == row hq of a 1-row launch at n + t (same q / k / v data)
@@ -1148,8 +1155,11 @@ int main(int argc, char ** argv) {
                         }
             }
             printf("T-invariance variant %d: %ld / %ld (item, row) partials differ from the 1-row launches\n", v, bad, chk);
+            fails += bad > 0;
         }
     }
+
+    printf(fails ? "CHECK FAILED (%ld)\n" : "CHECK OK\n", fails);
 
     // timing: variants interleaved per rep (drift-free ratios), slots alternate
     std::vector<std::vector<float>> tm(vars.size());
@@ -1175,5 +1185,5 @@ int main(int argc, char ** argv) {
         printf("variant %d: min %.1f us  median %.1f us  (%.0f GB/s at the median, %.2f us per tile)\n", vars[i], t[0] * 1e3,
                med * 1e3, bytes / (med * 1e-3) / 1e9, med * 1e3 / (cs / ATP));
     }
-    return 0;
+    return fails ? 1 : 0;
 }

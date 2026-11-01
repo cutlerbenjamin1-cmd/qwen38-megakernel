@@ -3,6 +3,7 @@
 //
 //   python3 wv_extract.py && nvcc -O3 -std=c++17 -arch=sm_86 -lineinfo -Xptxas -v wvgemm_bench.cu -o wvgemm_bench
 //   ./wvgemm_bench check            exactness: T-invariance (T = 1..16 bit-identical per row) + integer / fp64 checks
+//                                   (exit status 1 on a failure; `make check` runs it)
 //   ./wvgemm_bench time [roles] [types] [reps]
 //
 // Weights are random bytes in the engine's on-device layouts (native Q4_K / Q5_K, the load-time repacks of IQ4_XS, IQ4_NL,
@@ -2277,7 +2278,7 @@ int main(int argc, char ** argv) {
             if (c) q = c + 1;
         }
     }
-    if (mode == "check") return check(roles, types);
+    if (mode == "check") return check(roles, types) ? 1 : 0;
     const int reps = argc > 4 ? atoi(argv[4]) : 5;
     std::vector<int> wvT = {1, 2, 4, 8, 16}, dpT = {1, 2, 4, 5};
     auto ints = [](const char * s) {

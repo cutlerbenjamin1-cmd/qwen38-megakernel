@@ -19,6 +19,9 @@ bench/gemv_bench
 bench/mmq_bench
 bench/mmq_e*
 bench/resid_bench
+bench/wvgemm_bench
+bench/dattn_bench
+bench/wv_ref.cuh.tmp
 bench/*_tmp/
 # benchmark suite downloads (bench/suite/fetch.py)
 bench/suite/data/
@@ -39,3 +42,5 @@ build_win/
 dist/
 # scripts/exactness.py's default output
 exactness-out/
+# scripts/gate.sh's default output
+gate-out/

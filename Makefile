@@ -90,7 +90,32 @@ tests/gguf_fuzz: tests/gguf_fuzz.cpp gguf.h
 exactness: qwen38_mk libqwen38mk.so
 	python3 scripts/exactness.py $(if $(MK_MODEL),-m $(MK_MODEL)) $(EXACTNESS_ARGS)
 
-clean:
-	rm -f qwen38_mk libqwen38mk.so qwen38_mk.o ptxas.log tools/vocab_freq tools/llama_ref libqwen38vision.so tools/mkv_cli tools/vision_ref tools/vit_check vision/vit_cpu.o tests/gguf_fuzz
+# GPU kernel checks without a model (the GPU to itself): the tensor-core verify GEMM against the engine's dp4a GEMVs
+# (wvgemm_bench check: T-invariance, integer and fp64 checks) and the decode attention variants bit-identical to each other
+# and token-count invariant at T 4 and 5 (dattn_bench TINV=1; its kernel copies stop at T 5). wv_ref.cuh, wvgemm_bench's
+# copy of the engine's GEMV code, is regenerated from qwen38_mk.cu every time and rewritten only when it changes.
+bench/wv_ref.cuh: FORCE
+	@python3 bench/wv_extract.py qwen38_mk.cu $@.tmp > /dev/null
+	@cmp -s $@.tmp $@ && rm -f $@.tmp || mv $@.tmp $@
 
-.PHONY: all vision clean exactness FORCE
+bench/wvgemm_bench: bench/wvgemm_bench.cu bench/wv_ref.cuh
+	$(NVCC) -O3 -std=c++17 -arch=$(ARCH) -lineinfo $< -o $@
+
+bench/dattn_bench: bench/dattn_bench.cu
+	$(NVCC) -O3 -std=c++17 -arch=$(ARCH) -Xptxas -dlcm=cg $< -o $@
+
+check: bench/wvgemm_bench bench/dattn_bench
+	bench/wvgemm_bench check
+	TINV=1 bench/dattn_bench 4096 4 3 0 1 2
+	TINV=1 bench/dattn_bench 101600 5 3 0 1 2
+
+# every GPU check of a build in one run (scripts/gate.sh; the GPU to itself, ~30 min):
+#   make gate MK_MODEL=<gguf> GATE_ARGS="--record DIR"   (a reference)   or   GATE_ARGS="--ref DIR"
+gate: qwen38_mk libqwen38mk.so
+	scripts/gate.sh $(if $(MK_MODEL),-m $(MK_MODEL)) $(GATE_ARGS)
+
+clean:
+	rm -f qwen38_mk libqwen38mk.so qwen38_mk.o ptxas.log tools/vocab_freq tools/llama_ref libqwen38vision.so tools/mkv_cli tools/vision_ref tools/vit_check vision/vit_cpu.o tests/gguf_fuzz \
+		bench/wvgemm_bench bench/dattn_bench
+
+.PHONY: all vision clean exactness check gate FORCE
