@@ -407,8 +407,17 @@ those waits use a high-resolution waitable timer, since a plain sleep ends at th
 
 ## Files
 
-- `qwen38_mk.cu` / `qwen38_mk.h` - loader, repacking, the megakernel and the `MKEngine` API
-- `wv.cuh` / `wv_host.cuh` - wide verify: the int8 tensor-core verify GEMM and its load-time weight re-layout
+- `qwen38_mk.h` - the `MKEngine` API
+- `qwen38_mk.cu` - the device code (the megakernel, its phases and the other kernels) and, at its end, the launchers
+  and symbol copies the host side calls through `mk_launch.h`
+- `mk_shared.cuh` - the structs, constants and build settings both sides use; the engine refuses a device object built
+  with other settings than its host files
+- `engine_impl.h` - `MKEngine::Impl`, the engine's host-side state and methods, defined in `engine.cu` (launches,
+  decode steps, policy, most of the API), `loader.cu` (the model load: repacks, re-encodes, the constructor),
+  `prefill_host.cu` (the batched prefill's chunks and launches), `ck_pool.cu` (checkpoints), `host_store.cu` (side
+  requests and parked conversations), `state_files.cu` (post-prefill state files) and `lanes.cu` (parallel slots)
+- `wv.cuh` - wide verify: the int8 tensor-core verify GEMM; `wv_dev.cuh` / `wv_host.cuh` - its load-time weight
+  re-layout (kernels / host side)
 - `prefill.cuh` / `prefill_gemm.cuh` / `prefill_attn.cuh` - batched prefill kernels, their quantised fp16 GEMM and
   the prefill attention
 - `loader.cuh` - the host side of the model load (read-ahead, reusable buffers); `gguf.h` - minimal mmap GGUF reader

@@ -44,9 +44,11 @@ folder) and `scripts\package_release.ps1` (after `build.ps1`; it bundles the Vis
 - **CUDA:** 13.2; older 12.x versions are untested. The Windows build needs a driver that supports
   CUDA 13.2; it links the CUDA runtime statically, so at run time only the driver is needed.
 - **OS:** Linux, WSL2, or Windows 10 / 11 x64.
-- **RAM to compile:** most of the build is ptxas on the megakernel, one thread with a large heap. For the served
-  configuration it peaked at 18.8 GiB both on Linux / WSL2, in a 10.5-minute `make -j2`, and natively on Windows, in
-  a 12-minute `build.ps1`.
+- **RAM to compile:** most of the build is ptxas on the megakernel (`qwen38_mk.cu`, the device code), one thread with
+  a large heap. For the served configuration it peaked at 18.8 GiB both on Linux / WSL2, in a 10.5-minute `make -j2`,
+  and natively on Windows, in a 12-minute `build.ps1`. A change to the host side alone (`engine.cu`, `engine_impl.h`
+  and the other host files) does not recompile it: `make -j2` rebuilds and links in about 10 s for one host file and
+  30 s for `engine_impl.h` (all seven), with under 0.5 GB per compile.
 - **RAM at run time:** parked conversations and side requests use page-locked host memory, up to `--park-mib` /
   `MK_PARK_MIB` (default 8192 MiB; 1024 MiB for side requests alone when parking is off), allocated as it is needed and
   kept until the server exits. The token embedding table also stays in page-locked host memory instead of VRAM.
@@ -183,8 +185,8 @@ hf download unsloth/Qwen3.8-27B-GGUF Qwen3.8-27B-UD-Q4_K_XL.gguf mmproj-BF16.ggu
   or WSL2, the GPU to itself, about 16 minutes on an RTX 3090.
 - **Kernels without a model:** `make check` builds and runs `bench/wvgemm_bench check` (the tensor-core verify GEMM
   bit-identical at every token count and against fp64 and the engine's dp4a GEMVs, whose code `bench/wv_extract.py`
-  copies from `qwen38_mk.cu` first) and `bench/dattn_bench` with `TINV=1` (the decode attention variants bit-identical
-  to each other and token-count invariant, at 4 and 5 tokens); either exits 1 on a difference.
+  copies from `mk_shared.cuh` and `qwen38_mk.cu` first) and `bench/dattn_bench` with `TINV=1` (the decode attention
+  variants bit-identical to each other and token-count invariant, at 4 and 5 tokens); either exits 1 on a difference.
 - **Server tests:** `python -m pytest -q tests` runs without a GPU, against fake engines (the CI runs it on Python 3.10,
   3.11 and 3.12).
 - **GGUF parser:** `make tests/gguf_fuzz && tests/gguf_fuzz` feeds `gguf.h` malformed and randomly corrupted files under
@@ -211,7 +213,9 @@ hf download unsloth/Qwen3.8-27B-GGUF Qwen3.8-27B-UD-Q4_K_XL.gguf mmproj-BF16.ggu
 
 ## Files
 
-- `qwen38_mk.cu`, `qwen38_mk.h`, `prefill*.cuh`, `wv*.cuh`, `loader.cuh`, `gguf.h`: the engine
+- `qwen38_mk.cu`, `prefill*.cuh`, `wv.cuh`, `wv_dev.cuh`: the engine's device code; `engine.cu`, `engine_impl.h` and
+  the other host files of the Makefile's `HOST_SRC`, `loader.cuh`, `wv_host.cuh`: its host side; `mk_shared.cuh`,
+  `mk_launch.h`, `qwen38_mk.h` (the API), `gguf.h`: shared ([ENGINE.md](ENGINE.md#files) has what each file holds)
 - `capi.cpp`: the C API of `libqwen38mk.so` / `qwen38mk.dll` (and the keep-warm thread)
 - `main.cu`: the `qwen38_mk` CLI; `logit_stats.h`: the accuracy comparison shared by the CLI and the tools
 - `server/mk_server.py`: the HTTP server

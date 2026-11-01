@@ -965,7 +965,7 @@ Read from the environment at startup ([CONFIGURATION.md](CONFIGURATION.md)):
 The server loads the engine library (`libqwen38mk.so`, `qwen38mk.dll` on Windows; `--lib`) through ctypes and uses its
 C API (`capi.cpp`). Where each feature lives, for reading the code:
 
-| feature | C API | engine (`qwen38_mk.cu`) |
+| feature | C API | engine (`MKEngine`) |
 |---|---|---|
 | prompt reuse, checkpoints | `mk_prefill_cks`, `mk_prefill_img`, `mk_checkpoints`, `mk_rewind_to`, `mk_truncate`, `mk_sequence`, `mk_committed` | `MKEngine::prefill` and the checkpoint pool |
 | exact reuse | `mk_exact` (`MK_EXACT=1` is read when the engine is built) | the prefill's exact attention form |
