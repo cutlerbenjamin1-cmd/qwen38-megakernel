@@ -41,12 +41,12 @@ folder) and `scripts\package_release.ps1` (after `build.ps1`; it bundles the Vis
   block per SM and needs at least 80 SMs for more than 4 drafts, 50 for up to 4; the engine checks this at load and
   names the shortfall. Tuned and tested on an RTX 3090 (sm_86, 82 SMs). `make` builds for the installed GPU's
   architecture (sm_89 or sm_120 too), but only sm_86 is tested.
-- **CUDA:** 13.2 is what we build with; older 12.x versions are untested. The Windows build needs a driver that supports
+- **CUDA:** 13.2; older 12.x versions are untested. The Windows build needs a driver that supports
   CUDA 13.2; it links the CUDA runtime statically, so at run time only the driver is needed.
 - **OS:** Linux, WSL2, or Windows 10 / 11 x64.
 - **RAM to compile:** most of the build is ptxas on the megakernel, one thread with a large heap. For the served
   configuration it peaked at 18.8 GiB both on Linux / WSL2, in a 10.5-minute `make -j2`, and natively on Windows, in
-  a 12-minute `build.ps1` (2026-10-30, 6f3b257).
+  a 12-minute `build.ps1`.
 - **RAM at run time:** parked conversations and side requests use page-locked host memory, up to `--park-mib` /
   `MK_PARK_MIB` (default 8192 MiB; 1024 MiB for side requests alone when parking is off), allocated as it is needed and
   kept until the server exits. The token embedding table also stays in page-locked host memory instead of VRAM.
@@ -88,9 +88,9 @@ Build settings:
   the engine flags, which the server reports in `/props`.
 
 Under WSL2, keep the model on the Linux filesystem: GGUF files on `/mnt/c` (or any Windows drive) load several times
-slower. With the model on ext4 the server was ready ~12 s after start (2026-10-16). WSL2's memory comes out of the same
-pool as Windows', so a compile on one side and a loaded model on the other can exhaust it: a native ptxas failed with a
-memory allocation error while a WSL2 GPU job held ~20 GB (2026-10-16).
+slower. With the model on ext4 the server is ready in about 12 s. WSL2's memory comes out of the same pool as
+Windows', so a compile on one side and a loaded model on the other can exhaust it: a native ptxas fails with a memory
+allocation error while a WSL2 GPU job holds ~20 GB.
 
 ## Windows
 
@@ -133,7 +133,7 @@ scripts\serve.bat                 :: http://127.0.0.1:8080, 120k context, q8_0 K
 
 `scripts\serve.bat` takes the same settings as `scripts/serve.sh` ([CONFIGURATION.md](CONFIGURATION.md)). Images are
 on when `mmproj-BF16.gguf` sits next to the model or `MK_MMPROJ` names it (`MK_MMPROJ=off` turns them off). From an
-NVMe disk the server was ready ~7 s after start (2026-10-16).
+NVMe disk the server is ready in about 7 s.
 
 ## Model files
 

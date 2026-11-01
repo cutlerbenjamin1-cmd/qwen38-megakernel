@@ -1,9 +1,7 @@
-# Engine notes
+# The engine
 
-How the engine works inside. This document began as open-jet's megakernel README (this repository started as that
-directory, history included) and has been updated as the engine changed. Measurements are in
-[BENCHMARKS.md](BENCHMARKS.md), the server in [SERVER.md](SERVER.md) and every setting in
-[CONFIGURATION.md](CONFIGURATION.md); numbers quoted here carry their date.
+How the engine works inside. Measurements are in [BENCHMARKS.md](BENCHMARKS.md), the server in
+[SERVER.md](SERVER.md) and every setting in [CONFIGURATION.md](CONFIGURATION.md).
 
 A specialised CUDA inference engine for Qwen3.8-27B `Q4_K_M` and unsloth's `UD-Q4_K_XL` (llama.cpp arch `qwen35`:
 48 Gated-DeltaNet + 16 gated-attention layers, one MTP block). It is tuned and tested on an RTX 3090 (sm_86, 82 SMs);
@@ -18,7 +16,7 @@ Which model file runs on it (details in [The GGUF](#the-gguf)):
 | unsloth's Qwen3.8-27B `UD-Q4_K_XL` | yes (tuned on it) |
 | unsloth's Qwen3.8-27B `Q4_K_M` | yes |
 | another Qwen3.8-27B `Q4_K_M` | when every tensor has a type listed under [The GGUF](#the-gguf); untested |
-| fine-tunes of Qwen3.8-27B (other quantizers) | when every tensor has a type listed under [The GGUF](#the-gguf); four checked on 2026-10-18 |
+| fine-tunes of Qwen3.8-27B (other quantizers) | when every tensor has a type listed under [The GGUF](#the-gguf); four checked |
 | a file without the MTP layer | yes, without drafting (depth 0), or with `--mtp` and a separate MTP file of the same model |
 | any other quant | refused by the loader, which names the first tensor it cannot read (use llama.cpp) |
 
@@ -47,7 +45,8 @@ barrier; the host only reads back the accepted tokens. Prompts go through batche
   length, and the verify GEMMs compute every row the same way at any T. With sampling, the token distribution is the
   one of sampling without drafts.
 
-Speculation in numbers (2026-10-16, commit 7d67c5d, CLI, UD-Q4_K_XL, q8_0 KV; tokens / total time):
+Speculation in numbers (CLI, UD-Q4_K_XL, q8_0 KV; tokens over total time). This is an older build, so the rates sit
+below [the current ones](BENCHMARKS.md#headline-numbers), but the shape is the same:
 
 | prompts | drafts | tok/s | draft acceptance | tokens / cycle | ms / cycle |
 |---|---|---|---|---|---|
@@ -60,9 +59,8 @@ Speculation in numbers (2026-10-16, commit 7d67c5d, CLI, UD-Q4_K_XL, q8_0 KV; to
 | copying text verbatim, short / at 38k | 7 | 257.7 / 235.3 | 95.1% / 97.9% | 7.51 | 29.1 / 31.9 |
 
 A cycle that verifies 8 rows took ~29.1 ms against 22.3 ms for 1 row (short context), so the gain comes from accepted
-drafts. Without drafts, llama.cpp b11548 decoded the same prompts at 42.0 tok/s (short) and 35.1 tok/s (38k) in that
-session (b12024 through the server on 2026-10-31: 43.5 and 36.1 against this engine's 46.7 and 43.3,
-[BENCHMARKS.md](BENCHMARKS.md#without-drafts)).
+drafts. Without drafts on either side the engine still decodes faster than llama.cpp: 46.7 against 43.5 tok/s on short
+prompts and 43.3 against 36.1 at 38k ([BENCHMARKS.md](BENCHMARKS.md#without-drafts)).
 
 ## Correctness
 
@@ -70,8 +68,8 @@ The output is not byte-identical to llama.cpp's: the arithmetic is ordered and r
 are close the other one can win, and a generation then continues differently. Measured against llama.cpp's own
 next-token distributions (same GGUF; reference: llama.cpp b10246 generating token by token with its q8_0 KV cache;
 13 sequences of this repo's code and docs, 13,299 positions scored after a 1024-token prompt each), UD-Q4_K_XL with
-the q8_0 KV cache agrees on 98.737% of the top tokens with a mean KL divergence of 0.00119 nats (2026-10-17, the same
-on 2026-10-20), closer than llama.cpp's own batched run (98.489% / 0.00166); most disagreements are near-ties. The
+the q8_0 KV cache agrees on 98.737% of the top tokens with a mean KL divergence of 0.00119 nats, closer than
+llama.cpp's own batched run (98.489% / 0.00166); most disagreements are near-ties. The
 tables (the prefill-only and `mixed` paths, 32k to 160k context, Q4_K_M, image prompts) and the commands that
 reproduce them are in [BENCHMARKS.md](BENCHMARKS.md#against-llamacpp).
 
@@ -94,15 +92,15 @@ distribution, so the sampled distribution is the same as without drafts (chi-squ
 The random numbers come from a counter-based generator keyed by the seed and the position: a row's acceptance and
 resampling numbers by its position, a sampled draft's by the position it drafts. Each position is decided once, and a
 position drafted again after a rejection before it draws the same number, but that number is independent of
-everything that decided the tokens before it, so the output stays exact (2026-10-17: a CPU replica of the loop,
-`tests/spec_rng_sim.py`, 396k re-drafted positions; the PIT test on 13,401 re-drafted rows of the engine at 7
+everything that decided the tokens before it, so the output stays exact (checked with a CPU replica of the loop,
+`tests/spec_rng_sim.py`, 396k re-drafted positions, and a PIT test on 13,401 re-drafted rows of the engine at 7
 drafts). One opt-in `MK_POLICY` setting needs a restriction: `chain=2` with sampled drafts runs without drop gates
 (dropping a draft on its own probability selects which drafts get verified: biased).
 
 **unsloth UD-Q4_K_XL** (`Qwen3.8-27B-UD-Q4_K_XL.gguf`, 17.6 GB: Q4_K / Q5_K / Q6_K / Q8_0 / IQ4_XS per tensor plus a
 few Q3_K, IQ3_S and IQ4_NL) puts its extra bits where the decode spends its time: its FFN gate / up average 5.1 bits
 per weight against Q4_K's 4.5, so a cycle reads more weight bytes than with the plain Q4_K_M. Its MTP block (Q6_K in
-the file) is re-quantized to Q4_K at load ([The GGUF](#the-gguf)). In one session on 2026-10-14 the plain Q4_K_M
+the file) is re-quantized to Q4_K at load ([The GGUF](#the-gguf)). In a side-by-side run the plain Q4_K_M
 decoded faster at most context lengths ([BENCHMARKS.md](BENCHMARKS.md#q4_k_m-and-upstreams-scripts)).
 
 ## Build / run
@@ -161,19 +159,18 @@ exactly [K, N] (further dimensions 1), `token_embd` exactly [5120, 248320], the 
 a file with the right names but a short or reshaped tensor is refused, naming it, instead of being read past its end.
 `tests/gguf_fuzz.cpp` (`make tests/gguf_fuzz`) feeds it malformed and randomly corrupted files (size and offset lies
 included) under AddressSanitizer / UBSan, reads every byte of every tensor of the files that parse and tries the
-shape-checked reads; UD-Q4_K_XL, UD-Q4_K_M and Q4_K_M parse to the same tensors and keys as before the checks
-(2026-10-17). The vision projector (mmproj) is read through ggml's GGUF reader, which checks the same sizes; the CPU
-encoder then checks every tensor's size against the projector's hyperparameters, and the hyperparameters and the types
-of the keys it reads (a crafted file is refused with an error rather than ending the process).
+shape-checked reads; UD-Q4_K_XL, UD-Q4_K_M and Q4_K_M pass every check. The vision projector (mmproj) is read through
+ggml's GGUF reader, which checks the same sizes; the CPU encoder then checks every tensor's size against the
+projector's hyperparameters, and the hyperparameters and the types of the keys it reads (a crafted file is refused
+with an error rather than ending the process).
 
 The MTP draft block (`blk.64.*`, `nextn.eh_proj`) is the one lossy exception: its matrices stored wider than Q4_K
 (Q5_K, Q6_K, Q8_0: all of them in UD-Q4_K_XL, `eh_proj` / `attn_v` / `ffn_down` in Q4_K_M) are re-quantized to Q4_K at
 load (`ggml_quantize_chunk`, ~2.5 s of CPU for UD-Q4_K_XL, on a background thread during the load), so every MTP pass
 streams less (a Q4_0 MTP block too, and IQ4_NL). Only the drafts change: they are
-verified by the unchanged main model, so greedy output and the sampled output distribution stay exact. When it went in
-(2026-10-12, before wide verify) it saved 107 MiB of VRAM on UD-Q4_K_XL, sped greedy decode up 1.5% and moved
-acceptance by under a point. `MK_MTP_Q4=0` (the stored types) and `ab` (both, switched by the policy key `mtpq`) went
-with the dp4a-verify build (2026-11-01) and are refused: every main-layer matrix of those types is in the tensor-core
+verified by the unchanged main model, so greedy output and the sampled output distribution stay exact. On
+UD-Q4_K_XL it saves 107 MiB of VRAM and moves acceptance by under a point. `MK_MTP_Q4=0` (the stored types) and `ab`
+(both, switched by the policy key `mtpq`) are refused: every main-layer matrix of those types is in the tensor-core
 layout, so only the MTP block would reach dp4a kernels for them, and the engine does not compile them; a matrix of a
 type its dp4a kernels do not read is refused at load.
 
@@ -185,14 +182,14 @@ sizes, head counts and dimensions, `block_count` (the MTP block at layer 64), vo
 model and all 15 `blk.64` tensors are there. A model file without the layer (`block_count` 64), or `--no-mtp` /
 `MK_NO_MTP=1`, runs without drafting: depth 0 whatever is asked (a notice, not an error), no MTP weights, draft head
 or MTP KV slot (1/17 of the KV cache), and the prefill skips the MTP block's K / V. Greedy output equals the drafted
-engine's at depth 0 bit for bit (checked on UD-Q4_K_XL, 2026-10-17).
+engine's at depth 0 bit for bit (checked on UD-Q4_K_XL).
 
 The draft head gets the same treatment (`MK_DRAFT_Q4`, on by default; `MK_DRAFT_Q4=0` turns it off and saves its 90 MiB
 of VRAM): the 32,768 rows of the draft vocabulary are re-quantized from `output`'s Q6_K to a Q4_K copy at load (0.8 s),
 which every draft pass reads instead of the shared lm_head rows (0.69x the bytes, contiguous). Tokens added to the draft
 vocabulary on the fly still come from lm_head. Greedy output and the sampled distribution are unchanged (the main head
-verifies); the policy key `dq4=0|1` switches it at run time. Measured on 2026-10-17: +2.1% greedy decode on the short
-bench prompts (4 x 512 tokens, 7 drafts; cycles and accepted drafts identical), no measurable change at 38k and 101.6k.
+verifies); the policy key `dq4=0|1` switches it at run time. It adds ~2% to greedy decode on short prompts (the same
+cycles and accepted drafts) and nothing measurable at 38k and 101.6k.
 
 Gate and up projections of different types (25 of the 65 layers of UD-Q4_K_XL) are read each in its own type over the
 shared activations in decode. In prefill one mixed-type fused GEMM computes both (warps 0-3 gate rows, warps 4-7 up
@@ -255,9 +252,7 @@ D', E and F: [CONFIGURATION.md](CONFIGURATION.md#kv-cache-presets); their accura
 
 Each layer's cache and the RoPE table hold 2 x MAXT rows (16, ~0.6 MB in all) past the
 context: with more than 5 drafts, the last cycles before "context full" write the MTP block's draft rows up to 4
-positions past it (since 2026-10-17; before, those rows overwrote the first rows of the next head or of the next buffer,
-layer 3's cache, and a reused prefix then decoded differently; the server, which stops 16 tokens before the end, never
-got there, a CLI or C API run decoding to "context full" did).
+positions past it.
 
 In the per-layer scans made for the low-bit formats, K was ~2.3x as sensitive as V, and no setting that saved 0.5 GB
 or more stayed within the KL-divergence noise of the q8_0 cache, so the presets are opt-in.
@@ -283,7 +278,7 @@ is unchanged) and the engine takes its output rows in the batched prefill. `make
   in the encoder's own code, checked equal to glibc's on all 2^32 inputs); `mtmd` = llama.cpp's libmtmd
   encoder (any CPU); `auto` = `cpu` where it runs.
 
-Accuracy against an fp64 forward of the checkpoint (`vision/vit_ref.py`, 5 images of 196 .. 1024 tokens; 2026-10-16):
+Accuracy against an fp64 forward of the checkpoint (`vision/vit_ref.py`, 5 images of 196 .. 1024 tokens):
 relative L2 error of the rows, lowest row cosine:
 
 | encoder | rel. error | min row cosine |
@@ -328,23 +323,21 @@ frame or frame pair is an image (the same M-RoPE positions, so the engine needs 
   no state snapshots or extra state traffic.
 - **Split barrier before the DeltaNet core**: the 48 DeltaNet heads go to the first 48 blocks
   that finish the DeltaNet projections; they load the head's state and replay its accepted drafts before waiting for
-  the rest. Bitwise exact; decode +1.1% at 38k and +0.75% at 101.6k context (A-B-A, 2026-10-17).
+  the rest. Bitwise exact; about +1% decode at 38k and 101.6k context.
 - **Per-chunk waits before ffn_down**: ffn_down runs in four split-K chunks, and
   each chunk's blocks compute exactly the gate / up tiles that chunk reads, count them on the chunk's own counter and
-  wait only for that, instead of a grid barrier over all blocks. Bitwise exact; decode +0.4% at 38k, +0.6% at 101.6k and
-  +0.4% on short prompts (A-B-A, 2026-10-20).
+  wait only for that, instead of a grid barrier over all blocks. Bitwise exact; about +0.5% decode.
 - **No per-launch copy or barrier reset**: the kernel writes its control block
   to mapped host memory instead of a device-to-host copy per launch, the barrier counts carry over between launches
-  instead of being zeroed, and new draft-vocabulary rows are uploaded asynchronously. Bitwise exact; decode on Linux
-  +1.0..1.3% at 38k, +0.7..1.2% at 101.6k and +1.0..1.3% on short prompts (two A-B-As), natively on Windows +1.0% at
-  38k, +0.8% at 101.6k and +1.0% on short prompts (2026-10-20); 2 MiB more VRAM.
+  instead of being zeroed, and new draft-vocabulary rows are uploaded asynchronously. Bitwise exact; about +1% decode
+  on Linux and Windows, for 2 MiB more VRAM.
 - **Attention**: split-K flash decoding with tensor-core MMAs (Q.K^T and P.V in fp16 with fp32 accumulation, online
   softmax) over 32-position K/V tiles; the chunk boundaries depend on the context length only, so greedy output does
   not depend on the draft depth. With the q8 cache (`attn_core_q8`) each block runs a three-deep software pipeline with
   one barrier per tile (S of tile j, softmax of tile j - 1 and P V of tile j - 2 on specialised warps), the raw q8 K
   and V tiles stream through cp.async rings and both MMA operands are converted from int8 in registers. Same
-  arithmetic as the simple loop (bit-identical output), about twice its KV bandwidth at 100K context; when it went in
-  (2026-10-12) decode gained 18.7% at 101.6K depth and 7.3% at 38K. Chunks of a single tile (context <= 640) keep the
+  arithmetic as the simple loop (bit-identical output), about twice its KV bandwidth at 100K context: decode 18.7%
+  faster at 101.6K depth and 7.3% at 38K. Chunks of a single tile (context <= 640) keep the
   simple loop, which has no pipeline to fill; low-bit `MK_KV` slots run the pipelined kernel too (`attn_core_q8m`).
   At T > 5 (up to 48 query rows) one pass over K / V serves all rows (`attn_core_w48`).
 - **MTP drafting on device**, with the draft lm_head restricted to the 32,768 most frequent tokens
@@ -373,8 +366,8 @@ those waits use a high-resolution waitable timer, since a plain sleep ends at th
   dequantised to fp16 in registers (exact small integers via the `0x6400` trick, then one fp16 scale and min per
   sub-block); activations are fp16 with the elements of each 16-group permuted so that a 4-byte weight word is directly
   an MMA A fragment. Products accumulate in fp16 over k = 128, then in fp32. Measured inside a 101.6k prefill: 89-105
-  TFLOPS, 108-117 in isolation (2026-10-12). FFN gate and up share one GEMM whose epilogue writes `silu(gate) * up` as
-  the down projection's fp16 input. Stage hand-off per type (2026-10-18): in the Q5_K and IQ4_NL GEMMs each warp copies
+  TFLOPS, 108-117 in isolation. FFN gate and up share one GEMM whose epilogue writes `silu(gate) * up` as
+  the down projection's fp16 input. Stage hand-off per type: in the Q5_K and IQ4_NL GEMMs each warp copies
   the weight bytes of its own rows, so the block barrier covers only the activation tiles (one per two stages); Q6_K,
   Q3_K, IQ3_S and seven of the mixed-type gate / up pairs use per-stage mbarriers (copies two stages ahead) instead of
   the block barrier (both need four cp.async stages); the other kernels keep one block barrier per stage. Same products
@@ -388,13 +381,12 @@ those waits use a high-resolution waitable timer, since a plain sleep ends at th
   positions of one KV head (6 q heads x 16 rows); two warps per q head split S by key positions and P V by head-dim
   halves, so 12 warps keep 64 fp32 accumulators each and K / V of the next phase load during the MMAs. P V accumulates
   in fp16 per 32-position tile, then in fp32. The q-tiles of the last, partial wave are split along the keys and merged.
-  When this kernel went in (2026-10-11) the prefill of a 101.6K-token prompt went from 127.9 s to 90.3 s. With the q8
-  cache (default), Q K^T runs on int8 tensor cores straight from the cache (`pk_attn8`): Q is quantized per 32 dims
-  like the cache, each 32-dim block's int32 partial is scaled by q scale x k scale, the raw q8 K / V tiles stream
-  through a cp.async ring and V is converted for the next tile while the current one computes (2026-10-12: 59 -> 84
-  TFLOPS-equivalent in the microbenchmark at 100K; attention of a 101.6K-token prompt 38.2 s -> 25.8 s, no measurable
-  KLD change). With `MK_EXACT=1` the attention works on absolute key segments, so a row does not depend on where its
-  chunk starts.
+  With the q8 cache (default), Q K^T runs on int8 tensor cores straight from the cache (`pk_attn8`): Q is quantized per
+  32 dims like the cache, each 32-dim block's int32 partial is scaled by q scale x k scale, the raw q8 K / V tiles stream
+  through a cp.async ring and V is converted for the next tile while the current one computes (84 TFLOPS-equivalent
+  against the fp16 form's 59 in the microbenchmark at 100K; attention of a 101.6K-token prompt 25.8 s against 38.2 s,
+  no measurable KLD change). With `MK_EXACT=1` the attention works on absolute key segments, so a row does not depend
+  on where its chunk starts.
 
 ## Limitations
 
@@ -409,9 +401,9 @@ those waits use a high-resolution waitable timer, since a plain sleep ends at th
   penalties on the generated tokens (applied first; greedy too; exact under speculative verification: a verify row also
   counts the drafts before it); no repetition penalty.
 - Text, images and video (no audio; images and clips as base64; video needs ffmpeg; Qwen-VL projectors only); one
-  request at a time; several conversations are kept in host memory between requests
-  ([SERVER.md](SERVER.md#the-conversation-cache)), and an edit re-prefills from the last checkpoint before it; no slot
-  save / restore.
+  request at a time, or up to 4 text-only requests with `--agents`; several conversations are kept in host memory
+  between requests ([SERVER.md](SERVER.md#the-conversation-cache)), and an edit re-prefills from the last checkpoint
+  before it; no slot save / restore.
 
 ## Files
 

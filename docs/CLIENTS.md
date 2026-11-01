@@ -1,10 +1,9 @@
 # Clients
 
 The server speaks the three APIs that coding agents and chat UIs use: OpenAI chat completions, the Anthropic Messages
-API and the OpenAI Responses API ([SERVER.md](SERVER.md#apis-and-endpoints)). On 2026-10-21 we ran ten clients against
-it on native Windows, each through the same set of real tasks; OpenCode had been run against it in the days before. This
-page has, for each of them, the settings that worked, what goes wrong without them, and how the server handles the small
-requests the client sends on the side.
+API and the OpenAI Responses API ([SERVER.md](SERVER.md#apis-and-endpoints)). Each client below ran the same set of
+real tasks against it ([how](#how-the-clients-were-tested)). For each one: the settings that work, what goes wrong
+without them, and how the server handles the small requests the client sends on the side.
 
 With the settings below every client completed the tasks. Most need two or three settings that no client can guess for a
 local model: its context window, whether it takes images, and how to turn thinking off. None needs a setting for the
@@ -45,7 +44,7 @@ sent fresh.
 
 ## Claude Code
 
-Tested: 2.1.306 (2026-10-21). Route: `POST /v1/messages` (streamed, `?beta=true`) and
+Tested: 2.1.306. Route: `POST /v1/messages` (streamed, `?beta=true`) and
 `/v1/messages/count_tokens`.
 
 ```sh
@@ -83,7 +82,7 @@ claude --exclude-dynamic-system-prompt-sections
 
 ## Codex CLI
 
-Tested: 0.163.0 (2026-10-21). Route: `POST /v1/responses` only (Codex removed its chat-completions wire API).
+Tested: 0.163.0. Route: `POST /v1/responses` only (Codex removed its chat-completions wire API).
 
 In `~/.codex/config.toml`:
 
@@ -119,7 +118,7 @@ env_key = "MK_API_KEY"             # set MK_API_KEY to any value
 
 ## Qwen Code
 
-Tested: 0.25.3 (2026-10-21). Route: chat completions, streamed.
+Tested: 0.25.3. Route: chat completions, streamed.
 
 Environment: `OPENAI_BASE_URL=http://127.0.0.1:8080/v1`, `OPENAI_API_KEY` (any value),
 `OPENAI_MODEL=Qwen3.8-27B-UD-Q4_K_XL.gguf`, and auth type `openai` (`qwen --auth-type openai`). In
@@ -154,7 +153,7 @@ Environment: `OPENAI_BASE_URL=http://127.0.0.1:8080/v1`, `OPENAI_API_KEY` (any v
 
 ## Pi
 
-Tested: 1.3.0 (2026-10-21). Route: chat completions, streamed (system prompt as role `developer`).
+Tested: 1.3.0. Route: chat completions, streamed (system prompt as role `developer`).
 
 In `~/.pi/agent/models.json`:
 
@@ -194,7 +193,7 @@ and in `settings.json` `"defaultProvider": "mk"`, `"defaultModel": "Qwen3.8-27B-
 
 ## DeepSeek Harness (dsh)
 
-Tested: 0.2.1-rc.2 (2026-10-21), headless profile. Route: chat completions, streamed.
+Tested: 0.2.1-rc.2, headless profile. Route: chat completions, streamed.
 
 In `~/.dsh/cordis.patch.yml`:
 
@@ -235,7 +234,7 @@ In `~/.dsh/cordis.patch.yml`:
 
 ## Crush
 
-Tested: v0.98.1 (2026-10-21). Route: chat completions, streamed.
+Tested: v0.98.1. Route: chat completions, streamed.
 
 ```sh
 crush provider add mk --type openai-compat --base-url "http://127.0.0.1:8080/v1" --api-key "$MK_API_KEY"
@@ -243,7 +242,7 @@ crush model add mk/Qwen3.8-27B-UD-Q4_K_XL.gguf --name "Qwen3.8-27B (megakernel)"
     --default-max-tokens 32768 --supports-images true
 ```
 
-(We kept these as lines of the `crushrc` file, with LF line ends, plus `option provider-auto-update false`.)
+(These also work as lines of the `crushrc` file, with LF line ends, plus `option provider-auto-update false`.)
 
 - **Needed:** the provider and the model with its context window; `--supports-images true` for images (without it
   Crush does not send them).
@@ -260,7 +259,7 @@ crush model add mk/Qwen3.8-27B-UD-Q4_K_XL.gguf --name "Qwen3.8-27B (megakernel)"
 
 ## Goose
 
-Tested: 1.55.0 (2026-10-21). Route: chat completions, streamed.
+Tested: 1.55.0. Route: chat completions, streamed.
 
 Environment for the built-in `openai` provider:
 
@@ -292,13 +291,13 @@ For images, a custom provider instead, `custom_providers/mk_local.json` in Goose
   tools, the conversation in the system message) run beside it too while they fit `--side-max`.
 - **Quirks:** Goose's compaction summaries think as long as they like (85 s once): the `openai` provider has no
   per-request thinking switch (`GOOSE_THINKING_EFFORT` was not tried). Goose loads the skills and agents of other tools
-  from the user profile (`~/.claude/skills`, `~/.claude/agents`, ...) into its system prompt (~3k tokens in our runs);
+  from the user profile (`~/.claude/skills`, `~/.claude/agents`, ...) into its system prompt (~3k tokens in testing);
   on Windows it finds the profile through the Known Folder API, so a redirected `USERPROFILE` does not change that. Its
   `cmd.exe` shell cuts multi-line commands at the first newline (`GOOSE_SHELL=powershell` avoids it).
 
 ## Hermes Agent
 
-Tested: v0.22.3 (2026-10-21). Route: chat completions, streamed; at startup it probes `/props` and a few other routes
+Tested: v0.22.3. Route: chat completions, streamed; at startup it probes `/props` and a few other routes
 (three harmless 404s) and takes the server for llama-server.
 
 In `~/.hermes/config.yaml`:
@@ -333,7 +332,7 @@ auxiliary:
 
 ## Aider
 
-Tested: 0.86.2 (2026-10-21). Route: chat completions, streamed; aider sends no tools and no `max_tokens`.
+Tested: 0.86.2. Route: chat completions, streamed; aider sends no tools and no `max_tokens`.
 
 Environment: `OPENAI_API_BASE=http://127.0.0.1:8080/v1`, `OPENAI_API_KEY` (any value),
 `AIDER_MODEL=openai/Qwen3.8-27B-UD-Q4_K_XL.gguf`. In `.aider.model.settings.yml`:
@@ -367,7 +366,7 @@ and in `.aider.model.metadata.json`:
 
 ## Open WebUI
 
-Tested: 0.12.3 (2026-10-21), API path and UI tasks. Route: `GET /v1/models` and chat completions; the browser talks to
+Tested: 0.12.3, API path and UI tasks. Route: `GET /v1/models` and chat completions; the browser talks to
 Open WebUI's backend, not to the server, so no CORS setting is needed.
 
 - **Needed:** the connection under Admin > Settings > Connections > OpenAI: `http://127.0.0.1:8080/v1`, any key.
@@ -394,7 +393,7 @@ Open WebUI's backend, not to the server, so no CORS setting is needed.
 
 ## OpenCode
 
-Tested: 2.0.32 (2026-10-18 to 2026-10-20, native Windows and WSL2). Route: chat completions, streamed.
+Tested: 2.0.32 (native Windows and WSL2). Route: chat completions, streamed.
 
 In `~/.config/opencode/opencode.json`:
 
@@ -429,8 +428,8 @@ In `~/.config/opencode/opencode.json`:
   it). The model entry gives the context limit, images and the reasoning field, which round-trips as
   `reasoning_content`.
 - **Side requests:** titles run beside the session and are kept as side conversations. Two sessions at once share the
-  engine through parking: 110 s with ~72k tokens prefilled against 242 s and ~232k with the host store off (2026-10-19,
-  230,000-token context, preset D).
+  engine through parking: 110 s with ~72k tokens prefilled against 242 s and ~232k with the host store off
+  (230,000-token context, preset D).
 - **Quirks:** OpenCode's background service caches its config: run `opencode service restart` after an edit. OpenCode
   sends no sampling fields, so the server's defaults (Unsloth's Qwen3.8 thinking preset) apply.
 
@@ -444,7 +443,7 @@ feature the server refuses with a 400 (JSON schema output, forced tool choice, l
 
 ## How the clients were tested
 
-- **Live runs, 2026-10-21:** native Windows, RTX 3090; the test server ran with a 230,000-token context, preset D, 7
+- **Live runs:** native Windows, RTX 3090; the test server ran with a 230,000-token context, preset D, 7
   drafts, exact reuse, images and the 8 GiB host store. Each client was installed in its own directory with its own
   home, config and caches. Tasks: create a file with tests, find and fix a failing test, a follow-up in the same
   session, a question about a 4,900-line (~30k-token) file, an image, switching between sessions, and each client's own
@@ -452,14 +451,12 @@ feature the server refuses with a 400 (JSON schema output, forced tool choice, l
   without them, images failed in Qwen Code, Goose and Hermes (described or decoded by hand instead) and Aider's default
   edit format left stray files. The model slipped twice: Aider's arithmetic on the long-file question, and a line
   number off by two in Pi and dsh.
-- **Server versions:** the live runs used the server of 7322fbd; Codex ran on the Responses API branch that became
-  538d441. The cache rules were then changed from what these runs showed (ef4a6dd, the same day): one-shot requests
-  without tools run beside the conversation whatever their `max_tokens`, a request that only edits a conversation's
-  later history parks nothing, compaction leftovers are parked with low priority, new sessions resume at pinned
-  checkpoints, Qwen3's soft switches are applied, and Codex's max / ultra efforts are accepted. Those were checked by
-  replaying the captured requests of the live runs against both builds
-  ([SERVER.md](SERVER.md#measured-on-real-client-traffic)) and with requests of each client's shapes against the real
-  model.
+- **Server version:** the live runs predate some of the current cache rules: one-shot requests without tools run
+  beside the conversation whatever their `max_tokens`, a request that only edits a conversation's later history parks
+  nothing, compaction leftovers are parked with low priority, new sessions resume at pinned checkpoints, Qwen3's soft
+  switches are applied, and Codex's max / ultra efforts are accepted. Those were checked by replaying the captured
+  requests of the live runs ([SERVER.md](SERVER.md#measured-on-real-client-traffic)) and with requests of each
+  client's shapes against the real model.
 - **What the configs above change:** the base URL (port 8080 instead of the test port), the context (120000, the
   launchers' default, instead of 230000), the API key and display names are placeholders; the shell lines are written
   for a POSIX shell (the runs used `set` in `cmd`); settings that only served the test setup (telemetry and update
