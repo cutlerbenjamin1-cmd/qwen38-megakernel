@@ -1,6 +1,7 @@
 # build outputs (build/: out-of-tree variant builds)
 build/
 *.o
+*.o.d
 qwen38_mk
 libqwen38mk.so
 libqwen38vision.so

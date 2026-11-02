@@ -6,7 +6,13 @@ ARCH := sm_$(patsubst sm_%,%,$(ARCH))
 # the engine's extra -D flags: none for the served build; debug / experiment builds, e.g. MKFLAGS=-DMK_SPEC_LOG=1.
 # ptxas peaks at ~19 GiB of RAM (2026-10-30).
 MKFLAGS ?=
-NVFLAGS = -O3 -std=c++17 -arch=$(ARCH) -lineinfo -Xptxas -dlcm=cg -Xptxas -v -Xcompiler -fPIC $(MKFLAGS)
+# ptxas / host options as single tokens (-Xptxas=a,b): ccache does not know that nvcc's -Xptxas takes the next word, so
+# with "-Xptxas -v" it moves -v out of its pair and its `nvcc -E` fails ("Unknown option '-fPIC'"): no caching at all.
+NVFLAGS = -O3 -std=c++17 -arch=$(ARCH) -lineinfo -Xptxas=-dlcm=cg,-v -Xcompiler=-fPIC $(MKFLAGS)
+# With NVCC="ccache nvcc": depend mode (keys = the whole command line + the -MD header list). ccache's default fallback
+# hashes `nvcc -E`, which is only the device-side preprocessing, without the -D flags: a -D that changes only host-side
+# code (#ifndef __CUDA_ARCH__, e.g. in the CUDA headers) would get the other build's object back. No effect without ccache.
+export CCACHE_DEPEND ?= 1
 # Most of the build is ptxas on the megakernel (one thread, ~19 GiB heap). It runs ~20% faster when glibc's malloc asks
 # for transparent huge pages, which this tunable does (glibc 2.35+; nothing changes where THP is off). Same machine code.
 export GLIBC_TUNABLES ?= glibc.malloc.hugetlb=1
@@ -55,14 +61,14 @@ build/nvflags: FORCE
 # the device code and its launchers; ptxas register / spill report for every phase function goes to ptxas.log
 qwen38_mk.o: qwen38_mk.cu mk_shared.cuh mk_launch.h qwen38_mk.h gguf.h prefill.cuh prefill_gemm.cuh prefill_attn.cuh wv.cuh wv_dev.cuh \
 		build/nvflags
-	$(NVCC) $(NVFLAGS) -I$(LLAMA)/ggml/include -c qwen38_mk.cu -o $@ 2> ptxas.log || (cat ptxas.log; false)
+	$(NVCC) $(NVFLAGS) -I$(LLAMA)/ggml/include -MD -MF $@.d -c qwen38_mk.cu -o $@ 2> ptxas.log || (cat ptxas.log; false)
 
 # the host side (no device code: a change here does not rebuild qwen38_mk.o); the same flags, so the shared definitions agree
 HOST_SRC = engine.cu ck_pool.cu loader.cu prefill_host.cu state_files.cu host_store.cu lanes.cu
 HOST_HDR = engine_impl.h mk_shared.cuh mk_launch.h qwen38_mk.h gguf.h loader.cuh wv_host.cuh
 HOST_OBJ = $(HOST_SRC:.cu=.o)
 $(HOST_OBJ): %.o: %.cu $(HOST_HDR) build/nvflags
-	$(NVCC) $(NVFLAGS) -I$(LLAMA)/ggml/include -c $< -o $@
+	$(NVCC) $(NVFLAGS) -I$(LLAMA)/ggml/include -MD -MF $@.d -c $< -o $@
 
 qwen38_mk: qwen38_mk.o $(HOST_OBJ) main.cu logit_stats.h
 	$(NVCC) -O3 -std=c++17 -arch=$(ARCH) -I$(LLAMA)/include -I$(LLAMA)/ggml/include main.cu qwen38_mk.o $(HOST_OBJ) \
@@ -124,7 +130,7 @@ gate: qwen38_mk libqwen38mk.so
 	scripts/gate.sh $(if $(MK_MODEL),-m $(MK_MODEL)) $(GATE_ARGS)
 
 clean:
-	rm -f qwen38_mk libqwen38mk.so qwen38_mk.o $(HOST_OBJ) ptxas.log tools/vocab_freq tools/llama_ref libqwen38vision.so tools/mkv_cli tools/vision_ref tools/vit_check vision/vit_cpu.o tests/gguf_fuzz \
+	rm -f qwen38_mk libqwen38mk.so qwen38_mk.o $(HOST_OBJ) qwen38_mk.o.d $(HOST_OBJ:=.d) ptxas.log tools/vocab_freq tools/llama_ref libqwen38vision.so tools/mkv_cli tools/vision_ref tools/vit_check vision/vit_cpu.o tests/gguf_fuzz \
 		bench/wvgemm_bench bench/dattn_bench
 
 .PHONY: all vision clean exactness check gate FORCE
