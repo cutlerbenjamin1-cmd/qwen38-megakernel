@@ -58,9 +58,11 @@ Without drafts on either side: 43.5 against 46.7 tok/s on the short prompts, 36.
 | | result | measured | details |
 |---|---|---|---|
 | 4 parallel agents (`--agents 4`, Q4_K_M) | 380.1 tok/s in total on short prompts, 318.8 with a ~23k-token context each | 2026-10-30 | [parallel agents](#parallel-agents) |
+| 4 parallel agents against llama.cpp b12024's `llama-server --parallel 4` (Q4_K_M, sampled) | 381.6 against 137.2 tok/s in total on short prompts, 315.4 against 96.8 with a ~23k-token context each | 2026-11-02 | [against llama.cpp's server](#against-llamacpps-server) |
 | upstream open-jet 72ba4a7, its own scripts (Q4_K_M, 4 drafts each) | writing code 163.8 against 132.6 tok/s; with 30k tokens of code in context 118.1 against 86.9; prefill 1,878 against 1,528 tok/s | 2026-10-25 | [Q4_K_M and upstream's scripts](#q4_k_m-and-upstreams-scripts) |
 | accuracy against llama.cpp generating token by token | top token agrees on 98.737% of positions, mean KL 0.00119 nats (llama.cpp's own batched run: 98.489%, 0.00166) | 2026-10-17, unchanged through v2026.10.30 | [against llama.cpp](#against-llamacpp) |
 | KV presets D / F: KL at 100k context | 0.00226 / 0.00218, against q8_0's 0.00217 | 2026-10-25 | [KV cache presets](#kv-cache-presets) |
+| the same formats without the 8-bit ring: KL at 100k context | 0.00254 / 0.00281 (4-bit K and V: 0.00469) | 2026-11-02 | [without the ring](#without-the-ring) |
 | the full 262,144-token context, preset F | a 260,896-token prompt in 340 s, decode at that depth 66.6 tok/s, 23,650 MiB on the card | 2026-10-25 | [the full context](#the-full-context) |
 | greedy token ids at 0, 4 and 7 drafts | identical (llama.cpp b12024's greedy answers at 4 and 7 drafts: 9 of 282 differ) | each release (llama.cpp: 2026-10-31) | [speculation](#speculation) |
 | Windows build against Linux build | identical output | each release | [Windows and Linux](#windows-and-linux) |
@@ -94,6 +96,19 @@ in [bench/suite](../bench/suite/README.md#2-start-a-server).
 | VRAM, whole card, server idle | 22.7 GiB | 23.2 GiB | 21.2 GiB |
 | 282 benchmark questions: right, total time | 229, 2,563 s | 229, 2,841 s | 230, 1,676 s (2026-10-30) |
 
+The four short prompts one by one (greedy; with drafts both engines' replies have the same length within a token, so
+each row times the same amount of work):
+
+| prompt (reply tokens) | llama.cpp, 4 drafts | llama.cpp, 7 drafts | this engine, 7 drafts | this engine against llama.cpp at 4 |
+|---|---|---|---|---|
+| a Python function that checks whether a number is prime, with a docstring and doctests (273) | 110.8 tok/s | 109.9 | 232.9 | 2.10x |
+| how a hash map works internally, for a junior developer (512) | 85.2 tok/s | 66.0 | 145.2 | 1.70x |
+| a ~300-word short story about a lighthouse keeper (510; this engine 511) | 61.4 tok/s | 42.9 | 90.8 | 1.48x |
+| a step-by-step plan for migrating a Flask REST API to FastAPI (512) | 89.8 tok/s | 74.9 | 158.7 | 1.77x |
+
+Code drafts best and prose worst, for both engines: llama.cpp accepted 213 of 236 drafted tokens on the prime check at 4
+drafts and 306 of 811 on the story.
+
 ### Without drafts
 
 The same clients with no drafting on either side (llama.cpp without `--spec-type`, this engine with `MK_DRAFT=0`):
@@ -104,6 +119,10 @@ The same clients with no drafting on either side (llama.cpp without `--spec-type
 | sampled decode, thinking on, mean of request rates | 43.3 tok/s | 46.4 | 7.3% |
 | decode at 11.6k / 38k / 101.6k context | 40.8 / 36.1 / 27.8 tok/s | 45.3 / 43.3 / 39.1 | 11% / 20% / 41% |
 | VRAM, whole card, server idle | 21.1 GiB | 21.1 GiB | |
+
+Per prompt, greedy: llama.cpp 43.4 to 43.5 tok/s, this engine 46.6 to 46.9 (7.2% to 7.8% ahead). llama.cpp's greedy
+story without drafts was 460 tokens long, against 510 at 4 and 7 drafts ([speculation](#speculation)); this engine's was
+511 at 0 and at 7.
 
 Notes:
 - **Draft depth.** 4 drafts is llama.cpp's fastest setting here, as it was on b11548: 2, 5 and 6 drafts, measured in
@@ -271,6 +290,38 @@ waiting prompt whole instead (`MK_PF_MIX=0 MK_PF_CHUNK=0`; another session that 
 11.5 / 10.7 tok/s there) got the 20k-token prompt's first token after 11.0 s, while the other request made 0.6 tok/s
 meanwhile.
 
+### Against llama.cpp's server
+
+The same client against llama.cpp b12024's `llama-server --parallel 4` (the tuned command of
+[bench/suite](../bench/suite/README.md#2-start-a-server) with `-np 4` and `-c 100000`: 25,000 positions per slot; 4 MTP
+drafts, q8_0 KV cache, natively on Windows), then this server (v2026.10.30, `--agents 4 -d 7 --kv q8`: 33,280 positions
+per slot, WSL2), back to back in one session on 2026-11-02, unsloth's plain `Qwen3.8-27B-Q4_K_M.gguf`:
+
+| | llama-server --parallel 4 | this server | |
+|---|---|---|---|
+| 4 short requests at once, total tok/s (better of 2 runs) | 137.2 | 381.6 | 2.78x |
+| 4 requests with ~23k-token contexts, total tok/s | 96.8 | 315.4 | 3.26x |
+| the same: the slowest first token | 0.61 s | 0.54 s | |
+| a ~20k-token prompt sent while another request decodes: its first token | 16.4 s | 13.7 s | |
+| the other request meanwhile | 2.3 tok/s | 14.3 tok/s | |
+| 1 short request alone, tok/s (better of 2 runs) | 61.1 | 190.8 | 3.12x |
+| 1 request with a ~23k-token context alone, tok/s | 61.0 | 159.7 | 2.62x |
+| VRAM at ready, whole card | 24,014 MiB | 22,500 MiB | |
+
+- A total adds the requests' decode rates (512 tokens each, sampled at temperature 0.6, top_p 0.95, top_k 20).
+  llama.cpp's per-request token counts come from its stream's `timings.predicted_n`, as for this server.
+- **Context:** with `-np 4` and MTP drafting, llama-server does not load at `-c 120000` on this card: its MTP draft
+  context's KV cache (472 MiB) fails to allocate. The ctx test's prompts are 23,316 to 23,323 tokens, plus 512
+  generated.
+- **Checked after the run, the same session:** llama-server's own timings match the client's (60.3 / 61.9 tok/s against
+  60.5 / 62.1). One request decodes at the same ~61 tok/s with `-np 4 -c 64000` (1.4 GB less VRAM in use) and with
+  `-np 1 -c 100000`, and 4 at once give 131 tok/s at `-c 64000` against 126 / 132 at `-c 100000`. Its process's shared
+  GPU memory stays at 280 to 640 MiB in every configuration (pinned host buffers), so the `-c 100000` run did not page
+  into system memory. Its SM clock read 780 to 1,245 MHz right after its runs (this server: 1,950 to 1,965 MHz).
+- The gaps are larger than single-stream ([against llama.cpp](#against-llamacpp-2026-10-31)) because this client
+  samples: llama.cpp's sampled decode with MTP drafts is its slower path.
+- This server's own pass earlier in the same session, before llama-server's: 371.0 / 331.0 / 183.0 / 179.0 tok/s.
+
 ## KV cache presets
 
 `MK_KV` stores K and V below 8 bits, and `MK_KV_WIN=2048` keeps the most recent 2,048 positions in an 8-bit ring next
@@ -386,6 +437,25 @@ q8_0 included: compare within a row. Top-token agreement / mean KL / perplexity:
   This engine's q8_0 cache held the 163,904 positions in 6.06 GB (the `--kld` CLI under WSL2: no server, no draft
   head).
 
+### Without the ring
+
+The presets' formats with no 8-bit ring (`MK_KV` without `MK_KV_WIN`) on the real kernels: the v2026.10.25 Linux package
+(the build of the 100k / 160k rows above), the same references and scoring, 2026-11-02. Mean KL in nats, lower is
+better, with the excess over q8_0's in the same row:
+
+| set | q8_0 | `K*=6,V*=5`, no ring | `K*=5r,V*=5`, no ring | `K*=4,V*=4`, no ring |
+|---|---|---|---|---|
+| ~32k, code | 0.00219 | 0.00258 (+18%) | 0.00302 (+38%) | 0.00525 (2.4x) |
+| 64k, code | 0.00163 | 0.00183 (+12%) | 0.00197 (+21%) | 0.00334 (2.0x) |
+| 100k, code | 0.00217 | 0.00254 (+17%) | 0.00281 (+29%) | 0.00469 (2.2x) |
+| 100k, War and Peace | 0.00311 | 0.00342 (+10%) | 0.00376 (+21%) | 0.00602 (1.9x) |
+| 160k, War and Peace | 0.00467 | 0.00496 (+6%) | 0.00515 (+10%) | 0.00740 (1.6x) |
+
+- With the 2,048 ring the same formats read q8_0's numbers from 64k out (presets D and F above): the ring is what makes
+  5-bit K usable.
+- Continuity: preset F with the ring at ~32k on this package gives the published report byte for byte (0.00242), and
+  4-bit K and V at ~32k / 64k equal the 2026-10-15 build's 0.00525 / 0.00334.
+
 ### The window size and rotation
 
 Why the presets use a 2,048-position window and, except for F's K, unrotated rows. All rows below come from the
@@ -464,8 +534,9 @@ which the device / host split rewrote, so a later run of the script is not compa
   the reasoning itself went another way (2,228 against 4,795 tokens on one). Asked again twice at 4 drafts on a fresh
   server, the 9 got the same answer both times (reasoning text included), and on 8 of them the first run's: those 8
   differences come from the draft depth. The ninth's first answer came after the other questions on the same server and
-  is not reproduced without them (3,692 against 4,405 tokens). A preregistered study of llama.cpp's MTP on one RTX 3090
-  (Hsiu-Chi Tsai, 2026-08-29, [repository](https://github.com/thc1006/qwen3.8-speculative-decoding-rtx3090),
+  is not reproduced without them (3,692 against 4,405 tokens). The speed run's short story shows it too: 460 tokens
+  without drafts, 510 at 4 and at 7 (2026-10-31). A preregistered study of llama.cpp's MTP on one RTX 3090 (Hsiu-Chi
+  Tsai, 2026-08-29, [repository](https://github.com/thc1006/qwen3.8-speculative-decoding-rtx3090),
   [archive](https://doi.org/10.5281/zenodo.22149941)) found its output the same from pass to pass but different from
   decoding without drafts in 23 to 25 of 25 prompts by 1,600 tokens.
 - **Sampling keeps the distribution of sampling without drafts.** A draft is accepted with probability p(draft) and a

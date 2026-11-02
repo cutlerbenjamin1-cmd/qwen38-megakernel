@@ -51,8 +51,9 @@ one session.
   switching between conversations.
 - **[OpenAI, Anthropic and Responses APIs](#works-with-your-coding-agent)**, tested with 11 coding agents and chat UIs.
 - **Images and video**, encoded on the CPU, so they take no VRAM.
-- **Several agents at once:** `--agents 4` serves 380 tok/s in total on short prompts (Q4_K_M), 319 with ~23k tokens
-  of context each ([parallel agents](docs/BENCHMARKS.md#parallel-agents)).
+- **Several agents at once:** `--agents 4` serves 382 tok/s in total on short prompts (Q4_K_M), 315 with ~23k tokens
+  of context each, against 137 and 97 for llama.cpp's `llama-server --parallel 4` in the same session, sampled
+  ([parallel agents](docs/BENCHMARKS.md#parallel-agents)).
 - **Prebuilt packages** for Windows and Linux.
 
 ## Quick start
