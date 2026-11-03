@@ -573,7 +573,7 @@ class Engine:
         return self.L.mk_park_need(self.h, max_cks)
 
     # ---- parallel slots (--agents: SlotScheduler drives them from its thread) ----
-    SLOT_PER = 16  # tokens a slot can emit in one cycle that the output arrays hold (1 + its drafts, at most MAXT)
+    SLOT_PER = 16  # tokens a slot can emit in one cycle that the output arrays hold (1 + its drafts, at most MAXD)
 
     def slots_open(self, n, ctx):
         """opens n slots of ctx positions each (0: the most that fit, leaving MK_SLOT_RESERVE_MIB of the device memory

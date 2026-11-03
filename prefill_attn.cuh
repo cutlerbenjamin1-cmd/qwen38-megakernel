@@ -646,14 +646,24 @@ __device__ __forceinline__ void a8_issue(uint8_t * st, const int8_t * Kq, const 
     for (int k = 0; k < 3; k++) a8_issue_k(st, Kq, Vq, Vs, kb, np, k, kbits, vbits);
     pf::cpa_commit();
 }
-// K scales of tile rows kb ..: thread t < 256 loads position t >> 3, block t & 7; a8_st_ks stores it transposed as fp32
-__device__ __forceinline__ float a8_ld_ks(const __half * Ks, int kb, int np) {
-    const int p = threadIdx.x >> 3;
-    if (threadIdx.x >= 8 * A2_K || p >= np) return 0.f;
-    return __half2float(__ushort_as_half(__ldg(reinterpret_cast<const unsigned short *>(Ks) + (size_t) (kb + p) * (HD / 32) + (threadIdx.x & 7))));
+// K scales of tile rows kb ..: thread t = tid - 256 (warps 8 - 11, which have no third a8_cv_v / V chunk) loads the fp16
+// pair of position t >> 2, blocks 2 (t & 3) and 2 (t & 3) + 1 as raw bits (rows of 16 B: 4-B aligned); a8_st_ks converts
+// them and stores them transposed as fp32. The conversion sits at the store, a tile later: converting right after the
+// load stalled warps 0 - 7 on the load's latency before the S MMAs of every tile (and warps 8 - 11 at the next barrier).
+constexpr int A8_KST = A2_NT - 4 * A2_K; // first thread of the K-scale loads
+__device__ __forceinline__ unsigned a8_ld_ks(const __half * Ks, int kb, int np) {
+    const int t = (int) threadIdx.x - A8_KST, p = t >> 2;
+    if (t < 0 || p >= np) return 0u;
+    return __ldg(reinterpret_cast<const unsigned *>(Ks + (size_t) (kb + p) * (HD / 32)) + (t & 3));
 }
-__device__ __forceinline__ void a8_st_ks(uint8_t * st, float v) {
-    if (threadIdx.x < 8 * A2_K) reinterpret_cast<float *>(st + A8_KB)[(threadIdx.x & 7) * A2_K + (threadIdx.x >> 3)] = v;
+__device__ __forceinline__ void a8_st_ks(uint8_t * st, unsigned v) {
+    const int t = (int) threadIdx.x - A8_KST;
+    if (t >= 0) {
+        const float2 f = __half22float2(pf::u2h(v));
+        float * ks = reinterpret_cast<float *>(st + A8_KB) + 2 * (t & 3) * A2_K + (t >> 2);
+        ks[0] = f.x;
+        ks[A2_K] = f.y;
+    }
 }
 // chunk k (of 3) of this thread: 8 V values of ring stage st -> fp16 in sV (a2_q8h / a2_q4h / a2_qnh, as pk_attn2).
 // VB (4 .. 7): vbits is 8 or VB (the slot's low-bit V, known at compile time); 0: any
@@ -674,6 +684,12 @@ __device__ __forceinline__ void a8_cv_v(const uint8_t * st, __half * sV, int k, 
 
 // scores in log2 units: log2 e is folded into the Q scales, P = exp2(s - m)
 constexpr float A8_L2E = 1.4426950408889634f;
+// exp2f(x), or v where the row maximum mn is still -inf (x is NaN there): computed unconditionally, then selected. The
+// ternary `mn == -inf ? v : exp2f(x)` compiled to a branch (BSSY / BRA / BSYNC) around every pair of exp2f; same values
+__device__ __forceinline__ float a8_ex2(float x, float mn, float v) {
+    const float e = exp2f(x);
+    return mn == -INFINITY ? v : e;
+}
 // KLOW: the slot's K is low-bit (q4..q7): its tiles are expanded to int8 in the staging. The KLOW = false instantiation is the
 // plain q8 kernel (no per-tile format checks: the host picks the instantiation per slot). KB / VB (4 .. 7, 0 = read per slot):
 // the slot's main-buffer K / V bits at compile time (a tile is then KB / VB or 8, the q8 window ring): folds the expansion's
@@ -754,7 +770,7 @@ __global__ void __launch_bounds__(A2_NT, 1) pk_attn8(int T, int n0, int slot, in
     const int kbs = KB ? KB : kf.kb, vbs = VB ? VB : kf.vb; // the main buffer's K / V bits
     auto kbt = [&](int it) { return it >= itr_k ? 8 : kbs; };
     auto vbt = [&](int it) { return it >= itr_v ? 8 : vbs; };
-    auto issue_tile = [&](uint8_t * st, int it, int np) { // K, V, V scales of tile it -> stage st; returns this thread's K scale
+    auto issue_tile = [&](uint8_t * st, int it, int np) { // K, V, V scales of tile it -> stage st; returns this thread's K scales (raw)
         const int8_t *tk, *tv;
         const __half *tks, *tvs;
         kv_tile_src(0, slot, g, it * A2_K, wsr, wsm, kbs, it >= itr_k, tk, tks);
@@ -955,7 +971,7 @@ __global__ void __launch_bounds__(A2_NT, 1) pk_attn8(int T, int n0, int slot, in
         const int vbn = vbt(it + 1); // V(it + 1)'s format
         const int ia = it + A8_NS - 1; // refill the stage of tile it - 1 with tile ia
         uint8_t * sta = asm_ + (ia % A8_NS) * A8_STG;
-        float ksn = 0.f;
+        unsigned ksn = 0u;
         if (ia < it1) {
             const int kba = ia * A2_K, npa = min(A2_K, pmax + 1 - kba);
             ksn = issue_tile(sta, ia, npa);
@@ -1037,15 +1053,15 @@ __global__ void __launch_bounds__(A2_NT, 1) pk_attn8(int T, int n0, int slot, in
             mx1 = fmaxf(mx1, t.y);
         }
         const float mn0 = fmaxf(m0, mx0), mn1 = fmaxf(m1, mx1);
-        const float al0 = mn0 == -INFINITY ? 1.f : exp2f(m0 - mn0), al1 = mn1 == -INFINITY ? 1.f : exp2f(m1 - mn1);
+        const float al0 = a8_ex2(m0 - mn0, mn0, 1.f), al1 = a8_ex2(m1 - mn1, mn1, 1.f);
         float x0[2], x1[2];
         unsigned pa[2][2];
 #pragma unroll
         for (int ni = 0; ni < 2; ni++) {
-            const float p0 = mn0 == -INFINITY ? 0.f : exp2f(s[ni][0] - mn0);
-            const float p1 = mn0 == -INFINITY ? 0.f : exp2f(s[ni][1] - mn0);
-            const float p2 = mn1 == -INFINITY ? 0.f : exp2f(s[ni][2] - mn1);
-            const float p3 = mn1 == -INFINITY ? 0.f : exp2f(s[ni][3] - mn1);
+            const float p0 = a8_ex2(s[ni][0] - mn0, mn0, 0.f);
+            const float p1 = a8_ex2(s[ni][1] - mn0, mn0, 0.f);
+            const float p2 = a8_ex2(s[ni][2] - mn1, mn1, 0.f);
+            const float p3 = a8_ex2(s[ni][3] - mn1, mn1, 0.f);
             x0[ni] = p0 + p1;
             x1[ni] = p2 + p3;
             __half2 h01 = __floats2half2_rn(p0, p1), h23 = __floats2half2_rn(p2, p3);

@@ -623,8 +623,9 @@ struct MKEngine::Impl {
     template <int TYPE, bool GLU, int LAY = 0> void mmh_attr() { mkl::pf_mmh_attr<TYPE, GLU, LAY>(); }
     // nrt row tiles (CTAs along N) x token tiles of pf_nb tokens; LAY 1: the matrix is in the wv layout
     template <int TYPE, bool GLU, int LAY = 0>
-    void mmh_launch(int nrt, const pf::WMat & W, const __half * X, int ntok, const pf::Out & O, const uint8_t * W2 = nullptr) {
-        mkl::pf_mmh<TYPE, GLU, LAY>(pf_nb(ntok, nrt), nrt, &W, X, ntok, &O, W2);
+    void mmh_launch(int nrt, const pf::WMat & W, const __half * X, int ntok, const pf::Out & O, const uint8_t * W2 = nullptr,
+                    cudaStream_t st = 0) {
+        mkl::pf_mmh<TYPE, GLU, LAY>(pf_nb(ntok, nrt), nrt, &W, X, ntok, &O, W2, st);
     }
 
     // pf::mmh's shapes: K in pairs of BK-wide stages (the pipelined loop steps two stages; fp16 sums span two), N in whole
@@ -641,8 +642,15 @@ struct MKEngine::Impl {
     // prints the counts of the prefill that just finished (device synchronised) and clears them
     void chk_report(int npos);
 #endif
-    // y[t][row] (+)= W x_t for the first ntok fp16 rows of xh (token offset t0)
-    void gemm(const Mat & m, int ntok, float * y, int ldy, int mode, int t0 = 0, const __half * xin = nullptr);
+    // y[t][row] (+)= W x_t for the first ntok fp16 rows of xh (token offset t0), on stream st
+    void gemm(const Mat & m, int ntok, float * y, int ldy, int mode, int t0 = 0, const __half * xin = nullptr, cudaStream_t st = 0);
+    // pf_fork (MK_PFX bit 1 clear): a layer's independent GEMMs run side by side, so their CTAs share one partial last wave
+    // instead of one each (DN: gate on pf_s2 next to qkv; attention: k on pf_s2 and v on pf_s3 next to q; joined by
+    // pf_e1 / pf_e2 before their outputs are read). Launch placement only: the same kernels on the same data.
+    int pfx_bits = 0;
+    bool pf_fork = false;
+    cudaStream_t pf_s3 = nullptr;
+    cudaEvent_t pf_e2 = nullptr;
 
     // xh2[t] = silu(Wg x_t) * (Wu x_t) for the first ntok rows of xh: one fused GEMM when gate and
     // up share a type with in-row scales, else two GEMMs into y0 / y1 and pk_glu

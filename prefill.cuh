@@ -181,6 +181,101 @@ __global__ void __launch_bounds__(256) pk_ab(const float * Wab, const int8_t * a
     }
 }
 
+// pk_ab with blocks of 128 threads of 8 tokens x 6 rows (MK_PFX bit 16 off; Q8: abq != nullptr). Every output is the same
+// chain as pk_ab's (from 0, fmaf(x, w, acc) over its split's k in order, times rs; w formed by the same expression), but
+// a k step costs 2 x float4 + 3 x float2 shared loads per 48 FMAs (pk_ab: 1 + 3 per 24; it is bound by its shared-memory
+// wavefronts), the x tile is stored without bank conflicts, and the next tile's global loads are in flight during the
+// FMAs (pk_ab loads, stores, then computes). Thread (tg, rg): tokens 4 tg + {0..3} and 32 + 4 tg + {0..3} (8 lanes read 128
+// contiguous bytes), rows 6 rg + {0..5}.
+template <bool Q8>
+__global__ void __launch_bounds__(128, 4) pk_ab2(const float * Wab, const int8_t * abq, const __half * abd, const float * fn, int T) { MK_VIEW_INIT();
+    __shared__ __align__(16) float sx[32][64 + 4]; // [k][token]
+    __shared__ __align__(16) float sw[32][96 + 4]; // [k][row]
+    const int tid = threadIdx.x, tg = tid & 7, rg = tid >> 3;
+    const int t0 = blockIdx.x * 64, k00 = blockIdx.y * AB_KS;
+    const int xt = tid & 63, xk = 4 * (tid >> 6); // x fill: token xt, k quads xk + 8 m (lanes along tokens)
+    const int wk = 4 * (tid & 7), wr = tid >> 3;  // w fill: rows wr + 16 m, k quad wk (as pk_ab)
+    float acc[8][6];
+#pragma unroll
+    for (int i = 0; i < 8; i++)
+#pragma unroll
+        for (int j = 0; j < 6; j++) acc[i][j] = 0.f;
+    float4 px[4], pw[Q8 ? 1 : 6]; // Q8: pw[0] = fn of the quad
+    int pq[Q8 ? 6 : 1];
+    __half pd[Q8 ? 6 : 1];
+    const bool xin = t0 + xt < T;
+    auto load = [&](int k0) {
+#pragma unroll
+        for (int m = 0; m < 4; m++)
+            px[m] = xin ? __ldg(reinterpret_cast<const float4 *>(cP.x + (size_t) (t0 + xt) * D + k0 + xk + 8 * m))
+                        : make_float4(0.f, 0.f, 0.f, 0.f);
+#pragma unroll
+        for (int m = 0; m < 6; m++) {
+            const int rr = wr + 16 * m;
+            if constexpr (Q8) {
+                pq[m] = __ldg(reinterpret_cast<const int *>(abq + (size_t) rr * D + k0 + wk));
+                pd[m] = abd[(size_t) rr * (D / 32) + ((k0 + wk) >> 5)];
+            } else {
+                pw[m] = __ldg(reinterpret_cast<const float4 *>(Wab + (size_t) rr * D + k0 + wk));
+            }
+        }
+        if constexpr (Q8) pw[0] = __ldg(reinterpret_cast<const float4 *>(fn + k0 + wk));
+    };
+    auto store = [&] {
+#pragma unroll
+        for (int m = 0; m < 4; m++) {
+            const int kk = xk + 8 * m;
+            sx[kk][xt] = px[m].x; sx[kk + 1][xt] = px[m].y; sx[kk + 2][xt] = px[m].z; sx[kk + 3][xt] = px[m].w;
+        }
+#pragma unroll
+        for (int m = 0; m < 6; m++) {
+            const int rr = wr + 16 * m;
+            float4 v;
+            if constexpr (Q8) {
+                const int qw = pq[m];
+                const float d = __half2float(pd[m]);
+                const float4 f = pw[0];
+                v.x = ((float) (int8_t) (qw) * d) * f.x;
+                v.y = ((float) (int8_t) (qw >> 8) * d) * f.y;
+                v.z = ((float) (int8_t) (qw >> 16) * d) * f.z;
+                v.w = ((float) (int8_t) (qw >> 24) * d) * f.w;
+            } else {
+                v = pw[m];
+            }
+            sw[wk][rr] = v.x; sw[wk + 1][rr] = v.y; sw[wk + 2][rr] = v.z; sw[wk + 3][rr] = v.w;
+        }
+    };
+    load(k00);
+    for (int k0 = k00; k0 < k00 + AB_KS; k0 += 32) {
+        store();
+        __syncthreads();
+        if (k0 + 32 < k00 + AB_KS) load(k0 + 32);
+#pragma unroll 4
+        for (int kk = 0; kk < 32; kk++) {
+            const float4 xa = *reinterpret_cast<const float4 *>(&sx[kk][4 * tg]);
+            const float4 xb = *reinterpret_cast<const float4 *>(&sx[kk][32 + 4 * tg]);
+            const float2 w0 = *reinterpret_cast<const float2 *>(&sw[kk][6 * rg]);
+            const float2 w1 = *reinterpret_cast<const float2 *>(&sw[kk][6 * rg + 2]);
+            const float2 w2 = *reinterpret_cast<const float2 *>(&sw[kk][6 * rg + 4]);
+            const float xv[8] = {xa.x, xa.y, xa.z, xa.w, xb.x, xb.y, xb.z, xb.w};
+            const float wv[6] = {w0.x, w0.y, w1.x, w1.y, w2.x, w2.y};
+#pragma unroll
+            for (int i = 0; i < 8; i++)
+#pragma unroll
+                for (int j = 0; j < 6; j++) acc[i][j] = fmaf(xv[i], wv[j], acc[i][j]);
+        }
+        __syncthreads();
+    }
+#pragma unroll
+    for (int i = 0; i < 8; i++) {
+        const int t = t0 + (i < 4 ? 4 * tg + i : 32 + 4 * tg + i - 4);
+        if (t >= T) continue;
+        const float rs = __ldg(cP.rs + t);
+#pragma unroll
+        for (int j = 0; j < 6; j++) cP.ab[((size_t) blockIdx.y * cP.cap + t) * 96 + 6 * rg + j] = acc[i][j] * rs;
+    }
+}
+
 // conv1d (kernel 4, causal, continuing from the conv ring) + silu, l2-norm of q / k, log g / beta
 __global__ void __launch_bounds__(256) pk_dn_prep(int T, int n0, int dl, const float * convw, const float * dt,
                                                   const float * A) { MK_VIEW_INIT();
@@ -487,6 +582,256 @@ __global__ void __launch_bounds__(256, 2) pk_dn_scan(int T, int t0, const float 
             }
         }
         __syncthreads();
+
+        // U = T diag(beta) V - T diag(beta gamma) (K S)
+        float u[2][4] = {}, ws[2][4] = {};
+#pragma unroll
+        for (int s = 0; s < 2; s++) { // k = tokens 16 s ..
+            unsigned bv[2];
+            ldsm2t(bv, &sV[16 * s + (lane & 15)][8 * w]);
+            const unsigned bk0 = movt(pk2(ks[s][0], ks[s][1])), bk1 = movt(pk2(ks[s][2], ks[s][3]));
+#pragma unroll
+            for (int mt = 0; mt < 2; mt++) {
+                if (s > mt) continue; // T is lower triangular
+                unsigned a[4];
+                ldsm4(a, &sT0[16 * mt + (lane & 15)][16 * s + 8 * (lane >> 4)]);
+                mma4(u[mt], a, bv[0], bv[1]);
+                ldsm4(a, &sT1[16 * mt + (lane & 15)][16 * s + 8 * (lane >> 4)]);
+                mma4(ws[mt], a, bk0, bk1);
+            }
+        }
+#pragma unroll
+        for (int mt = 0; mt < 2; mt++)
+#pragma unroll
+            for (int e = 0; e < 4; e++) u[mt][e] -= ws[mt][e];
+
+        // O = diag(gamma) Q S + P U
+        float o[2][4];
+#pragma unroll
+        for (int mt = 0; mt < 2; mt++) {
+            const float ga = sg[16 * mt + g], gb_ = sg[16 * mt + g + 8];
+            o[mt][0] = ga * qs[mt][0]; o[mt][1] = ga * qs[mt][1];
+            o[mt][2] = gb_ * qs[mt][2]; o[mt][3] = gb_ * qs[mt][3];
+        }
+#pragma unroll
+        for (int s = 0; s < 2; s++) {
+            const unsigned bu0 = movt(pk2(u[s][0], u[s][1])), bu1 = movt(pk2(u[s][2], u[s][3]));
+#pragma unroll
+            for (int mt = 0; mt < 2; mt++) {
+                if (s > mt) continue;
+                unsigned a[4];
+                ldsm4(a, &sP[16 * mt + (lane & 15)][16 * s + 8 * (lane >> 4)]);
+                mma4(o[mt], a, bu0, bu1);
+            }
+        }
+#pragma unroll
+        for (int mt = 0; mt < 2; mt++)
+#pragma unroll
+            for (int hf = 0; hf < 2; hf++) {
+                const int t = tb + 16 * mt + g + 8 * hf;
+                if (t < T)
+                    *reinterpret_cast<float2 *>(cP.y2 + (size_t) (t0 + t) * VD + h * 128 + col0 + 2 * t4) =
+                        make_float2(o[mt][2 * hf], o[mt][2 * hf + 1]);
+            }
+
+        // S = gamma_31 S + K^T diag(exp(a_31 - a)) U
+        const float gl = sg[DC - 1];
+#pragma unroll
+        for (int mt = 0; mt < 8; mt++)
+#pragma unroll
+            for (int e = 0; e < 4; e++) S[mt][e] *= gl;
+#pragma unroll
+        for (int s = 0; s < 2; s++) {
+            const float da = sd[16 * s + g], db = sd[16 * s + g + 8];
+            const unsigned b0 = movt(pk2(u[s][0] * da, u[s][1] * da)), b1 = movt(pk2(u[s][2] * db, u[s][3] * db));
+#pragma unroll
+            for (int mt = 0; mt < 8; mt++) {
+                unsigned a[4];
+                ldsm4t(a, &sK[16 * s + (lane & 7) + ((lane >> 4) << 3)][16 * mt + ((lane >> 3) & 1) * 8]);
+                mma4(S[mt], a, b0, b1);
+            }
+        }
+    }
+#pragma unroll
+    for (int mt = 0; mt < 8; mt++) {
+        float * p = st_out + (size_t) h * 128 * 128;
+        const int c = col0 + 2 * t4, rw = 16 * mt + g;
+        p[dn_sidx(c, rw)] = S[mt][0];
+        p[dn_sidx(c + 1, rw)] = S[mt][1];
+        p[dn_sidx(c, rw + 8)] = S[mt][2];
+        p[dn_sidx(c + 1, rw + 8)] = S[mt][3];
+    }
+}
+
+// pk_dn_scan's S-independent per-chunk matrices for every 32-row chunk of rows 0 .. T - 1 at once (MK_PFX bit 2 off):
+// per value head h and chunk c the fp16 [32][32] matrices T0 = T diag(beta), T1 = T diag(beta gamma) and P at
+// tri + ((c NVH + h) 3 + {0, 1, 2}) 1024. Block = (key head, chunk): K K^T and Q K^T once for the DN_GV value heads that
+// share the key head (pk_dn_scan makes them per value head and column half with the same MMAs: the same values), then
+// per value head pk_dn_scan's exp scaling, triangular solve and fp16 roundings. Rows >= T are zero, as pk_dn_scan's.
+constexpr int DN_GV = NVH / NKH; // value heads h = kh + NKH j of key head kh
+__global__ void __launch_bounds__(256) pk_dn_tri(int T, __half * tri) { MK_VIEW_INIT();
+    __shared__ __align__(16) __half sK[DC][DC_LD], sQ[DC][DC_LD];
+    __shared__ __align__(16) float sAT[DN_GV][DC][DC_LA]; // A transposed per value head: sAT[v][j][i] = A_ij
+    __shared__ float sa[DN_GV][DC], sb[DN_GV][DC], sg[DN_GV][DC];
+    const int kh = blockIdx.x, c = blockIdx.y, tb = DC * c, tid = threadIdx.x, lane = tid & 31, w = tid >> 5, g = lane >> 2, t4 = lane & 3;
+#pragma unroll
+    for (int k = 0; k < 4; k++) {
+        const int i = tid + 256 * k, tt = i >> 5, cc = i & 31, t = tb + tt;
+        const uint4 v = t < T ? __ldg(reinterpret_cast<const uint4 *>(cP.dq + (size_t) t * QKV + (cc < 16 ? 0 : NKH * 128) + kh * 128) + (cc & 15))
+                              : make_uint4(0, 0, 0, 0);
+        *reinterpret_cast<uint4 *>(cc < 16 ? &sQ[tt][8 * cc] : &sK[tt][8 * (cc - 16)]) = v;
+    }
+    if (w < DN_GV) { // value head kh + NKH w: cumulative log gates as in pk_dn_scan's put (padding rows: log g = 0, beta = 0)
+        const int h = kh + NKH * w, tl = tb + lane;
+        const float beta = tl < T ? __ldg(cP.gb + (size_t) tl * 96 + NVH + h) : 0.f;
+        float a = tl < T ? __ldg(cP.gb + (size_t) tl * 96 + h) : 0.f;
+#pragma unroll
+        for (int o = 1; o < 32; o <<= 1) {
+            const float y = __shfl_up_sync(0xffffffffu, a, o);
+            if (lane >= o) a += y;
+        }
+        sa[w][lane] = a;
+        sb[w][lane] = beta;
+        sg[w][lane] = __expf(a);
+    }
+    __syncthreads();
+    { // K K^T (warps 0-3) and Q K^T (warps 4-7): 2 n8 tiles each, as pk_dn_scan; then A (fp32, transposed) and P per value head
+        const int isq = w >> 2, mt = (w >> 1) & 1, n0 = 16 * (w & 1);
+        const __half (*X)[DC_LD] = isq ? sQ : sK;
+        float c0[4] = {0.f, 0.f, 0.f, 0.f}, c1[4] = {0.f, 0.f, 0.f, 0.f};
+#pragma unroll
+        for (int s = 0; s < 8; s++) {
+            unsigned a[4], b[4];
+            ldsm4(a, &X[16 * mt + (lane & 15)][16 * s + 8 * (lane >> 4)]);
+            ldsm4(b, &sK[n0 + (lane & 7) + ((lane >> 4) << 3)][16 * s + ((lane >> 3) & 1) * 8]);
+            mma4(c0, a, b[0], b[1]);
+            mma4(c1, a, b[2], b[3]);
+        }
+        __half * pg = tri + ((size_t) (c * NVH + kh) * 3 + 2) * (DC * DC); // P of value head kh (+ NKH 3 DC DC per j)
+#pragma unroll
+        for (int v = 0; v < DN_GV; v++)
+#pragma unroll
+            for (int e = 0; e < 8; e++) {
+                const int i = 16 * mt + g + ((e & 2) ? 8 : 0), j = n0 + 8 * (e >> 2) + 2 * t4 + (e & 1);
+                const float x = (e >> 2) ? c1[e & 3] : c0[e & 3];
+                const float f = j <= i ? __expf(sa[v][i] - sa[v][j]) * x : 0.f;
+                if (isq) pg[(size_t) v * NKH * 3 * DC * DC + i * DC + j] = __float2half_rn(f);
+                else sAT[v][j][i] = j < i ? sb[v][i] * f : 0.f;
+            }
+    }
+    __syncthreads();
+    if (w < DN_GV) { // T = (I + A)^-1 of value head kh + NKH w (lane = column, right-looking), as pk_dn_scan's warp 0
+        float x[DC];
+#pragma unroll
+        for (int i = 0; i < DC; i++) x[i] = i == lane ? 1.f : 0.f;
+#pragma unroll
+        for (int j = 0; j < DC - 1; j++) {
+#pragma unroll
+            for (int i4 = (j + 1) / 4; i4 < DC / 4; i4++) {
+                const float4 a4 = *reinterpret_cast<const float4 *>(&sAT[w][j][4 * i4]);
+                const float av[4] = {a4.x, a4.y, a4.z, a4.w};
+#pragma unroll
+                for (int q = 0; q < 4; q++)
+                    if (4 * i4 + q > j) x[4 * i4 + q] = fmaf(-av[q], x[j], x[4 * i4 + q]);
+            }
+        }
+        const float bc = sb[w][lane], bgc = bc * sg[w][lane];
+        __half * tg = tri + (size_t) (c * NVH + kh + NKH * w) * 3 * (DC * DC);
+#pragma unroll
+        for (int i = 0; i < DC; i++) {
+            tg[i * DC + lane] = __float2half_rn(x[i] * bc);
+            tg[DC * DC + i * DC + lane] = __float2half_rn(x[i] * bgc);
+        }
+    }
+}
+
+// pk_dn_scan with pk_dn_tri's matrices (MK_PFX bit 2 off): rows t0 .. t0 + T - 1 must lie on pk_dn_tri's 32-row grid and
+// end at its T (t0 % 32 == 0; a piece ending elsewhere has its padding elsewhere: pk_dn_scan). Block = (value head, 32
+// value columns), warp = 8 columns with pk_dn_scan's per-column code. 192 blocks of 4 warps (<= 3 per SM: <= 3 warps of
+// fp32-accumulating MMAs per SMSP; pk_dn_scan's 96 blocks of 8 warps put 4 per SMSP on 14 SMs), and per chunk two block
+// barriers instead of four (no K K^T / Q K^T, no solve).
+constexpr int DC_LV4 = 40; // sV row stride (halves): 32 columns + 8 (ldmatrix rows on distinct bank quads)
+__global__ void __launch_bounds__(128, 3) pk_dn_scan4(int T, int t0, const float * st_in, float * st_out, const __half * tri) { MK_VIEW_INIT();
+    __shared__ __align__(16) __half sK[DC][DC_LD], sQ[DC][DC_LD], sV[DC][DC_LV4];
+    __shared__ __align__(16) __half sT0[DC][DC_LP], sT1[DC][DC_LP], sP[DC][DC_LP];
+    __shared__ float sg[DC], sd[DC];
+    const int h = blockIdx.x, kh = h % NKH, tid = threadIdx.x, lane = tid & 31, w = tid >> 5, g = lane >> 2, t4 = lane & 3;
+    const int col0 = blockIdx.y * 32 + 8 * w; // this warp's 8 value columns
+    const float * Si = st_in + (size_t) h * 128 * 128; // element (col, row) at dn_sidx(col, row)
+    float S[8][4];                                    // rows 16 mt + g (+8), columns col0 + 2 t4 (+1)
+#pragma unroll
+    for (int mt = 0; mt < 8; mt++) {
+        const int c = col0 + 2 * t4, rw = 16 * mt + g;
+        S[mt][0] = __ldcg(Si + dn_sidx(c, rw));
+        S[mt][1] = __ldcg(Si + dn_sidx(c + 1, rw));
+        S[mt][2] = __ldcg(Si + dn_sidx(c, rw + 8));
+        S[mt][3] = __ldcg(Si + dn_sidx(c + 1, rw + 8));
+    }
+
+    uint4 pqk[8], pv, pm[3];
+    float plg = 0.f;
+    auto fetch = [&](int tb) {
+#pragma unroll
+        for (int k = 0; k < 8; k++) {
+            const int i = tid + 128 * k, tt = i >> 5, c = i & 31, t = tb + tt;
+            pqk[k] = t < T ? __ldg(reinterpret_cast<const uint4 *>(cP.dq + (size_t) (t0 + t) * QKV + (c < 16 ? 0 : NKH * 128) + kh * 128) + (c & 15))
+                           : make_uint4(0, 0, 0, 0);
+        }
+        const int t = tb + (tid >> 2);
+        pv = t < T ? __ldg(reinterpret_cast<const uint4 *>(cP.dq + (size_t) (t0 + t) * QKV + 2 * NKH * 128 + h * 128 + blockIdx.y * 32) + (tid & 3))
+                   : make_uint4(0, 0, 0, 0);
+        const uint4 * tg = reinterpret_cast<const uint4 *>(tri + (size_t) ((t0 + tb) / DC * NVH + h) * 3 * (DC * DC));
+#pragma unroll
+        for (int m = 0; m < 3; m++) pm[m] = tb < T ? __ldg(tg + DC * DC / 8 * m + tid) : make_uint4(0, 0, 0, 0); // row tid / 4, cols 8 (tid % 4) ..
+        if (w == 0) {
+            const int tl = tb + lane;
+            plg = tl < T ? __ldg(cP.gb + (size_t) (t0 + tl) * 96 + h) : 0.f;
+        }
+    };
+    auto put = [&] {
+#pragma unroll
+        for (int k = 0; k < 8; k++) {
+            const int i = tid + 128 * k, tt = i >> 5, c = i & 31;
+            *reinterpret_cast<uint4 *>(c < 16 ? &sQ[tt][8 * c] : &sK[tt][8 * (c - 16)]) = pqk[k];
+        }
+        *reinterpret_cast<uint4 *>(&sV[tid >> 2][8 * (tid & 3)]) = pv;
+        *reinterpret_cast<uint4 *>(&sT0[tid >> 2][8 * (tid & 3)]) = pm[0];
+        *reinterpret_cast<uint4 *>(&sT1[tid >> 2][8 * (tid & 3)]) = pm[1];
+        *reinterpret_cast<uint4 *>(&sP[tid >> 2][8 * (tid & 3)]) = pm[2];
+        if (w == 0) { // cumulative log gates (padding rows: log g = 0)
+            float a = plg;
+#pragma unroll
+            for (int o = 1; o < 32; o <<= 1) {
+                const float y = __shfl_up_sync(0xffffffffu, a, o);
+                if (lane >= o) a += y;
+            }
+            const float al = __shfl_sync(0xffffffffu, a, 31);
+            sg[lane] = __expf(a);
+            sd[lane] = __expf(al - a);
+        }
+    };
+
+    fetch(0);
+    for (int tb = 0; tb < T; tb += DC) {
+        __syncthreads(); // previous chunk done with shared memory
+        put();
+        __syncthreads();
+        if (tb + DC < T) fetch(tb + DC);
+
+        // K S and Q S for this warp's columns
+        float ks[2][4] = {}, qs[2][4] = {};
+#pragma unroll
+        for (int s = 0; s < 8; s++) { // k = key dims 16 s .. : B = S tile s
+            const unsigned b0 = movt(pk2(S[s][0], S[s][1])), b1 = movt(pk2(S[s][2], S[s][3]));
+#pragma unroll
+            for (int mt = 0; mt < 2; mt++) {
+                unsigned a[4];
+                ldsm4(a, &sK[16 * mt + (lane & 15)][16 * s + 8 * (lane >> 4)]);
+                mma4(ks[mt], a, b0, b1);
+                ldsm4(a, &sQ[16 * mt + (lane & 15)][16 * s + 8 * (lane >> 4)]);
+                mma4(qs[mt], a, b0, b1);
+            }
+        }
 
         // U = T diag(beta) V - T diag(beta gamma) (K S)
         float u[2][4] = {}, ws[2][4] = {};

@@ -72,7 +72,7 @@ extern char ** environ; // (state files: the MK_* settings in the key)
 #define MK_K2_TB 8
 #endif
 #ifndef MK_K6_DEF // MK_K6's default (env overrides)
-#define MK_K6_DEF 4
+#define MK_K6_DEF 6
 #endif
 // MK_K8 (prefill small kernels, exact; env bits, default MK_K8_DEF = 6: bit 1 is unmeasured, opt-in): 1 pk_ab on a
 // second stream next to
@@ -82,6 +82,11 @@ extern char ** environ; // (state files: the MK_* settings in the key)
 #endif
 #ifndef MK_K8_NT
 #define MK_K8_NT 4
+#endif
+// MK_ATT_I8 1: build the int8 Q.K^T decode attention (experimental, in development: the env MK_ATT_I8=1 then selects it at
+// run time; not bit-identical to the default fp16 Q). 0: not compiled (the default; it adds ~5 GiB and ~5 minutes to ptxas)
+#ifndef MK_ATT_I8
+#define MK_ATT_I8 0
 #endif
 // Not compile-time switches (the served behaviour is built in): a -D for one of these names stops the build.
 #if defined(MK_WV)
@@ -342,6 +347,7 @@ struct Bufs {
     float *h_hist, *hm;
     const float2 * rope; // [ctx][32] (cos, sin) of pos * base^(-2i/64)
     float2 * blk_best; // per block: best (logit, id) per row, or the TOPK_MAX best when sampling
+    float * lmscr;     // lm_head<16, true>: the rows' true logits, one 128 B line per (row pair, warp) [VOCAB / 2 + nwarps][32]
     float2 * blk_lse;  // per block: (max, sum of exp) of the draft logits (draft confidence)
     float2 * dlog;     // MK_SPEC_LOG: per draft [MAXD][TOPK_MAX + 1]: its top logits (logit, token id), then (lse, best)
     float2 * dq;       // sampled drafts: per draft [MAXD][TOPK_MAX] its proposal q' as (prob, token id), then (0, -1)
@@ -360,7 +366,7 @@ struct Bufs {
 #endif
     int dattn;   // decode attention of all-q8 slots: 1 attn_core_q8 (default), 0 attn_core_t (MK_DATTN=0)
     int att_i8;  // MK_ATT_I8 (q8 cache): 1 int8 Q.K^T for all-q8 slots in every decode attention kernel (aq_i8_s;
-                 // exact across depths / lanes, KLD-gated), 0 off (default)
+                 // exact across depths / lanes, KLD-gated), 0 off (default; always 0 unless built with -DMK_ATT_I8=1)
     int mtp_win; // MK_MTP_WIN > 0: the MTP block's decode attention sees the last mtp_win positions only (drafts only)
     int mtp_kvc; // K / V-only MTP catch-up rows (mtp_kv_pass) on (default), 0 with env MK_MTP_KVC=0
     float * wvpart;  // wv split-K partial sums [WV_S][MAXT][D] (resid_wv)
@@ -372,10 +378,6 @@ struct Bufs {
     // i -> block i % G) instead of in contiguous runs, 4 split each Q8_0 k / v tile into two 8-row items (attn_kv_rh: EXACT).
     // (The host refuses bit 1.)
     int k6;
-    // DEEP2 (MK_DEEP2, bits, default 7; all bit-exact): 1 the 16-row passes' lm_head in one 16-row pass (lm_head<16>; else
-    // 8-row passes), 2 the _ck phases prefetch each warp's next sub-chunk weight units to L2 before the fill barriers,
-    // 4 dn_proj_ck's alpha / beta items in the last sub-chunk (else the first)
-    int deep2;
     int * err; // mapped host words, set only on failure: [0] no finite main logit / invalid token, [1] MTP catch-up out of range
     Ctl * ctl_eg; // mapped host copy of ctl, written by block 0 at the end of every launch (mk_egress)
 };
@@ -520,7 +522,7 @@ struct Out {
 constexpr unsigned long long mk_abi_sig() {
     const unsigned long long v[] = {sizeof(ModelW), sizeof(Bufs), sizeof(PBufs), sizeof(Launch), sizeof(Ctl), sizeof(pf::WMat),
                                     sizeof(pf::Out), NVIEW, MAXT, MAXD, RMAX, NSEQ, MK_SPEC_LOG, MK_TEST_NAN, MK_TEST_SLOTS_FAIL, MK_KV_EMU,
-                                    MK_PF_INFCHK,
+                                    MK_PF_INFCHK, MK_ATT_I8,
 #ifdef __CUDA_ARCH_LIST__
                                     __CUDA_ARCH_LIST__, // (nvcc: the -arch list, e.g. 860)
 #endif

@@ -869,6 +869,21 @@ __global__ void __launch_bounds__(256, 1)
         step(st, std::integral_constant<int, 0>(), fa, fb);
         step(st + 1, std::integral_constant<int, 1>(), fb, fa);
     }
+    // OUT_ADD: the y elements this thread adds to in the store loop below, loaded here (they do not depend on the tile), so
+    // their latency overlaps the last conversions and the staging through se. The loop loaded each one right before its
+    // add, behind the previous iteration's store: one exposed load latency per iteration (16 at NB = 128)
+    constexpr int EIT = GLU ? 1 : NB * BM / 4 / 256;
+    static_assert(GLU || NB * BM / 4 % 256 == 0, "epilogue: whole float4 iterations per thread");
+    float4 yo[EIT];
+    if constexpr (!GLU) {
+        if (O.mode == OUT_ADD)
+#pragma unroll
+            for (int k = 0; k < EIT; k++) {
+                const int i = tid + 256 * k, tk = i / (BM / 4), c = (i % (BM / 4)) * 4;
+                yo[k] = tok0 + tk < ntok ? __ldcg(reinterpret_cast<const float4 *>(O.y + (size_t) (tok0 + tk) * O.ldy + row0 + c))
+                                         : make_float4(0.f, 0.f, 0.f, 0.f);
+            }
+    }
 #pragma unroll
     for (int mi = 0; mi < HMI; mi++)
 #pragma unroll
@@ -904,9 +919,14 @@ __global__ void __launch_bounds__(256, 1)
                 *reinterpret_cast<float4 *>(uf + 4 * m) = *reinterpret_cast<const float4 *>(gp + BM / 2 + 4 * m);
             }
             __align__(16) __half hv[16];
+            // the 16 denominators first: each division below branches to its slow path (FCHK), which kept the next
+            // element's expf behind it (one latency chain per element); the same expressions per element
+            float den[16];
+#pragma unroll
+            for (int e = 0; e < 16; e++) den[e] = 1.0f + expf(-gf[e]);
 #pragma unroll
             for (int e = 0; e < 16; e++) {
-                const float gv = gf[e], v = gv / (1.0f + expf(-gv)) * uf[e];
+                const float gv = gf[e], v = gv / den[e] * uf[e];
 #if MK_PF_INFCHK
                 chk_o += !isfinite(gv) + !isfinite(uf[e]);
                 chk_clamp(v, CHK_IN_GLU);
@@ -923,8 +943,9 @@ __global__ void __launch_bounds__(256, 1)
 #endif
         return;
     }
-    for (int i = tid; i < NB * BM / 4; i += 256) {
-        const int tk = i / (BM / 4), c = (i % (BM / 4)) * 4;
+#pragma unroll
+    for (int k = 0; k < EIT; k++) { // (i = tid, tid + 256, .. < NB BM / 4)
+        const int i = tid + 256 * k, tk = i / (BM / 4), c = (i % (BM / 4)) * 4;
         if (tok0 + tk >= ntok) continue;
         float4 v = *reinterpret_cast<const float4 *>(se + tk * ELD + c);
 #if MK_PF_INFCHK
@@ -932,7 +953,7 @@ __global__ void __launch_bounds__(256, 1)
 #endif
         float4 * dst = reinterpret_cast<float4 *>(O.y + (size_t) (tok0 + tk) * O.ldy + row0 + c);
         if (O.mode == OUT_ADD) {
-            const float4 o = __ldcg(dst);
+            const float4 o = yo[k];
             v.x += o.x; v.y += o.y; v.z += o.z; v.w += o.w;
         }
         *dst = v;

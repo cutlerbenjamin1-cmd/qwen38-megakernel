@@ -1149,13 +1149,10 @@ MKEngine::Impl::Impl(const std::string & path, int ctx_, int ndraft_, const std:
     // 4 pk_dn_prep MK_K8_NT tokens per block); compile-time K7 (state layout), K6_LD (Q8_0 tile loads)
     hb.k6 = getenv("MK_K6") ? atoi(getenv("MK_K6")) : MK_K6_DEF;
     if (hb.k6 & 1)
-        throw std::runtime_error("MK_K6=" + std::to_string(hb.k6) + ": bit 1 (the K-split of the Q8_0 k / v tiles) was removed; bits 2 and 4 remain (default 4)");
+        throw std::runtime_error("MK_K6=" + std::to_string(hb.k6) + ": bit 1 (the K-split of the Q8_0 k / v tiles) was removed; bits 2 and 4 remain (default 6)");
     k8 = getenv("MK_K8") ? atoi(getenv("MK_K8")) : MK_K8_DEF;
     if (const char * e = getenv("MK_K8_NT")) k8_nt = atoi(e) == 8 ? 8 : 4;
     fprintf(stderr, "[mk] stock2: K6 %d, K8 %d (nt %d)\n", hb.k6, k8, k8_nt);
-    hb.deep2 = getenv("MK_DEEP2") ? atoi(getenv("MK_DEEP2")) : 7;
-    fprintf(stderr, "[mk] deep2: lm_head<16> %d, _ck prefetch %d, dn ab last %d\n", hb.deep2 & 1, (hb.deep2 >> 1) & 1,
-            (hb.deep2 >> 2) & 1);
     fprintf(stderr, "[mk] K5: split dn_proj -> dn_core barrier, delta-net heads in dn_proj arrival order\n");
     fprintf(stderr, "[mk] C1: ffn_gu -> ffn_down per-chunk waits instead of a grid barrier\n");
     hb.ctx = ctx + KV_PAD; // rows per kv head (KV_PAD: the MTP draft rows written past the last admitted position)
@@ -1170,17 +1167,21 @@ MKEngine::Impl::Impl(const std::string & path, int ctx_, int ndraft_, const std:
         const bool q8 = kv_mode == 1 || (kv_mode < 0 && (want_kv || rows * HD * 4 + (size_t) 1536 * 1024 * 1024 > free_b));
         hb.kvq8 = q8;
         hb.dattn = !(getenv("MK_DATTN") && atoi(getenv("MK_DATTN")) == 0);
-        // MK_ATT_I8=1 (q8 cache): int8 Q.K^T in the decode attention of the all-q8 slots, in every kernel (aq_i8_s): exact
-        // across draft depths and lanes, not bit-identical to the default fp16 Q (KLD-gated). (2: the same; it selected
-        // early K / V copies, which measured slower and were removed)
+        // MK_ATT_I8=1 (q8 cache, -DMK_ATT_I8=1 builds): int8 Q.K^T in the decode attention of the all-q8 slots, in every
+        // kernel (aq_i8_s): exact across draft depths and lanes, not bit-identical to the default fp16 Q (KLD-gated). (2: the
+        // same; it selected early K / V copies, which measured slower and were removed)
         {
             const int ai8 = getenv("MK_ATT_I8") ? atoi(getenv("MK_ATT_I8")) : 0;
+#if MK_ATT_I8
             hb.att_i8 = q8 && (ai8 == 1 || ai8 == 2) ? 1 : 0;
             if (hb.att_i8)
                 fprintf(stderr, "[mk] MK_ATT_I8=%d: int8 Q.K^T in the decode attention of all-q8 slots (every kernel and draft depth; not "
                                 "bit-identical to fp16 Q)\n", ai8);
             else if (ai8)
                 fprintf(stderr, "[mk] MK_ATT_I8=%d ignored (%s)\n", ai8, q8 ? "values: 1, 2" : "fp16 KV cache");
+#else
+            if (ai8) fprintf(stderr, "[mk] MK_ATT_I8=%d ignored: int8 attention is not in this build (-DMK_ATT_I8=1: make MKFLAGS=..., build.ps1 -MkFlags ...)\n", ai8);
+#endif
         }
         // MK_MTP_WIN=N: the MTP block's decode attention sees the last N positions only (its prefill attention and
         // the KV layout are unchanged). Drafts are verified, so the output is exact; acceptance can change.
@@ -1333,6 +1334,8 @@ MKEngine::Impl::Impl(const std::string & path, int ctx_, int ndraft_, const std:
     mem_mark("RoPE table");
     hb.hm = dalloc<float>(D);
     hb.blk_best = dalloc<float2>((size_t) nsm * LM_RB * TOPK_MAX);
+    // lm_head<16, true>'s logit lines, line k * nwarps + warp for a warp's k-th row pair (~16 MB; builds with a 16-row head)
+    hb.lmscr = (MAXD > MAXT || RMAX > MAXT) ? dalloc<float>((size_t) (VOCAB / 2 + nsm * NW) * 32) : nullptr;
     hb.blk_lse = dalloc<float2>((size_t) nsm);
     hb.dlog = dalloc<float2>((size_t) MAXD * (TOPK_MAX + 1));
     hb.dq = dalloc<float2>((size_t) MAXD * TOPK_MAX);

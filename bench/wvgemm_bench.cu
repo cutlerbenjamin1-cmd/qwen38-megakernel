@@ -5,6 +5,8 @@
 //   ./wvgemm_bench check            exactness: T-invariance (T = 1..16 bit-identical per row) + wv / dp4a vs fp64
 //                                   (exit status 1 on a failure; `make check` runs it)
 //   ./wvgemm_bench time [roles] [types] [reps]
+// The engine's layout / loop: -DWV_TILEMAJ=2 -DWV_PF=0; -DWV_PF=2: a 2-deep loop (q32 roles only: X16 kernels keep the
+// plain loop; measured slower in the engine, which runs the plain one); -DWV_L2PF=d: an L2 prefetch d super-blocks ahead (with WV_TILEMAJ 2: whole FM units)
 //
 // Weights are random bytes in the engine's on-device layouts (native Q4_K / Q5_K, the load-time repacks of IQ4_XS, IQ4_NL,
 // Q8_0, Q6_K, Q3_K, IQ3_S), so both kernels read exactly the bytes they would read in mk_cycle. Activations are random
@@ -851,7 +853,20 @@ __device__ __forceinline__ void wv_tile(const Mat & m, int row0, int sb0, int ns
         for (int c = 0; c < 4; c++) acc[n][c] = 0.f;
     const int8_t * xrow = C::SPLIT ? xs.xq + (g & 3) * xs.ld + 8 * tq : xs.xq + g * xs.ld + 8 * tq;
     const bool bon = !C::SPLIT || (g >> 2) == h;
-    if (!PF && WV_SBU == 2) {
+    if (PF == 2 && !X16 && !WV_MODE) { // 2-deep: sb + 2's loads right after sb's MMAs (2 units in flight)
+        typename W::Raw a0, a1, b0, b1;
+        if (nsb > 0) wv_load2<TYPE>(a0, a1, m, row0, sb0, g, tq);
+        if (nsb > 1) wv_load2<TYPE>(b0, b1, m, row0, sb0 + 1, g, tq);
+#pragma unroll 1
+        for (int sb = 0; sb < nsb; sb += 2) {
+            wv_sb<TYPE, T, X16>(a0, a1, 8 * sb, xs, xrow, bon, acc);
+            if (sb + 2 < nsb) wv_load2<TYPE>(a0, a1, m, row0, sb0 + sb + 2, g, tq);
+            if (sb + 1 < nsb) {
+                wv_sb<TYPE, T, X16>(b0, b1, 8 * sb + 8, xs, xrow, bon, acc);
+                if (sb + 3 < nsb) wv_load2<TYPE>(b0, b1, m, row0, sb0 + sb + 3, g, tq);
+            }
+        }
+    } else if (!PF && WV_SBU == 2) {
         typename W::Raw a0, a1, b0, b1;
         int sb = 0;
 #pragma unroll 1
@@ -867,7 +882,7 @@ __device__ __forceinline__ void wv_tile(const Mat & m, int row0, int sb0, int ns
         }
     } else {
     typename W::Raw r0, r1, n0, n1;
-    if (PF || WV_MODE == 2) {
+    if (PF == 1 || WV_MODE == 2) {
         wv_load2<TYPE>(r0, r1, m, row0, sb0, g, tq);
     }
     if (WV_MODE == 4 || WV_MODE == 6) { // loads only, coalesced: lane -> 16-byte chunk c = lane + 32 i of the tile's step
@@ -954,19 +969,28 @@ __device__ __forceinline__ void wv_tile(const Mat & m, int row0, int sb0, int ns
         return;
     }
 #if WV_L2PF
-    // L2 prefetch of the main weight stream WV_L2PF super-blocks ahead: lane l -> row l & 15, 128-byte line l >> 4
+    // L2 prefetch of the main weight stream WV_L2PF super-blocks ahead: lane l -> row l & 15, 128-byte line l >> 4;
+    // FM units (WV_TILEMAJ 2, Q4_K / Q5_K / IQ4_XS: 16 bps contiguous bytes per (tile, super-block)): lane l -> line l
     const int bps = m.rb / (m.K / 256);
-    const uint8_t * pfrow = m.w + (size_t) (row0 + (lane & 15)) * m.rb + 128 * (lane >> 4);
+#if WV_TILEMAJ == 2
+    constexpr bool FMU = TYPE == T_Q4K || TYPE == T_Q5K || TYPE == T_IQ4X;
+#else
+    constexpr bool FMU = false;
+#endif
+    const uint8_t * pfrow = FMU ? m.w + (size_t) (row0 >> 4) * (m.K / 256) * 16 * bps + 128 * lane
+                                : m.w + (size_t) (row0 + (lane & 15)) * m.rb + 128 * (lane >> 4);
+    const int pfst = FMU ? 16 * bps : bps;
+    const bool pfon = FMU ? 128 * lane < 16 * bps : 128 * (lane >> 4) < bps;
 #pragma unroll
     for (int d = 0; d < WV_L2PF; d++)
-        if (d < nsb && 128 * (lane >> 4) < bps) pf_l2n(pfrow + (size_t) (sb0 + d) * bps);
+        if (d < nsb && pfon) pf_l2n(pfrow + (size_t) (sb0 + d) * pfst);
 #endif
 #pragma unroll 1
     for (int sb = 0; sb < nsb; sb++) {
 #if WV_L2PF
-        if (sb + WV_L2PF < nsb && 128 * (lane >> 4) < bps) pf_l2n(pfrow + (size_t) (sb0 + sb + WV_L2PF) * bps);
+        if (sb + WV_L2PF < nsb && pfon) pf_l2n(pfrow + (size_t) (sb0 + sb + WV_L2PF) * pfst);
 #endif
-        if (PF) {
+        if (PF == 1) {
             if (sb + 1 < nsb) {
                 wv_load2<TYPE>(n0, n1, m, row0, sb0 + sb + 1, g, tq);
             }
@@ -974,7 +998,7 @@ __device__ __forceinline__ void wv_tile(const Mat & m, int row0, int sb0, int ns
             wv_load2<TYPE>(r0, r1, m, row0, sb0 + sb, g, tq);
         }
         wv_sb<TYPE, T, X16>(r0, r1, 8 * sb, xs, xrow, bon, acc);
-        if (PF) {
+        if (PF == 1) {
             r0 = n0;
             r1 = n1;
         }

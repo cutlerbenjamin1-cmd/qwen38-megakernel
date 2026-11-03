@@ -120,10 +120,22 @@ void MKEngine::Impl::pf_init() {
         if (const char * e = getenv("MK_EXACT_SPLIT")) ex_split = atoi(e) != 0;
         mkl::pk_attn8_exa_attr();
     }
-    if (k8 & 1) { // MK_K8 bit 1: pk_ab's stream (non-blocking: ordered only by pf_e0 / pf_e1)
+    // MK_PFX (bits; a set bit keeps the old path): 1 pf_fork off, 2 pk_dn_scan (no pk_dn_tri / pk_dn_scan4), 4 pk_ab
+    // after the DN in-projection join (not before it), 8 attention k on pf_s2 and v on pf_s3 next to q (not k then q on
+    // stream 0, v on pf_s2), 16 pk_ab (not pk_ab2)
+    if (const char * e = getenv("MK_PFX")) pfx_bits = atoi(e);
+    pf_fork = !(pfx_bits & 1);
+#if MK_PF_INFCHK
+    pf_fork = false; // (chk_set's site / layer are stream-ordered on stream 0)
+#endif
+    if ((k8 & 1) || pf_fork) { // MK_K8 bit 1: pk_ab's stream; pf_fork: the side GEMMs' (non-blocking: ordered only by events)
         CK(cudaStreamCreateWithFlags(&pf_s2, cudaStreamNonBlocking));
         CK(cudaEventCreateWithFlags(&pf_e0, cudaEventDisableTiming));
         CK(cudaEventCreateWithFlags(&pf_e1, cudaEventDisableTiming));
+    }
+    if (pf_fork) {
+        CK(cudaStreamCreateWithFlags(&pf_s3, cudaStreamNonBlocking));
+        CK(cudaEventCreateWithFlags(&pf_e2, cudaEventDisableTiming));
     }
     if (const char * e = getenv("MK_PF_SYNC")) pf_sync = atoi(e) != 0;
     if (const char * e = getenv("MK_PF_GAPS")) pf_gaps = atoi(e) != 0;
@@ -306,7 +318,7 @@ void MKEngine::Impl::chk_report(int npos) {
     CK(mkl::set_chk_cnt(c.data(), c.size() * sizeof(unsigned long long)));
 }
 #endif
-void MKEngine::Impl::gemm(const Mat & m, int ntok, float * y, int ldy, int mode, int t0, const __half * xin) {
+void MKEngine::Impl::gemm(const Mat & m, int ntok, float * y, int ldy, int mode, int t0, const __half * xin, cudaStream_t st) {
     pf_shape_check(m, pf::BM);
 #if MK_PF_INFCHK
     chk_mat(m);
@@ -317,26 +329,26 @@ void MKEngine::Impl::gemm(const Mat & m, int ntok, float * y, int ldy, int mode,
     const int nrt = m.N / pf::BM;
     if (m.fm) {
         switch (m.type) {
-            case T_Q4K: mmh_launch<pf::TQ4K, false, 1>(nrt, W, X, ntok, O); return;
-            case T_Q5K: mmh_launch<pf::TQ5K, false, 1>(nrt, W, X, ntok, O); return;
-            case T_Q8_0: mmh_launch<pf::TQ80, false, 1>(nrt, W, X, ntok, O); return;
-            case T_IQ4X: mmh_launch<pf::TIQ4, false, 1>(nrt, W, X, ntok, O); return;
-            case T_IQ4NL: mmh_launch<pf::TIQ4NL, false, 1>(nrt, W, X, ntok, O); return;
-            case T_Q6K: mmh_launch<pf::TQ6K, false, 1>(nrt, W, X, ntok, O); return;
-            case T_Q3K: mmh_launch<pf::TQ3K, false, 1>(nrt, W, X, ntok, O); return;
-            case T_IQ3S: mmh_launch<pf::TIQ3S, false, 1>(nrt, W, X, ntok, O); return;
+            case T_Q4K: mmh_launch<pf::TQ4K, false, 1>(nrt, W, X, ntok, O, nullptr, st); return;
+            case T_Q5K: mmh_launch<pf::TQ5K, false, 1>(nrt, W, X, ntok, O, nullptr, st); return;
+            case T_Q8_0: mmh_launch<pf::TQ80, false, 1>(nrt, W, X, ntok, O, nullptr, st); return;
+            case T_IQ4X: mmh_launch<pf::TIQ4, false, 1>(nrt, W, X, ntok, O, nullptr, st); return;
+            case T_IQ4NL: mmh_launch<pf::TIQ4NL, false, 1>(nrt, W, X, ntok, O, nullptr, st); return;
+            case T_Q6K: mmh_launch<pf::TQ6K, false, 1>(nrt, W, X, ntok, O, nullptr, st); return;
+            case T_Q3K: mmh_launch<pf::TQ3K, false, 1>(nrt, W, X, ntok, O, nullptr, st); return;
+            case T_IQ3S: mmh_launch<pf::TIQ3S, false, 1>(nrt, W, X, ntok, O, nullptr, st); return;
             default: throw std::runtime_error("gemm: unsupported weight type in the wv layout");
         }
     }
     switch (m.type) {
-        case T_Q4K: mmh_launch<pf::TQ4K, false>(nrt, W, X, ntok, O); break;
-        case T_Q5K: mmh_launch<pf::TQ5K, false>(nrt, W, X, ntok, O); break;
-        case T_Q6K: mmh_launch<pf::TQ6K, false>(nrt, W, X, ntok, O); break;
-        case T_Q8_0: mmh_launch<pf::TQ80, false>(nrt, W, X, ntok, O); break;
-        case T_IQ4X: mmh_launch<pf::TIQ4, false>(nrt, W, X, ntok, O); break;
-        case T_IQ4NL: mmh_launch<pf::TIQ4NL, false>(nrt, W, X, ntok, O); break;
-        case T_Q3K: mmh_launch<pf::TQ3K, false>(nrt, W, X, ntok, O); break;
-        case T_IQ3S: mmh_launch<pf::TIQ3S, false>(nrt, W, X, ntok, O); break;
+        case T_Q4K: mmh_launch<pf::TQ4K, false>(nrt, W, X, ntok, O, nullptr, st); break;
+        case T_Q5K: mmh_launch<pf::TQ5K, false>(nrt, W, X, ntok, O, nullptr, st); break;
+        case T_Q6K: mmh_launch<pf::TQ6K, false>(nrt, W, X, ntok, O, nullptr, st); break;
+        case T_Q8_0: mmh_launch<pf::TQ80, false>(nrt, W, X, ntok, O, nullptr, st); break;
+        case T_IQ4X: mmh_launch<pf::TIQ4, false>(nrt, W, X, ntok, O, nullptr, st); break;
+        case T_IQ4NL: mmh_launch<pf::TIQ4NL, false>(nrt, W, X, ntok, O, nullptr, st); break;
+        case T_Q3K: mmh_launch<pf::TQ3K, false>(nrt, W, X, ntok, O, nullptr, st); break;
+        case T_IQ3S: mmh_launch<pf::TIQ3S, false>(nrt, W, X, ntok, O, nullptr, st); break;
         default: throw std::runtime_error("gemm: unsupported weight type");
     }
 }
@@ -523,9 +535,32 @@ void MKEngine::Impl::pf_run(const std::vector<int> & toks, int n0, std::vector<i
 #endif
             if (fault_now && L == NL / 2) fault_inject();
             pf_time("norm_quant", [&] { pf_norm_quant(hp.x, W.attn_norm, T); });
+            const bool fk = pf_fork && !pf_prof; // (MK_PF_PROFILE times every launch in order on stream 0)
             if (W.attn) {
+                // k (y1 columns 0 .. KVD - 1), v (y1 columns KVD ..), q (y0) all read xh, which is final at pf_e0. pf_fork:
+                // v on pf_s2 next to k then q on stream 0, so q's blocks finish last and on stream 0 and the join waits for
+                // nothing (k / v on the side streams were dispatched behind q's blocks and finished last: their join cost
+                // ~45 us of idle GPU per layer). MK_PFX bit 8: k on pf_s2, v on pf_s3, q on stream 0.
+                const bool kq = fk && !(pfx_bits & 8);
+                if (fk) {
+                    CK(cudaEventRecord(pf_e0, 0));
+                    CK(cudaStreamWaitEvent(pf_s2, pf_e0, 0));
+                    if (!kq) {
+                        CK(cudaStreamWaitEvent(pf_s3, pf_e0, 0));
+                        gemm(W.k, T, hp.y1, 2 * KVD, pf::OUT_STORE, 0, nullptr, pf_s2);
+                    }
+                    gemm(W.v, T, hp.y1 + KVD, 2 * KVD, pf::OUT_STORE, 0, nullptr, kq ? pf_s2 : pf_s3);
+                    CK(cudaEventRecord(pf_e1, pf_s2));
+                    if (!kq) CK(cudaEventRecord(pf_e2, pf_s3));
+                }
+                if (kq) gemm(W.k, T, hp.y1, 2 * KVD, pf::OUT_STORE);
                 pf_time("gemm_attn_qkv", [&] { gemm(W.q, T, hp.y0, QG, pf::OUT_STORE); });
-                pf_time("gemm_attn_qkv", [&] { gemm(W.k, T, hp.y1, 2 * KVD, pf::OUT_STORE); gemm(W.v, T, hp.y1 + KVD, 2 * KVD, pf::OUT_STORE); });
+                if (fk) {
+                    CK(cudaStreamWaitEvent(0, pf_e1, 0));
+                    if (!kq) CK(cudaStreamWaitEvent(0, pf_e2, 0));
+                } else {
+                    pf_time("gemm_attn_qkv", [&] { gemm(W.k, T, hp.y1, 2 * KVD, pf::OUT_STORE); gemm(W.v, T, hp.y1 + KVD, 2 * KVD, pf::OUT_STORE); });
+                }
                 const int sl = L / 4;
                 if (rsnap) CK(cudaStreamWaitEvent(0, rs_ev[sl], 0)); // (the rings' whole copies are done)
                 if (exact && (hb.kvrp[0][sl] || hb.kvrp[1][sl])) {
@@ -549,16 +584,30 @@ void MKEngine::Impl::pf_run(const std::vector<int> & toks, int n0, std::vector<i
             } else {
                 // MK_K8 bit 1: pk_ab (reads x and rs, writes ab: only pk_dn_prep reads it) on pf_s2 next to the GEMMs, which
                 // read xh; pk_dn_prep waits for it. (MK_PF_PROFILE: in order on stream 0, so it is timed alone.)
+                // pf_fork: the gate GEMM (y1, read by pk_dn_out) on pf_s2 too, after pk_ab if that is there, next to qkv (y0)
+                // pk_ab (unless MK_K8 bit 1) on stream 0 before the join (MK_PFX bit 4: after it). The gate GEMM's blocks
+                // are dispatched behind qkv's and finish last; waiting for them cost ~45 us of idle GPU per layer (the
+                // cross-stream event wait), and pk_ab's blocks now fill the gate's last wave instead
                 const bool k8a = (k8 & 1) && pf_s2 && !pf_prof;
-                if (k8a) {
+                const bool abj = !k8a && !(pfx_bits & 4);
+                auto ab = [&](cudaStream_t st) { // (MK_PFX bit 16: pk_ab, else pk_ab2: the same values)
+                    if (pfx_bits & 16) mkl::pk_ab(W.ab, W.abq, W.abd, W.attn_norm, T, st);
+                    else mkl::pk_ab2(W.ab, W.abq, W.abd, W.attn_norm, T, st);
+                };
+                if (k8a || fk) {
                     CK(cudaEventRecord(pf_e0, 0));
                     CK(cudaStreamWaitEvent(pf_s2, pf_e0, 0));
-                    mkl::pk_ab(W.ab, W.abq, W.abd, W.attn_norm, T, pf_s2);
+                    if (k8a) ab(pf_s2);
+                    if (fk) gemm(W.gate, T, hp.y1, VD, pf::OUT_STORE, 0, nullptr, pf_s2);
                     CK(cudaEventRecord(pf_e1, pf_s2));
                 }
-                pf_time("gemm_dn_in", [&] { gemm(W.qkv, T, hp.y0, QKV, pf::OUT_STORE); gemm(W.gate, T, hp.y1, VD, pf::OUT_STORE); });
-                if (k8a) CK(cudaStreamWaitEvent(0, pf_e1, 0));
-                else pf_time("dn_ab", [&] { mkl::pk_ab(W.ab, W.abq, W.abd, W.attn_norm, T); });
+                pf_time("gemm_dn_in", [&] {
+                    gemm(W.qkv, T, hp.y0, QKV, pf::OUT_STORE);
+                    if (!fk) gemm(W.gate, T, hp.y1, VD, pf::OUT_STORE);
+                });
+                if (abj) pf_time("dn_ab", [&] { ab(0); });
+                if (k8a || fk) CK(cudaStreamWaitEvent(0, pf_e1, 0));
+                if (!k8a && !abj) pf_time("dn_ab", [&] { ab(0); });
                 ck_wait_restore(dl); // this layer's conv ring / state may still be arriving from the checkpoint
                 int sg[STG_MAX], ta = -1; // staging slots of this layer's checkpoint pieces (+ a side scan's input)
                 for (int j = 0; j < sn; j++) sg[j] = stg_take();
@@ -575,25 +624,35 @@ void MKEngine::Impl::pf_run(const std::vector<int> & toks, int n0, std::vector<i
                     // ck_at) is computed on the side: a scan of the rows from the grid point before it, from the
                     // state there, into its staging slot (= what a prefill ending at it computes); the main scan
                     // then rewrites those rows' y2.
+                    // MK_PFX bit 2 off: the per-chunk matrices that do not depend on the state come from pk_dn_tri (all
+                    // chunks at once, into y0: free from pk_conv_ring to the next GEMM) and pk_dn_scan4 runs the state
+                    // recurrence. Pieces on the 32-token grid ending at T only: the off-grid side scan pads its last chunk
+                    // at te, so it keeps pk_dn_scan (same arithmetic either way).
                     float * live = hb.dstate + (size_t) dl * CK_SL;
                     const float * in = live;
+                    __half * tri = pfx_bits & 2 ? nullptr : reinterpret_cast<__half *>(hp.y0);
+                    if (tri) mkl::pk_dn_tri(T, tri);
+                    auto scan = [&](int nt, int ts, const float * a, float * b) {
+                        if (tri) mkl::pk_dn_scan4(nt, ts, a, b, tri);
+                        else mkl::pk_dn_scan(nt, ts, a, b);
+                    };
                     int t = 0;
                     for (int j = 0; j < sn; j++) {
                         const int te = sp[j] - n, tg = te / 32 * 32;
                         if (te == tg) {
-                            mkl::pk_dn_scan(tg - t, t, in, stg_state(sg[j]));
+                            scan(tg - t, t, in, stg_state(sg[j]));
                             in = stg_state(sg[j]);
                             t = tg;
                             continue;
                         }
                         if (tg > t) {
-                            mkl::pk_dn_scan(tg - t, t, in, stg_state(ta));
+                            scan(tg - t, t, in, stg_state(ta));
                             in = stg_state(ta);
                             t = tg;
                         }
                         mkl::pk_dn_scan(te - tg, tg, in, stg_state(sg[j]));
                     }
-                    mkl::pk_dn_scan(T - t, t, in, live);
+                    scan(T - t, t, in, live);
                 });
                 if (sn) stg_flush(dl, sn, sg, ss);
                 pf_time("dn_out", [&] { mkl::pk_dn_out(T, W.snorm); });

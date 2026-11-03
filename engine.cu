@@ -249,11 +249,12 @@ void MKEngine::Impl::release() noexcept {
         for (char * c : p.second.blob.chunks) cudaFreeHost(c);
     for (char * c : sw_blob.chunks) cudaFreeHost(c);
     for (char * c : hs_free) cudaFreeHost(c);
-    if (pf_s2) { // (MK_K8 bit 1)
-        cudaStreamSynchronize(pf_s2);
-        cudaStreamDestroy(pf_s2);
-    }
-    for (cudaEvent_t e : {pf_e0, pf_e1, pf_cev[0], pf_cev[1], wd_ev})
+    for (cudaStream_t s : {pf_s2, pf_s3}) // (MK_K8 bit 1, pf_fork)
+        if (s) {
+            cudaStreamSynchronize(s);
+            cudaStreamDestroy(s);
+        }
+    for (cudaEvent_t e : {pf_e0, pf_e1, pf_e2, pf_cev[0], pf_cev[1], wd_ev})
         if (e) cudaEventDestroy(e);
     for (cudaEvent_t e : pf_gev) cudaEventDestroy(e);
     for (void * p : allocs) use_pool ? cudaFreeAsync(p, 0) : cudaFree(p);
@@ -364,10 +365,13 @@ static const char * const kPhName[PH_COUNT] = {
 
 // MK_PROF_DUMP: one launch's raw stamps, times in ns (56-bit globaltimer, wrap-safe like prof_collect): per barrier its
 // phase, end (after the launch start), duration, fill mark and every block's arrival (after the phase start; -1: none,
-// barriers >= 1024 keep no arrivals)
-static void prof_dump(const std::vector<unsigned long long> & pr, long n, int T, int nsm) {
+// barriers >= 1024 keep no arrivals). MK_PROF_DUMP_N = k > 1: launches MK_PROF_DUMP .. + k - 1, each to MK_PROF_DUMP_FILE.<n>
+// (a phase's minimum over several launches filters the occasional whole-GPU pause)
+static void prof_dump(const std::vector<unsigned long long> & pr, long n, int T, int nsm, bool multi) {
     const unsigned long long M = (1ull << 56) - 1;
-    const char * path = getenv("MK_PROF_DUMP_FILE");
+    const char * env = getenv("MK_PROF_DUMP_FILE");
+    const std::string ps = env ? (multi ? std::string(env) + "." + std::to_string(n) : std::string(env)) : std::string();
+    const char * path = env ? ps.c_str() : nullptr;
     FILE * f = path ? fopen(path, "w") : stderr;
     if (!f) {
         fprintf(stderr, "[mk] MK_PROF_DUMP: cannot write %s\n", path);
@@ -400,7 +404,9 @@ void MKEngine::Impl::prof_collect(int T) {
     std::vector<unsigned long long> pr(4096 + 1024 * 128);
     CK(cudaMemcpy(pr.data(), hb.prof, pr.size() * 8, cudaMemcpyDeviceToHost));
     static const long dump_at = getenv("MK_PROF_DUMP") ? atol(getenv("MK_PROF_DUMP")) : 0;
-    if (dump_at > 0 && launches_seen == dump_at) prof_dump(pr, launches_seen, T, nsm);
+    static const long dump_n = getenv("MK_PROF_DUMP_N") ? std::max(1L, atol(getenv("MK_PROF_DUMP_N"))) : 1;
+    if (dump_at > 0 && launches_seen >= dump_at && launches_seen < dump_at + dump_n)
+        prof_dump(pr, launches_seen, T, nsm, dump_n > 1);
     unsigned long long prev = pr[0] >> 8;
     auto & bn = best_ns[T];
     auto & bt = best_tag[T];
@@ -730,7 +736,7 @@ MKEngine::MKEngine(const std::string & path, int ctx, int n_draft, const std::st
 }
 
 // "key=value,...": depth=0|1|2 (see Impl::Policy), dmin=N; on-device early stop (Launch::gate_*): drop=F,
-// stop=F (every draft), dropK=F / stopK=F (draft K = 1..7), chain=0|1; h1=0|1 (sampled drafts when
+// stop=F (every draft), dropK=F / stopK=F (draft K = 1 .. MAXD - 1), chain=0|1; h1=0|1 (sampled drafts when
 // sampling); dq4=0|1 (MK_DRAFT_Q4=1 only: the draft head reads lm_head / its Q4_K copy; kept until changed);
 // droplast=F (the deepest draft), dctx=N (from position N on at most 4 drafts),
 // chain=2 (sampled drafts: the chain multiplies each drafted token's probability under q' instead of the top-1's);

@@ -48,12 +48,15 @@ template <int ET> void pk_embed_img(int T);
 void pk_norm_quant(dim3 grid, const float * src, const float * w);
 void pk_norm_quant1(dim3 grid, const float * src, const float * w);
 void pk_ab(const float * Wab, const int8_t * abq, const __half * abd, const float * fn, int T, cudaStream_t st = 0);
+void pk_ab2(const float * Wab, const int8_t * abq, const __half * abd, const float * fn, int T, cudaStream_t st = 0);
 void pk_dn_prep(int T, int n0, int dl, const float * convw, const float * dt, const float * A);
 template <int NT> void pk_dn_prep_t(int T, int n0, int dl, const float * convw, const float * dt, const float * A);
 void pk_conv_ring(int T, int n0, int dl);
 void pk_ck_conv(int n0, int P, int dl, float * dst);
 void pk_ck_hist(dim3 grid, int lo, int n0, int from_ring, float * dst);
 void pk_dn_scan(int T, int t0, const float * st_in, float * st_out);
+void pk_dn_tri(int T, __half * tri);
+void pk_dn_scan4(int T, int t0, const float * st_in, float * st_out, const __half * tri);
 void pk_dn_out(dim3 grid, const float * snorm);
 void pk_attn_prep(dim3 grid, int n0, int slot, const float * qn, const float * kn, int do_q, int r0 = 0);
 void pk_attn_out(dim3 grid, int slot);
@@ -76,7 +79,7 @@ void pk_attn2_occupancy(int * nb);
 void pk_attn8_occupancy(int * nb);
 
 template <int TYPE, bool GLU, int LAY>
-void pf_mmh(int nb, int nrt, const void * W, const __half * X, int ntok, const void * O, const uint8_t * W2);
+void pf_mmh(int nb, int nrt, const void * W, const __half * X, int ntok, const void * O, const uint8_t * W2, cudaStream_t st = 0);
 template <int TYPE, bool GLU, int LAY> void pf_mmh_attr();
 template <int TG, int LG, int TU, int LU>
 void pf_mmh_mix(int nb, int nrt, const void * Wg, const void * Wu, const __half * X, int ntok, const void * O);
