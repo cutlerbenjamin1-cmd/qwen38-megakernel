@@ -44,6 +44,13 @@ barrier; the host only reads back the accepted tokens. Prompts go through batche
 - **Greedy output does not depend on the draft depth:** the attention split-K partition depends only on the context
   length, and the verify GEMMs compute every row the same way at any T. With sampling, the token distribution is the
   one of sampling without drafts.
+- **The deep-pass build** (`MK_MAXD=16`, opt-in, in active development:
+  [EXPERIMENTAL.md](EXPERIMENTAL.md#the-deep-pass)) takes up to 15 drafts and verifies 9 to 16 tokens as one 16-row pass
+  (`main_forward_d`; rows past T are padding, as in the 8-row pass): the matrix products in the 16-row weight phases of
+  the parallel slots' batched passes, attention as two 8-row calls, the second for rows 8-15 at position n + 8. A cycle
+  takes it only when the MTP head's own probabilities expect enough of the drafts past the 7th to be accepted
+  (`MK_POLICY` key `tier`), and drafts 8-15 need every attention layer's K and V at q8_0. Its output against the default
+  build's: [EXPERIMENTAL.md](EXPERIMENTAL.md#the-deep-pass).
 
 Speculation in numbers (CLI, UD-Q4_K_XL, q8_0 KV; tokens over total time). This is an older build, so the rates sit
 below [the current ones](BENCHMARKS.md#headline-numbers), but the shape is the same:

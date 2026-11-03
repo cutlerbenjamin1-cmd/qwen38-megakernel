@@ -5,7 +5,8 @@ two builds give the same output bit for bit ([BENCHMARKS.md](BENCHMARKS.md#windo
 named here is described in [CONFIGURATION.md](CONFIGURATION.md).
 
 Contents: [prebuilt packages](#prebuilt-packages) - [requirements](#requirements) - [Linux and WSL2](#linux-and-wsl2) -
-[Windows](#windows) - [model files](#model-files) - [checking a build](#checking-a-build) - [files](#files).
+[Windows](#windows) - [experimental builds](#experimental-builds) - [model files](#model-files) -
+[checking a build](#checking-a-build) - [files](#files).
 
 ## Prebuilt packages
 
@@ -44,11 +45,14 @@ folder) and `scripts\package_release.ps1` (after `build.ps1`; it bundles the Vis
 - **CUDA:** 13.2; older 12.x versions are untested. The Windows build needs a driver that supports
   CUDA 13.2; it links the CUDA runtime statically, so at run time only the driver is needed.
 - **OS:** Linux, WSL2, or Windows 10 / 11 x64.
-- **RAM to compile:** most of the build is ptxas on the megakernel (`qwen38_mk.cu`, the device code), one thread with
-  a large heap. For the served configuration it peaked at 18.8 GiB both on Linux / WSL2, in a 10.5-minute `make -j2`,
-  and natively on Windows, in a 12-minute `build.ps1`. A change to the host side alone (`engine.cu`, `engine_impl.h`
-  and the other host files) does not recompile it: `make -j2` rebuilds and links in about 10 s for one host file and
-  30 s for `engine_impl.h` (all seven), with under 0.5 GB per compile.
+- **RAM to compile:** most of the build is ptxas on the megakernel (`qwen38_mk.cu`, the device code), one thread with a
+  large heap. For the served configuration it peaked at 21.0 GiB on Linux / WSL2 (12 minutes of ptxas in a 14-minute
+  `make -j4`, 2026-11-03), the [deep-pass build](EXPERIMENTAL.md#the-deep-pass) the same (21.1 GiB), int8 decode
+  attention ([`-DMK_ATT_I8=1`](EXPERIMENTAL.md#int8-decode-attention)) 26.1 GiB in 17 minutes of ptxas. Natively on
+  Windows the previous engine (6f3b257, 2026-10-30) peaked at 18.8 GiB in a 12-minute `build.ps1`; expect about the
+  Linux figure for this one. A change to the host side alone (`engine.cu`, `engine_impl.h` and the other host files)
+  does not recompile it: `make -j2` rebuilds and links in about 10 s for one host file and 30 s for `engine_impl.h` (all
+  seven), with under 0.5 GB per compile.
 - **RAM at run time:** parked conversations and side requests use page-locked host memory, up to `--park-mib` /
   `MK_PARK_MIB` (default 8192 MiB; 1024 MiB for side requests alone when parking is off), allocated as it is needed and
   kept until the server exits. The token embedding table also stays in page-locked host memory instead of VRAM.
@@ -81,6 +85,8 @@ What `make` builds:
 Build settings:
 - **The served configuration** needs no flags: `MKFLAGS` is empty by default and takes the debug and experiment flags
   of [CONFIGURATION.md](CONFIGURATION.md#engine--d-flags), e.g. `make MKFLAGS=-DMK_SPEC_LOG=1`.
+- **In active development, opt-in:** the deep pass (`-DMK_MAXD=16`) and int8 decode attention
+  (`-DMK_ATT_I8=1`), alone or together: [EXPERIMENTAL.md](EXPERIMENTAL.md).
 - **Architecture:** `make` asks `nvidia-smi` for the first GPU's compute capability (sm_86 if it is missing); override
   it with `ARCH=sm_89` or similar.
 - **Huge pages:** the Makefile sets `GLIBC_TUNABLES=glibc.malloc.hugetlb=1`, which lets ptxas's heap use transparent
@@ -136,6 +142,12 @@ scripts\serve.bat                 :: http://127.0.0.1:8080, 120k context, q8_0 K
 `scripts\serve.bat` takes the same settings as `scripts/serve.sh` ([CONFIGURATION.md](CONFIGURATION.md)). Images are
 on when `mmproj-BF16.gguf` sits next to the model or `MK_MMPROJ` names it (`MK_MMPROJ=off` turns them off). From an
 NVMe disk the server is ready in about 7 s.
+
+## Experimental builds
+
+Two opt-in source builds are in active development: the deep pass (`MKFLAGS=-DMK_MAXD=16`, up to 15 drafts, q8_0 KV
+cache only for now) and int8 decode attention (`MKFLAGS=-DMK_ATT_I8=1`). How to build and use them, what they need, their
+exactness and speed: [EXPERIMENTAL.md](EXPERIMENTAL.md).
 
 ## Model files
 

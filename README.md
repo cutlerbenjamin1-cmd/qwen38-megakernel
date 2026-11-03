@@ -43,7 +43,8 @@ one session.
 
 ## What you get
 
-- **Speculative decoding with the model's own MTP head**, up to 7 drafts per step, verified on the GPU.
+- **Speculative decoding with the model's own MTP head**, up to 7 drafts per step (15 with the opt-in
+  [deep-pass build](docs/EXPERIMENTAL.md#the-deep-pass), q8_0 KV cache only), verified on the GPU.
 - **[Exact output](#exact-output):** greedy output is identical at any draft count, from a cached conversation or a
   fresh one, on Windows or Linux.
 - **[The full 262k context on 24 GB](#the-full-262k-context-on-24-gb)** with near-lossless low-bit KV presets.
@@ -55,6 +56,10 @@ one session.
   of context each, against 137 and 97 for llama.cpp's `llama-server --parallel 4` in the same session, sampled
   ([parallel agents](docs/BENCHMARKS.md#parallel-agents)).
 - **Prebuilt packages** for Windows and Linux.
+- **[In active development](docs/EXPERIMENTAL.md):** the [deep pass](docs/EXPERIMENTAL.md#the-deep-pass) (up to 15 drafts per step, q8_0 KV
+  cache only for now; low-bit KV presets with it are on the list) and int8 decode attention
+  ([`-DMK_ATT_I8=1`](docs/CONFIGURATION.md#engine--d-flags), q8_0 KV cache). Both are opt-in source builds, not in the
+  packages yet.
 
 ## Quick start
 
@@ -70,7 +75,7 @@ model as below and run `scripts/serve.sh` or `scripts\serve.bat`. What they need
 git clone https://github.com/ggml-org/llama.cpp ../llama.cpp && git -C ../llama.cpp checkout b10246
 cmake -S ../llama.cpp -B ../llama.cpp/build -DCMAKE_BUILD_TYPE=Release -DBUILD_SHARED_LIBS=ON -DGGML_CUDA=ON
 cmake --build ../llama.cpp/build -j
-make -j2                          # the served configuration: about 11 minutes, up to ~19 GiB of RAM in ptxas
+make -j2                          # the served configuration: about 14 minutes, up to ~21 GiB of RAM in ptxas
 pip install -r requirements.txt
 hf download unsloth/Qwen3.8-27B-GGUF Qwen3.8-27B-UD-Q4_K_XL.gguf mmproj-BF16.gguf --local-dir ~/models
 scripts/serve.sh                  # http://127.0.0.1:8080: 120k context, 7 drafts, exact reuse, images on
@@ -208,9 +213,9 @@ also need the context window set by hand, some the image flag or the thinking le
 
 ## How it's fast
 
-- **One kernel launch per decode cycle.** The main model pass over up to 8 tokens, lm_head, draft verification, the
-  MTP catch-up and the next drafts (about 340 phases) run in one persistent cooperative kernel. The host only reads
-  back the accepted tokens.
+- **One kernel launch per decode cycle.** The main model pass over up to 8 tokens (16 in the experimental deep-pass
+  build), lm_head, draft verification, the MTP catch-up and the next drafts (about 340 phases) run in one persistent
+  cooperative kernel. The host only reads back the accepted tokens.
 - **Verification on int8 tensor cores.** The main pass runs as int8 GEMMs, so a cycle that verifies 8 tokens costs
   about 29 ms against 22 ms for one.
 - **Weights stay in their GGUF k-quant encoding**, re-laid-out at load for aligned loads (values unchanged) and read
@@ -229,7 +234,7 @@ The full tour: [docs/ENGINE.md](docs/ENGINE.md).
   SMs at any draft count. Making its batched passes work on 50-79 SMs (A10, L4, RTX A5000) is open, and a pull request
   is welcome.
 - **CUDA 13.2** (older 12.x versions are untested), Linux, WSL2 or Windows 10 / 11 x64.
-- **RAM:** ~20 GiB free to compile the served configuration. At run time, page-locked host memory for parked
+- **RAM:** ~22 GiB free to compile the served configuration. At run time, page-locked host memory for parked
   conversations up to `MK_PARK_MIB` (8 GiB by default, allocated as needed).
 - **llama.cpp b10246** next to this repository, **Python 3.10+** with jinja2, an x86-64 CPU with AVX2 + FMA for the
   fast image encoder, and ffmpeg for video (optional).
