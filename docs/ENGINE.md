@@ -435,8 +435,14 @@ those waits use a high-resolution waitable timer, since a plain sleep ends at th
   the prefill attention
 - `loader.cuh` - the host side of the model load (read-ahead, reusable buffers); `gguf.h` - minimal mmap GGUF reader
 - `capi.cpp` - C API (engine + libllama tokenizer + keep-warm) for `libqwen38mk.so`
-- `server/mk_server.py` - the HTTP server ([SERVER.md](SERVER.md)); `scripts/serve.sh` / `scripts/serve.bat` - the
-  launchers
+- `server/mk_server.py` - the HTTP server's entry point: options and startup ([SERVER.md](SERVER.md));
+  `scripts/serve.sh` / `scripts/serve.bat` - the launchers
+- `server/mk_core.py` - `Server` (setup and state) and `SlotServer`; `mk_srv_cache.py`, `mk_srv_info.py`,
+  `mk_srv_prompt.py`, `mk_srv_gen.py` - `Server`'s methods, as mixins
+- `server/mk_http.py`, `mk_gate.py` - the HTTP layer and the request gate; `mk_chat.py` - the chat request and reply;
+  `mk_anthropic.py`, `mk_responses.py` - the other two APIs' translation to and from them
+- `server/mk_engine.py`, `mk_media.py`, `mk_template.py`, `mk_slots.py` - the engine's binding, image and video input,
+  chat templates, the slot scheduler; `mk_limits.py`, `mk_log.py`, `mk_errors.py` - shared by the others
 - `main.cu` - CLI (tokenization via libllama)
 - `compat_win32.h` / `.cpp`, `vision/win32.h` / `.cpp`, `build.ps1` - the native Windows build
 - `draft_vocab_32k.bin` - MTP draft-head token subset (int32 ids)

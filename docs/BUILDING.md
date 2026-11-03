@@ -243,7 +243,8 @@ hf download unsloth/Qwen3.8-27B-GGUF Qwen3.8-27B-UD-Q4_K_XL.gguf mmproj-BF16.ggu
   `mk_launch.h`, `qwen38_mk.h` (the API), `gguf.h`: shared ([ENGINE.md](ENGINE.md#files) has what each file holds)
 - `capi.cpp`: the C API of `libqwen38mk.so` / `qwen38mk.dll` (and the keep-warm thread)
 - `main.cu`: the `qwen38_mk` CLI; `logit_stats.h`: the accuracy comparison shared by the CLI and the tools
-- `server/mk_server.py`: the HTTP server
+- `server/mk_server.py`: the HTTP server's entry point; the other `server/mk_*.py`: the rest of it
+  ([ENGINE.md](ENGINE.md#files) has what each file holds)
 - `scripts/serve.sh`, `scripts/serve.bat`: the launchers (Linux / WSL2, Windows)
 - `Makefile`; `build.ps1`, `compat_win32.h` / `.cpp`, `vision/win32.h` / `.cpp`: the Windows build and its POSIX / Win32
   shims (compiled only on Windows)
