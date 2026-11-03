@@ -40,6 +40,8 @@ __device__ __forceinline__ int ldw1(const void * p) {
     return r;
 }
 __device__ __forceinline__ void pf_l2(const void * p) { asm volatile("prefetch.global.L2::evict_last [%0];" ::"l"(p)); }
+// normal-priority L2 prefetch of a streamed weight line (lm_head<16>; wv.cuh's pf_l2n is the same for the _ck phases)
+__device__ __forceinline__ void pf_l2s(const void * p) { asm volatile("prefetch.global.L2 [%0];" ::"l"(p)); }
 // prefetch `bytes` starting at p (128-byte lines) with the threads of the calling block
 __device__ __forceinline__ void pf_block(const void * p, int bytes) {
     for (int off = threadIdx.x * 128; off < bytes; off += NT * 128) pf_l2(reinterpret_cast<const uint8_t *>(p) + off);
@@ -68,7 +70,7 @@ struct SX {
     int U;
 };
 
-// ---- qwen38_mk.cu: M4 .. mrows ----
+// ---- qwen38_mk.cu: M4 .. accR ----
 constexpr int M4 = 0x0F0F0F0F;
 
 __device__ __forceinline__ int gwarp() { return (threadIdx.x >> 5) * gridDim.x + blockIdx.x; }
@@ -117,6 +119,7 @@ __device__ __forceinline__ void accR(const SX & s, int u, const int (&A)[R][4], 
     }
 }
 
+// ---- qwen38_mk.cu: q4k_scales .. mrows ----
 __device__ __forceinline__ void q4k_scales(const int4 & h, int p, float & fA, float & gA, float & fB, float & gB) {
     const float2 dm = __half22float2(*reinterpret_cast<const __half2 *>(&h.x));
     const int sh = (p & 1) * 16;
@@ -202,11 +205,12 @@ __device__ __forceinline__ void rows_q5k(const uint8_t * const (&rp)[R], const S
 //   rows (Mat::w, Q6_BLK = 192 B per block): qlo[128] (q4k-style nibbles) | qhi[64] (8 B per unit);
 //   meta (Mat::d, 18 B per block, in pairs of blocks: sc[16] even | sc[16] odd | d even | d odd, 36 B).
 // A unit reads its 4 scales sc[4p..4p+3] and the pair's two d (one 4-byte load each).
-template <int T, int IT, int R, int XP = 0>
-__device__ __forceinline__ void rows_q6k(const uint8_t * const (&rp)[R], const __half * const (&dp)[R], const SX & s,
+template <int T, int IT, int R, int XP = 0, class S = SX>
+__device__ __forceinline__ void rows_q6k(const uint8_t * const (&rp)[R], const __half * const (&dp)[R], const S & s,
                                          float (&acc)[R][T]) {
     const int lane = threadIdx.x & 31;
-#pragma unroll(IT > 8 ? (T >= 5 ? 1 : 4) : IT)
+    // (T > 8, lm_head<16>: one unit per iteration, the registers of 16 rows' sums)
+#pragma unroll(IT > 8 ? (T >= 5 ? 1 : 4) : (T > 8 ? 1 : IT))
     for (int i = 0; i < IT; i++) {
         const int u = lane + 32 * i, b = u >> 3, p = (u >> 1) & 3, hh = u & 1;
         int4 q[R];
@@ -245,11 +249,12 @@ __device__ __forceinline__ void rows_q6k(const uint8_t * const (&rp)[R], const _
 }
 
 // repacked Q8_0: per unit 32 B (A 16 int8 | B 16 int8), scales per natural 32-block
-template <int T, int IT, int R, int XP = 0>
-__device__ __forceinline__ void rows_q80(const uint8_t * const (&rp)[R], const __half * const (&dp)[R], const SX & s,
+template <int T, int IT, int R, int XP = 0, class S = SX>
+__device__ __forceinline__ void rows_q80(const uint8_t * const (&rp)[R], const __half * const (&dp)[R], const S & s,
                                          float (&acc)[R][T]) {
     const int lane = threadIdx.x & 31;
-#pragma unroll(IT > 8 ? (T >= 5 ? 1 : 4) : IT)
+    // (T > 8, lm_head<16>: one unit per iteration, the registers of 16 rows' sums)
+#pragma unroll(IT > 8 ? (T >= 5 ? 1 : 4) : (T > 8 ? 1 : IT))
     for (int i = 0; i < IT; i++) {
         const int u = lane + 32 * i;
         int A[R][4], B[R][4];
@@ -485,8 +490,8 @@ __device__ __forceinline__ int unit_bytes(int u0) {
                                           : 32 * u0;
 }
 // R rows of one weight type given their row pointers (and, for Q8_0, their scale rows)
-template <int T, int IT, int R, int TYPE, int XP = 0>
-__device__ __forceinline__ void rows_t(const uint8_t * const (&rp)[R], const __half * const (&dp)[R], const SX & s,
+template <int T, int IT, int R, int TYPE, int XP = 0, class S = SX>
+__device__ __forceinline__ void rows_t(const uint8_t * const (&rp)[R], const __half * const (&dp)[R], const S & s,
                                        float (&acc)[R][T]) {
     if constexpr (TYPE == T_Q4K) rows_q4k<T, IT, R, XP>(rp, s, acc);
     else if constexpr (TYPE == T_Q5K) rows_q5k<T, IT, R, XP>(rp, s, acc);

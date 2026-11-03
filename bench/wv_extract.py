@@ -23,7 +23,9 @@ SEGMENTS = [
     (r"^__device__ __forceinline__ unsigned long long l2_evict_first\(\)", r"^__device__ __forceinline__ float wmax\(",
      "l2_evict_first .."),
     (r"^struct SX \{", r"^__device__ __forceinline__ SX make_sx\(", "struct SX"),
-    (r"^constexpr int M4 = 0x0F0F0F0F;", r"^// Row pairs \[lo, hi\) of a single-matrix item range", "M4 .. mrows"),
+    # (without accR's lm_head<16> overload: it needs SXH and U_D, and the bench has no 16-row lm_head)
+    (r"^constexpr int M4 = 0x0F0F0F0F;", r"^// accR on lm_head<16>'s activations", "M4 .. accR"),
+    (r"^__device__ __forceinline__ void q4k_scales\(", r"^// Row pairs \[lo, hi\) of a single-matrix item range", "q4k_scales .. mrows"),
 ]
 parts = []
 for a, b, label in SEGMENTS:
