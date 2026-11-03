@@ -2,7 +2,6 @@
 import base64
 import contextlib
 import http.client
-import importlib.util
 import io
 import json
 import socket
@@ -15,16 +14,9 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
+from server_modules import load as _load_mk_server
+
 ROOT = Path(__file__).resolve().parent.parent
-
-
-def _load_mk_server():
-    path = ROOT / "server" / "mk_server.py"
-    spec = importlib.util.spec_from_file_location("mk_server_under_test", path)
-    module = importlib.util.module_from_spec(spec)
-    sys.modules[spec.name] = module
-    spec.loader.exec_module(module)
-    return module
 
 
 class MegakernelServerParsingTests(unittest.TestCase):

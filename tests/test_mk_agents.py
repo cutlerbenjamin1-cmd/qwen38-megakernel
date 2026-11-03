@@ -2,29 +2,16 @@
 slot API whose replies depend on the prompt and its sampling only, as the real engine's do (a slot decodes as it does
 alone), while how many tokens each cycle emits depends on how many slots decode together (as the real depth policy)."""
 import http.client
-import importlib.util
 import json
 import socket
-import sys
 import threading
 import time
 import types
 import unittest
 import unittest.mock
 import zlib
-from pathlib import Path
 
-ROOT = Path(__file__).resolve().parent.parent
-
-
-def _load_mk_server():
-    path = ROOT / "server" / "mk_server.py"
-    spec = importlib.util.spec_from_file_location("mk_server_agents_under_test", path)
-    module = importlib.util.module_from_spec(spec)
-    sys.modules[spec.name] = module
-    spec.loader.exec_module(module)
-    return module
-
+from server_modules import load as _load_mk_server
 
 TEMPLATE = ("{% for m in messages %}<|im_start|>{{ m.role }}\n{{ m.content }}<|im_end|>\n{% endfor %}"
             "{% if add_generation_prompt %}<|im_start|>assistant\n{% endif %}")
