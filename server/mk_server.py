@@ -437,8 +437,8 @@ class Engine:
         return r
 
     def step(self):
-        out = (ctypes.c_int * 8)()
-        n = self.L.mk_step(self.h, out, 8)
+        out = (ctypes.c_int * 16)()
+        n = self.L.mk_step(self.h, out, 16)
         if n < 0:
             raise self._err("decode")
         return list(out[:n])

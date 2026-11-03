@@ -184,7 +184,7 @@ void MKEngine::Impl::hs_quiesce() {
 
 void MKEngine::Impl::sw_need(int X, bool rings_all) {
     if (!sw_on || sw_broken) return;
-    const int up = (X + MAXT + SW_BLK - 1) / SW_BLK * SW_BLK;
+    const int up = (X + MAXD + SW_BLK - 1) / SW_BLK * SW_BLK;
     const int want = std::max(sw_hi, std::min(sw_top, up)),
               rwant = hb.kvwin > 0 ? std::max(sw_rhi, rings_all ? hb.kvrc : std::min(hb.kvrc, up)) : 0;
     if (want <= sw_hi && rwant <= sw_rhi) return;
@@ -405,7 +405,7 @@ int MKEngine::side_unpark(int id) {
     Impl::Parked & e = it->second;
     const int top = std::max({e.book.kv_top, (int) e.book.seq.size(), e.book.ctl.dn_c});
     if (!I.sw_broken) { // room for what the kept sequence moves out first (else nothing changes)
-        const int rows = std::min(I.sw_top, (top + MAXT + Impl::SW_BLK - 1) / Impl::SW_BLK * Impl::SW_BLK) - I.sw_hi;
+        const int rows = std::min(I.sw_top, (top + MAXD + Impl::SW_BLK - 1) / Impl::SW_BLK * Impl::SW_BLK) - I.sw_hi;
         size_t need = I.kv_token_bytes() * (size_t) std::max(0, rows) + 2 * I.hs_chunk; // (+ the last chunks' slack)
         if (I.hb.kvwin > 0) need += I.ring_bytes() / I.hb.kvrc * (size_t) (I.hb.kvrc - I.sw_rhi);
         for (const auto & c : e.cks)

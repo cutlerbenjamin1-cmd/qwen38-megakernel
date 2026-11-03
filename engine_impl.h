@@ -2,6 +2,7 @@
 // files it lists). Host files only: the device TU (qwen38_mk.cu) is reached through mk_launch.h.
 #pragma once
 
+#include <array>
 #include "mk_shared.cuh"
 #include "mk_launch.h"
 
@@ -41,7 +42,12 @@ struct MKEngine::Impl {
         int dmin = 1;
         // generalised gate (any depth): stop after draft k >= 1 below 0.4, drop the deepest draft (k = n_draft - 1, the
         // T = n_draft + 1 verify row) below drop_last (at n_draft 4: the default gates above)
-        float gate_drop[MAXT - 1] = {}, gate_stop[MAXT - 1] = {0.f, 0.4f, 0.4f, 0.4f, 0.4f, 0.4f, 0.4f};
+        static std::array<float, MAXD - 1> stop_init() {
+            std::array<float, MAXD - 1> a{};
+            for (int k = 1; k < MAXD - 1; k++) a[k] = 0.4f;
+            return a;
+        }
+        std::array<float, MAXD - 1> gate_drop{}, gate_stop = stop_init();
         float drop_last = 0.4f;
         // context cap: from position dctx on, at most 4 drafts (T <= 5: at long context the wide pass's second
         // head-group pass over K / V costs more than drafts 5..7 gain)
@@ -51,6 +57,7 @@ struct MKEngine::Impl {
         // 5-6 below 0.3, never drop the deepest draft (from an offline policy search on open-policy logs; greedy output
         // is unchanged). Any explicit stop / drop key turns it off.
         int g7 = 1;
+        float dstop = 0.5f, tier = 3.0f; // deep chain: g7's stop past draft 7; drafts 8.. verified if their chain sum >= tier
         int gate_chain = 1;
         int h1 = 1; // sampling: sampled drafts (Launch::spec_smp)
     } pol;
@@ -295,9 +302,9 @@ struct MKEngine::Impl {
     double launch_ns = 0;
     long launches = 0;
     // min over launches of each barrier-to-barrier interval, keyed by (T, barrier index)
-    std::vector<std::vector<double>> best_ns = std::vector<std::vector<double>>(MAXT + 1);
-    std::vector<std::vector<int>> best_tag = std::vector<std::vector<int>>(MAXT + 1);
-    std::vector<std::vector<double>> best_fill = std::vector<std::vector<double>>(MAXT + 1);
+    std::vector<std::vector<double>> best_ns = std::vector<std::vector<double>>(MAXD + 1);
+    std::vector<std::vector<int>> best_tag = std::vector<std::vector<int>>(MAXD + 1);
+    std::vector<std::vector<double>> best_fill = std::vector<std::vector<double>>(MAXD + 1);
     std::vector<double> arr_first = std::vector<double>(PH_COUNT, 0.0), arr_med = std::vector<double>(PH_COUNT, 0.0),
                         arr_last = std::vector<double>(PH_COUNT, 0.0);
     std::vector<long> arr_n = std::vector<long>(PH_COUNT, 0);
@@ -941,6 +948,12 @@ struct MKEngine::Impl {
     int slots_open(int n, int lctx);
     // the main view of lane k for a batched launch: its rows start at row r0 of the pass
     Bufs lane_main_view(const Lane & l, int r0) const;
+    static Bufs rows_view(const Bufs & b, int r0); // b with its row buffers from row r0
+    std::string wide_why() const; // why the RMAX-row weight phases cannot run here ("": they can)
+    std::string deep_why() const; // why the deep pass (n_draft > MAXT - 1) cannot run here ("": it can)
+    float * apart_hi = nullptr;   // the deep pass's attention partials of rows MAXT .. (view_hi)
+    float2 * aml_hi = nullptr;
+    void set_view_hi();
     // one batched decode launch of lanes ks (>= 2, none live, every one past its prefill): returns each lane's tokens
     // (empty: its context is full). Rows: lane i verifies T_i <= Tcap = MAXT / nl tokens (its drafts beyond are dropped,
     // as att_cap_T drops them) and drafts up to Tcap - 1 for the next launch.

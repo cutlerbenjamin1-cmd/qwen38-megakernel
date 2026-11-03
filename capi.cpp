@@ -547,9 +547,9 @@ int mk_step(void * hp, int * out, int cap) {
     return guarded(hp, [&](MKEngine * e) {
         std::vector<int> v;
         e->step(v);
-        const int n = std::min((int) v.size(), cap);
-        for (int i = 0; i < n; i++) out[i] = v[i];
-        return n;
+        if ((int) v.size() > cap) throw std::runtime_error("mk_step: " + std::to_string(v.size()) + " tokens, the buffer holds " + std::to_string(cap));
+        for (int i = 0; i < (int) v.size(); i++) out[i] = v[i];
+        return (int) v.size();
     });
 }
 

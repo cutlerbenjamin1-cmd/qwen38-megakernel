@@ -1573,6 +1573,25 @@ __device__ __forceinline__ void rows16_dp_all(const Mat & m, int j, LaneT<T> & o
     }
 }
 
+// _ck phases (MK_DEEP2 bit 2): L2 prefetch of tile `tile`'s units from super-block sb on, MK_CK_PFL 128-B lines per warp
+// and matrix, issued before a sub-chunk fill so the warp's weight stream keeps running through the fill's barriers (the
+// T <= MAXT phases fill once). Normal L2 priority: the lines are read once, within microseconds
+#ifndef MK_CK_PFL
+#define MK_CK_PFL 12
+#endif
+__device__ __forceinline__ void pf_l2n(const void * p) { asm volatile("prefetch.global.L2 [%0];" ::"l"(p)); }
+template <bool X16>
+__device__ __forceinline__ void wv_pf_next(const Mat & m, int tile, int sb) {
+    const int lane = threadIdx.x & 31, ty = m.type;
+    if (!(cB.deep2 & 2) || lane >= MK_CK_PFL) return;
+    // unit (tile, sb) bytes: wv_unit / wv_tblk (16 rows x BS), FM Q6_K in the q32 phases q6f_load's Q6F_UNIT
+    const int ub = ty == T_Q6K && !X16 ? Q6F_UNIT
+                 : 16 * (ty == T_Q4K || ty == T_IQ4NL ? 144 : ty == T_Q5K ? 176 : ty == T_IQ4X ? 136 : ty == T_Q8_0 ? 256
+                         : ty == T_Q6K ? Q6_BLK : Q3_BLK);
+    const size_t nsb = (size_t) (m.K >> 8), off = ((size_t) tile * nsb + sb) * ub + 128 * lane;
+    if (off < ((size_t) tile + 1) * nsb * ub) pf_l2n(m.w + off);
+}
+
 // attention q / k / v projections, RT rows (every matrix in the wv layout)
 template <int T>
 __device__ __noinline__ void attn_proj_ck(const LayerW & W) {
@@ -1602,6 +1621,7 @@ __device__ __noinline__ void attn_proj_ck(const LayerW & W) {
 #pragma unroll 1
     for (int c = 0; c < NCH; c++) {
         const int s0 = NSB * c / NCH, s1 = NSB * (c + 1) / NCH;
+        if (have) wv_pf_next<false>(m, lt, s0);
         wv_fill_ck<T, false, US>(cB.qn, 8 * s0, 8 * (s1 - s0), false, q6);
         if (have) {
             if (ns > 1) st.a = attn_kv_rh_st<T>(m, lt, rh, s0, s1 - s0, US, st.a);
@@ -1634,13 +1654,18 @@ __device__ __noinline__ void dn_proj_ck(const LayerW & W, int dl, RowTab rt) {
     float ** const s_cvp = reinterpret_cast<float **>(misc(nullptr) + 64);
     if (threadIdx.x < T) {
         const int t = threadIdx.x;
-        int r0;
-        const int ln = rt_lane(rt, t, r0);
         float * cv = nullptr;
-        if (ln >= 0) {
-            const Bufs & V = cBs[view_main(ln)];
-            const int p = ((volatile Ctl *) V.ctl)->n + t - r0;
-            cv = V.conv + (size_t) dl * CONV_RING * QKV + (size_t) (p % CONV_RING) * QKV;
+        if (rt.nl == 0) { // (the deep pass: row t at the sequence's n + t)
+            const int p = ((volatile Ctl *) cB.ctl)->n + t;
+            cv = cB.conv + (size_t) dl * CONV_RING * QKV + (size_t) (p % CONV_RING) * QKV;
+        } else {
+            int r0;
+            const int ln = rt_lane(rt, t, r0);
+            if (ln >= 0) {
+                const Bufs & V = cBs[view_main(ln)];
+                const int p = ((volatile Ctl *) V.ctl)->n + t - r0;
+                cv = V.conv + (size_t) dl * CONV_RING * QKV + (size_t) (p % CONV_RING) * QKV;
+            }
         }
         s_cvp[t] = cv;
     }
@@ -1664,11 +1689,15 @@ __device__ __noinline__ void dn_proj_ck(const LayerW & W, int dl, RowTab rt) {
     }
     WvSt<T, false> st;
     wv_st_zero<T, false>(st);
+    // the alpha / beta items' sub-chunk: MK_DEEP2 bit 4 the last (no fill barrier waits for them; the 16-row items take
+    // twice the 8-row time), else the first
+    const int abc = (cB.deep2 & 4) ? NCH - 1 : 0;
 #pragma unroll 1
     for (int c = 0; c < NCH; c++) {
         const int s0 = NSB * c / NCH, s1 = NSB * (c + 1) / NCH;
+        if (have) wv_pf_next<false>(m, lt, s0);
         wv_fill_ck<T, false, US>(cB.qn, 8 * s0, 8 * (s1 - s0), false, q6);
-        if (c == 0) {
+        if (c == abc) {
             const float * s_rs = misc(nullptr);
             for (int it = ab0; it < ab1; it += astep) {
                 const int row = it % (2 * NVH), ch = it / (2 * NVH);
@@ -1741,6 +1770,10 @@ __device__ __noinline__ WvGU<WvCfg<T, false>::NG> ffn_gu_ck_sums(const LayerW & 
 #pragma unroll 1
     for (int c = 0; c < NCH; c++) {
         const int s0 = NSB * c / NCH, s1 = NSB * (c + 1) / NCH;
+        if (have) {
+            if (gw) wv_pf_next<false>(W.fg, j, s0);
+            if (uw) wv_pf_next<false>(W.fu, j, s0);
+        }
         wv_fill_ck<T, false, US>(cB.qn, 8 * s0, 8 * (s1 - s0), false, Q6);
         if (have) {
             if (gw) wv_tile_any_st<T, false, Q6>(W.fg, j, s0, s1 - s0, US, sg);
@@ -1822,18 +1855,20 @@ __device__ __noinline__ void resid_wv_ck(const Mat Wm, const QBuf in, const floa
     const int G = gridDim.x / WV_S, b = blockIdx.x;
     if (b >= WV_S * G) return;
     const int kc = b / G, bi = b - kc * G;
-    if (role & 2) c1_wait(kc, G);
     unsigned * cnt = cB.wvcnt + (role & 1) * (D / 32);
     constexpr int NTILE = D / 16;
     const int t0 = NTILE * bi / G, t1 = NTILE * (bi + 1) / G;
     const int tile = t0 + (NW - 1 - warp);
     const bool have = tile < t1;
+    if (have) wv_pf_next<X16>(Wm, tile, CH * kc); // (the weights do not wait for ffn_gu's chunk: fetched during c1_wait)
+    if (role & 2) c1_wait(kc, G);
     const bool min2 = X16 && wv_min2(Wm.type), q6 = !X16 && Wm.type == T_Q6K;
     WvSt<T, X16> st;
     wv_st_zero<T, X16>(st);
 #pragma unroll 1
     for (int c = 0; c < NCH; c++) {
         const int s0 = CH * c / NCH, s1 = CH * (c + 1) / NCH;
+        if (have && c > 0) wv_pf_next<X16>(Wm, tile, CH * kc + s0);
         wv_fill_ck<T, X16, US>(in, 8 * (CH * kc + s0), 8 * (s1 - s0), min2, q6);
         if (have) wv_tile_any_st<T, X16, true>(Wm, tile, CH * kc + s0, s1 - s0, US, st);
     }

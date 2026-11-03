@@ -6,7 +6,7 @@
 #if MK_SPEC_LOG
 void MKEngine::Impl::slog_drafts() {
     if (!slog) return;
-    slog_q.resize((size_t) MAXT * (TOPK_MAX + 1));
+    slog_q.resize((size_t) MAXD * (TOPK_MAX + 1));
     CK(cudaMemcpy(slog_q.data(), hb.dlog, slog_q.size() * sizeof(float2), cudaMemcpyDeviceToHost));
 }
 #endif
@@ -302,7 +302,7 @@ void MKEngine::Impl::launch(int mode, int T, int last, int score) {
     sw_need(hctl.n + T + ndraft); // (side request: the kept sequence's rows there go to the host store first)
     kv_top = std::max(kv_top, hctl.n + T + ndraft); // rows hctl.n .. + T - 1, the MTP's draft rows after them (ring_rewind)
     Launch L{mode, T, last, ndraft, score, smp_temp, smp_top_p, smp_min_p, smp_top_k, smp_seed};
-    for (int k = 0; k < MAXT - 1; k++) {
+    for (int k = 0; k < MAXD - 1; k++) {
         L.gate_drop[k] = pol.gate_drop[k];
         L.gate_stop[k] = pol.gate_stop[k];
     }
@@ -312,17 +312,24 @@ void MKEngine::Impl::launch(int mode, int T, int last, int score) {
         L.gate_stop[4] = L.gate_stop[5] = 0.3f;
         L.gate_drop[4] = 0.3f;
     } else if (top >= 1) L.gate_drop[top - 1] = std::max(L.gate_drop[top - 1], pol.drop_last);
+#if MK_MAXD > 8
+    if (pol.g7 && top > MAXT - 1)
+        for (int k = MAXT - 1; k < MAXD - 1; k++) L.gate_stop[k] = pol.dstop;
+#endif
     L.gate_chain = pol.gate_chain;
     L.spec_smp = smp_temp > 0.f && pol.h1;
     // chain=2 with sampled drafts: the chain holds the drafted token's own q' probability, so a drop gate on it would
     // pick which drafts get verified by their value (biased output: tests/spec_rng_sim.py); stop gates only
     if (L.gate_chain == 2 && L.spec_smp)
-        for (int k = 0; k < MAXT - 1; k++) L.gate_drop[k] = 0.f;
+        for (int k = 0; k < MAXD - 1; k++) L.gate_drop[k] = 0.f;
     if (!score && (pen_pres != 0.f || pen_freq != 0.f)) {
         L.pres = pen_pres;
         L.freq = pen_freq;
         pcnt_dirty = true;
     }
+#if MK_MAXD > 8
+    if (mode == MODE_DECODE && T > MAXT) set_view_hi();
+#endif
     void * args[] = {&L};
     ck_wait_restore(); // (cheap no-ops unless a checkpoint copy is pending on ck_st)
     ck_guard_state();
@@ -350,9 +357,50 @@ void MKEngine::Impl::launch(int mode, int T, int last, int score) {
 
 }
 
+static const char * const kPhName[PH_COUNT] = {
+    "embed", "attn_proj", "attn_core", "attn_comb", "resid_o", "dn_proj", "dn_core", "resid_sout", "ffn_gu", "ffn_down",
+    "lm_head", "mtp_m0", "mtp_eh", "mtp_attn_proj", "mtp_attn_core", "mtp_attn_comb", "mtp_resid_o", "mtp_ffn_gu",
+    "mtp_ffn_down", "mtp_lm_head", "mtp_kv_m0", "mtp_kv_eh", "mtp_kv_proj"};
+
+// MK_PROF_DUMP: one launch's raw stamps, times in ns (56-bit globaltimer, wrap-safe like prof_collect): per barrier its
+// phase, end (after the launch start), duration, fill mark and every block's arrival (after the phase start; -1: none,
+// barriers >= 1024 keep no arrivals)
+static void prof_dump(const std::vector<unsigned long long> & pr, long n, int T, int nsm) {
+    const unsigned long long M = (1ull << 56) - 1;
+    const char * path = getenv("MK_PROF_DUMP_FILE");
+    FILE * f = path ? fopen(path, "w") : stderr;
+    if (!f) {
+        fprintf(stderr, "[mk] MK_PROF_DUMP: cannot write %s\n", path);
+        return;
+    }
+    const unsigned long long t0 = pr[0] >> 8;
+    int K = 1;
+    while (K < 2048 && pr[K]) K++;
+    fprintf(f, "# mk_prof_dump launch %ld T %d nsm %d t0_ns %llu barriers %d\n", n, T, nsm, t0, K - 1);
+    fprintf(f, "# k phase t_end_ns dt_ns fill_ns arrival_ns[block 0 .. nsm - 1]\n");
+    unsigned long long prev = t0;
+    for (int k = 1; k < K; k++) {
+        const unsigned long long t = pr[k] >> 8, mark = pr[2048 + k] & M;
+        const int tag = (int) (pr[k] & 0xff);
+        fprintf(f, "%d %s %llu %llu %llu", k, tag < PH_COUNT ? kPhName[tag] : "?", (t - t0) & M, (t - prev) & M,
+                mark ? (mark - prev) & M : 0ull);
+        for (int b = 0; b < nsm; b++) {
+            const unsigned long long a = k < 1024 ? pr[4096 + k * 128 + b] & M : 0;
+            if (a) fprintf(f, " %llu", (a - prev) & M);
+            else fputs(" -1", f);
+        }
+        fputc('\n', f);
+        prev = t;
+    }
+    if (path) fclose(f);
+    fprintf(stderr, "[mk] MK_PROF_DUMP: launch %ld (T=%d, %d barriers) -> %s\n", n, T, K - 1, path ? path : "stderr");
+}
+
 void MKEngine::Impl::prof_collect(int T) {
     std::vector<unsigned long long> pr(4096 + 1024 * 128);
     CK(cudaMemcpy(pr.data(), hb.prof, pr.size() * 8, cudaMemcpyDeviceToHost));
+    static const long dump_at = getenv("MK_PROF_DUMP") ? atol(getenv("MK_PROF_DUMP")) : 0;
+    if (dump_at > 0 && launches_seen == dump_at) prof_dump(pr, launches_seen, T, nsm);
     unsigned long long prev = pr[0] >> 8;
     auto & bn = best_ns[T];
     auto & bt = best_tag[T];
@@ -391,11 +439,7 @@ void MKEngine::Impl::prof_collect(int T) {
 
 void MKEngine::Impl::print_profile() {
     if (!profiling || !launches) return;
-    static const char * names[PH_COUNT] = {"embed", "attn_proj", "attn_core", "attn_comb", "resid_o", "dn_proj",
-                                           "dn_core", "resid_sout", "ffn_gu", "ffn_down", "lm_head", "mtp_m0",
-                                           "mtp_eh", "mtp_attn_proj", "mtp_attn_core", "mtp_attn_comb",
-                                           "mtp_resid_o", "mtp_ffn_gu", "mtp_ffn_down", "mtp_lm_head",
-                                           "mtp_kv_m0", "mtp_kv_eh", "mtp_kv_proj"};
+    const char * const * names = kPhName;
     fprintf(stderr, "[mk-profile] %ld decode launches, mean %.3f ms in barriers-to-barrier phases\n", launches,
             launch_ns / launches / 1e6);
     for (int i = 0; i < PH_COUNT; i++) {
@@ -408,7 +452,7 @@ void MKEngine::Impl::print_profile() {
         if (arr_n[i])
             fprintf(stderr, "  %-16s %8.2f %8.2f %8.2f\n", names[i], arr_first[i] / arr_n[i] / 1e3, arr_med[i] / arr_n[i] / 1e3,
                     arr_last[i] / arr_n[i] / 1e3);
-    for (int T = 0; T <= MAXT; T++) { // (T = 0: batched launches)
+    for (int T = 0; T <= MAXD; T++) { // (T = 0: batched launches)
         if (best_ns[T].empty()) continue;
         std::vector<double> tot(PH_COUNT, 0.0), fil(PH_COUNT, 0.0);
         std::vector<int> cnt(PH_COUNT, 0);
@@ -655,7 +699,7 @@ void MKEngine::Impl::reset() {
 MKEngine::MKEngine(const std::string & path, int ctx, int n_draft, const std::string & draft_vocab, int kv_mode,
                    const std::string & mtp)
     : p_(nullptr), n_draft_(n_draft) {
-    if (n_draft < 0 || n_draft > MAXT - 1) throw std::runtime_error("n_draft must be in [0, " + std::to_string(MAXT - 1) + "]");
+    if (n_draft < 0 || n_draft > MAXD - 1) throw std::runtime_error("n_draft must be in [0, " + std::to_string(MAXD - 1) + "]");
     if (mkl::abi_sig() != mk_abi_sig())
         throw std::runtime_error("engine build: the device object (qwen38_mk.cu) was compiled with other settings than the host files: rebuild both");
     p_ = new Impl(path, ctx, n_draft, draft_vocab, kv_mode, mtp);
@@ -669,6 +713,12 @@ MKEngine::MKEngine(const std::string & path, int ctx, int n_draft, const std::st
         }
     } delete_on_throw{p_, std::uncaught_exceptions()};
     n_draft = n_draft_ = p_->n_draft_cap; // (0 without an MTP block)
+#if MK_MAXD > 8
+    if (n_draft > MAXT - 1) {
+        const std::string why = p_->deep_why();
+        if (!why.empty()) throw std::runtime_error("n_draft > " + std::to_string(MAXT - 1) + " (the deep pass) needs " + why);
+    }
+#endif
     // the wide pass (T >= 6) runs the pipelined q8-cache decode attention only (attn_core<T > 5>: attn_core_w48q, or
     // attn_core_w48m for the low-bit MK_KV sides)
     if (n_draft > 4 && !p_->hb.kvq8) throw std::runtime_error("n_draft > 4 needs the q8 KV cache (--kv q8)");
@@ -688,8 +738,17 @@ MKEngine::MKEngine(const std::string & path, int ctx, int n_draft, const std::st
 // "" = defaults
 void MKEngine::set_policy(const std::string & spec) {
     Impl::Policy pol;
-    float dk[MAXT - 1], sk[MAXT - 1]; // per-draft overrides
-    for (int j = 0; j < MAXT - 1; j++) dk[j] = sk[j] = -1.f;
+    float dk[MAXD - 1], sk[MAXD - 1]; // per-draft overrides
+    for (int j = 0; j < MAXD - 1; j++) dk[j] = sk[j] = -1.f;
+    auto draft_key = [](const std::string & k) { // dropK / stopK: K (1 .. MAXD - 1), else 0
+        if (k.size() < 5 || k.size() > 6 || (k.compare(0, 4, "drop") != 0 && k.compare(0, 4, "stop") != 0)) return 0;
+        int K = 0;
+        for (size_t i = 4; i < k.size(); i++) {
+            if (k[i] < '0' || k[i] > '9') return 0;
+            K = 10 * K + (k[i] - '0');
+        }
+        return K >= 1 && K <= MAXD - 1 ? K : 0;
+    };
     size_t i = 0;
     while (i < spec.size()) {
         size_t j = spec.find(',', i);
@@ -700,17 +759,19 @@ void MKEngine::set_policy(const std::string & spec) {
         const size_t e = kv.find('=');
         if (e == std::string::npos) throw std::runtime_error("policy: expected key=value, got " + kv);
         const std::string k = kv.substr(0, e), v = kv.substr(e + 1);
-        if (k == "drop" || k == "stop" || (k.size() == 5 && (k.compare(0, 4, "drop") == 0 || k.compare(0, 4, "stop") == 0)))
+        const int dkey = draft_key(k);
+        if (k == "drop" || k == "stop" || dkey)
             pol.g7 = 0; // explicit gates replace the depth > 5 defaults
         if (k == "depth") pol.depth = std::stoi(v);
         else if (k == "dmin") pol.dmin = std::stoi(v);
         else if (k == "drop") for (float & x : pol.gate_drop) x = std::stof(v);
         else if (k == "stop") for (float & x : pol.gate_stop) x = std::stof(v);
-        else if (k.size() == 5 && (k.compare(0, 4, "drop") == 0 || k.compare(0, 4, "stop") == 0) && k[4] >= '1' &&
-                 k[4] < '1' + MAXT - 1) // dropK / stopK: draft K alone (e.g. drop4: the T = 5 verify row)
-            (k[0] == 'd' ? dk : sk)[k[4] - '1'] = std::stof(v);
+        else if (dkey) // dropK / stopK: draft K alone (e.g. drop4: the T = 5 verify row)
+            (k[0] == 'd' ? dk : sk)[dkey - 1] = std::stof(v);
         else if (k == "droplast") pol.drop_last = std::stof(v), pol.g7 = 0; // the deepest draft (k = n_draft - 1)
         else if (k == "g7") pol.g7 = std::stoi(v);
+        else if (k == "dstop") pol.dstop = std::stof(v); // (deep chain: g7's stop past draft 7)
+        else if (k == "tier") pol.tier = std::stof(v);   // (deep chain: Policy::tier, 0 = always verify every draft)
         else if (k == "dctx") pol.dctx = std::stoi(v); // from position dctx on: at most 4 drafts
         else if (k == "chain") pol.gate_chain = std::stoi(v);
         else if (k == "h1") pol.h1 = std::stoi(v);
@@ -721,7 +782,7 @@ void MKEngine::set_policy(const std::string & spec) {
         else if (k == "dq4") p_->set_draft_q4(std::stoi(v)); // MK_DRAFT_Q4=1 only; from the next launch
         else throw std::runtime_error("policy: unknown key " + k);
     }
-    for (int j = 0; j < MAXT - 1; j++) {
+    for (int j = 0; j < MAXD - 1; j++) {
         if (dk[j] >= 0.f) pol.gate_drop[j] = dk[j];
         if (sk[j] >= 0.f) pol.gate_stop[j] = sk[j];
     }
@@ -1223,11 +1284,22 @@ int MKEngine::step(std::vector<int> & out) {
 // MKEngine::step's body on the live sequence; returns the launch's T
 int MKEngine::Impl::step_live(std::vector<int> & out) {
     Ctl & c = hctl;
-    if (c.n + MAXT + 2 >= ctx) throw std::runtime_error("context full"); // (rows past ctx: KV_PAD)
+    if (c.n + MAXD + 2 >= ctx) throw std::runtime_error("context full"); // (rows past ctx: KV_PAD)
     // verify the previous launch's drafts, minus any that would put this launch's rows across an
     // attention-partition boundary (once per ATT_BUCKET positions; keeps greedy output depth-independent)
     // T >= 6 runs as one MAXT-row pass (padding rows): the whole n + 1 .. n + MAXT must lie in one partition, else at most 5
     int T = att_cap_T(c.n, 1 + nd_avail);
+#if MK_MAXD > 8
+    if (T > MAXT && pol.tier > 0.f) { // the deep pass only when drafts MAXT.. are worth it (Policy::tier)
+        float cp = 1.f, e = 0.f;
+        for (int k = 0; k < T - 1; k++) {
+            cp *= c.dconf[k];
+            if (k >= MAXT - 1) e += cp;
+        }
+        if (e < pol.tier) T = MAXT;
+    }
+#endif
+    if (T > MAXT && att_cap_T(c.n, MAXD) < MAXD) T = MAXT; // (the deep pass: n + 1 .. n + MAXD in one partition)
     if (T > 5 && att_cap_T(c.n, MAXT) < MAXT) T = 5;
     // Draft depth (an upper bound: the on-device gate may stop drafting earlier), by Policy::depth (default 1: the
     // full depth). Depth 0: after a cycle that rejected a draft, draft one token less (but at least 3), since a deeper
@@ -1239,7 +1311,7 @@ int MKEngine::Impl::step_live(std::vector<int> & out) {
     ndraft = nd;
 #if MK_SPEC_LOG
     const int n0 = c.n;
-    int drafts[MAXT];
+    int drafts[MAXD];
     for (int i = 1; i < T; i++) drafts[i] = c.tok[i];
 #endif
     launch(MODE_DECODE, T, 0);

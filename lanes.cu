@@ -164,7 +164,7 @@ size_t MKEngine::Impl::lane_kv_bytes(int lctx) const { // (+ dalloc's 16 B per b
 size_t MKEngine::Impl::lane_bytes(int lctx) const { // (slots_open's device buffers of a lane, + 16 B each)
     return lane_kv_bytes(lctx) + sizeof(float) * ((size_t) 48 * CONV_RING * QKV + (size_t) 48 * KV_RING * KVGB +
            (size_t) 48 * NVH * 128 * 128 + (size_t) NKV * MAX_CH * AR * 256 + (size_t) NKV * MAX_CH * AR * 2 +
-           (size_t) H_RING * D + D) + sizeof(float2) * (size_t) MAXT * (2 * TOPK_MAX + 1) + sizeof(Ctl) + 10 * 16;
+           (size_t) H_RING * D + D) + sizeof(float2) * (size_t) MAXD * (2 * TOPK_MAX + 1) + sizeof(Ctl) + 10 * 16;
 }
 
 int MKEngine::Impl::slots_open(int n, int lctx) {
@@ -209,17 +209,7 @@ int MKEngine::Impl::slots_open(int n, int lctx) {
     {
         // the RMAX-row pass (wv.cuh "batched passes wider than MAXT rows") runs every main matrix but ffn_gate / ffn_up in
         // the wv layout, and one item per warp in every weight phase
-        std::string why;
-        for (int L = 0; L < NL && why.empty(); L++) {
-            const LayerW & W = hw.L[L];
-            if (W.attn && !(W.q.fm && W.k.fm && W.v.fm && W.o.fm)) why = "an attention q / k / v / out matrix of a type outside the wv layout";
-            if (!W.attn && !W.sout.fm) why = "a delta-net ssm_out matrix of a type outside the wv layout";
-            if (!W.fd.fm) why = "an ffn_down matrix outside the wv layout";
-        }
-        const int G = nsm / WV_S;
-        if (why.empty() && ((D / 16 + G - 1) / std::max(G, 1) > NW || (FF / 16 / WV_S + G - 1) / std::max(G, 1) > NW ||
-                            (QKV / 16 + VD / 16 + nsm - 1) / nsm > NW || QG / 16 + 4 * (KVD / 16) > nsm * NW))
-            why = "a GPU with fewer SMs than one item per warp needs";
+        std::string why = wide_why();
         if (getenv("MK_PAR_RMAX") && atoi(getenv("MK_PAR_RMAX")) <= MAXT) why = "MK_PAR_RMAX";
         par_wide = why.empty();
         fprintf(stderr, "[mk] parallel slots: batched passes of %s\n", par_wide ? (std::to_string(RMAX) + " rows").c_str()
@@ -335,8 +325,8 @@ int MKEngine::Impl::slots_open(int n, int lctx) {
         b.aml = dalloc<float2>((size_t) NKV * MAX_CH * AR);
         b.h_hist = dalloc<float>((size_t) H_RING * D);
         b.hm = dalloc<float>(D);
-        b.dlog = dalloc<float2>((size_t) MAXT * (TOPK_MAX + 1));
-        b.dq = dalloc<float2>((size_t) MAXT * TOPK_MAX);
+        b.dlog = dalloc<float2>((size_t) MAXD * (TOPK_MAX + 1));
+        b.dq = dalloc<float2>((size_t) MAXD * TOPK_MAX);
         b.ctl = dalloc<Ctl>(1);
         b.pcnt = nullptr;
         b.logits = nullptr;
@@ -383,8 +373,49 @@ int MKEngine::Impl::slots_open(int n, int lctx) {
     return lctx;
 }
 
-Bufs MKEngine::Impl::lane_main_view(const Lane & l, int r0) const {
-    Bufs v = l.hb;
+#if MK_PAR_WIDE
+std::string MKEngine::Impl::wide_why() const {
+    std::string why;
+    for (int L = 0; L < NL && why.empty(); L++) {
+        const LayerW & W = hw.L[L];
+        if (W.attn && !(W.q.fm && W.k.fm && W.v.fm && W.o.fm)) why = "an attention q / k / v / out matrix of a type outside the wv layout";
+        if (!W.attn && !W.sout.fm) why = "a delta-net ssm_out matrix of a type outside the wv layout";
+        if (!W.fd.fm) why = "an ffn_down matrix outside the wv layout";
+    }
+    const int G = nsm / WV_S;
+    if (why.empty() && ((D / 16 + G - 1) / std::max(G, 1) > NW || (FF / 16 / WV_S + G - 1) / std::max(G, 1) > NW ||
+                        (QKV / 16 + VD / 16 + nsm - 1) / nsm > NW || QG / 16 + 4 * (KVD / 16) > nsm * NW))
+        why = "a GPU with fewer SMs than one item per warp needs";
+    return why;
+}
+#endif
+
+#if MK_MAXD > 8
+std::string MKEngine::Impl::deep_why() const {
+    if (!hb.kvq8) return "the q8 KV cache (--kv q8)";
+    for (int w = 0; w < 2; w++)
+        for (int sl = 0; sl < std::min(kv_slots, N_ATT_SLOTS - 1); sl++)
+            if (hb.kvb[w][sl] != 8) return "8-bit K / V in every attention layer (no low-bit MK_KV preset)";
+    if (hb.kvwin > 0) return "no MK_KV_WIN rings";
+    for (int L = 0; L < NL; L++)
+        if (!hw.L[L].attn && !(hw.L[L].qkv.fm && hw.L[L].gate.fm)) return "delta-net projections in the wv layout";
+    if (nsm < mk_min_grid(MAXT)) return "a GPU with at least " + std::to_string(mk_min_grid(MAXT)) + " SMs";
+    const std::string why = wide_why();
+    return why.empty() ? why : "the RMAX-row weight phases: " + why;
+}
+
+void MKEngine::Impl::set_view_hi() {
+    Bufs v = rows_view(hb, MAXT);
+    v.apart = apart_hi;
+    v.aml = aml_hi;
+    CK(mkl::set_cBs_async(&v, sizeof(Bufs), view_hi() * sizeof(Bufs), cudaMemcpyHostToDevice, 0));
+}
+#endif
+
+Bufs MKEngine::Impl::lane_main_view(const Lane & l, int r0) const { return rows_view(l.hb, r0); }
+
+Bufs MKEngine::Impl::rows_view(const Bufs & b, int r0) {
+    Bufs v = b;
     v.x += (size_t) r0 * D;
     v.xm += (size_t) r0 * D;
     auto qoff = [&](QBuf & q) {
@@ -462,7 +493,7 @@ std::vector<std::vector<int>> MKEngine::Impl::lanes_step(const std::vector<int> 
     L.T = rows <= 5 ? rows : rows <= MAXT ? MAXT : RMAX;
     L.mtpb = hb.mtp_win <= 0; // (MK_MTP_WIN: the window start follows the pass's first row)
     L.ndraft = top;
-    for (int k = 0; k < MAXT - 1; k++) {
+    for (int k = 0; k < MAXD - 1; k++) {
         L.gate_drop[k] = pol.gate_drop[k];
         L.gate_stop[k] = pol.gate_stop[k];
     }
@@ -471,7 +502,7 @@ std::vector<std::vector<int>> MKEngine::Impl::lanes_step(const std::vector<int> 
     L.spec_smp = 0;
     for (int i = 0; i < L.nl; i++) L.spec_smp |= L.ln[i].spec_smp;
     if (L.gate_chain == 2 && L.spec_smp)
-        for (int k = 0; k < MAXT - 1; k++) L.gate_drop[k] = 0.f;
+        for (int k = 0; k < MAXD - 1; k++) L.gate_drop[k] = 0.f;
     for (int i = 0; i < nl; i++) {
         if (li[i] < 0) continue;
         Lane & l = lanes[ks[i]];
@@ -635,7 +666,7 @@ std::vector<std::vector<int>> MKEngine::slots_step(const std::vector<int> & slot
             I.lane_in(ks[0]);
             std::vector<int> o;
             const Ctl & c = I.hctl;
-            if (c.n + MAXT + 2 < I.ctx) step(o); // (else full: no tokens)
+            if (c.n + MAXD + 2 < I.ctx) step(o); // (else full: no tokens)
             out[at[0]] = o;
         } else if (ks.size() >= 2) {
             const auto r = I.lanes_step(ks); // (a failure there: every lane in ks, the batched launch wrote them all)

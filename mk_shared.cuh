@@ -174,6 +174,11 @@ constexpr int QKV = 10240, VD = 6144, QG = 12288, KVD = 1024;
 // main-layer ffn_down runs on wv (its Q6_K / Q3_K / IQ3_S too, tile-major), the conv ring has 16 slots, and the
 // attention cores run two head-group passes at T >= 6 (48 query rows do not fit).
 constexpr int MAXT = 8;
+#ifndef MK_MAXD
+#define MK_MAXD 8 // 16: the deep build (T 9 .. 16 run as one 16-row pass, main_forward_d)
+#endif
+constexpr int MAXD = MK_MAXD; // the most tokens of one decode verify pass
+static_assert(MAXD == MAXT || MAXD == 2 * MAXT, "MK_MAXD: 8 or 16 (the deep pass: two 8-row attention calls)");
 // batched launches (parallel slots) wider than a solo pass: RMAX rows over the lanes, the wv phases in K sub-chunk fills
 // (wv.cuh "batched passes wider than MAXT rows"); the row buffers hold RMAX rows
 #ifndef MK_PAR_RMAX
@@ -183,18 +188,19 @@ constexpr int MAXT = 8;
 #define MK_PAR_WIDE (MK_PAR_RMAX > 8) // (8: MAXT, which the preprocessor cannot see)
 constexpr int RMAX = MK_PAR_WIDE ? MK_PAR_RMAX : MAXT;
 static_assert(RMAX % 8 == 0 && RMAX <= 32, "RMAX: whole 8-row lm_head passes, store_lane_t's 32 lanes");
+static_assert(MAXD <= RMAX, "MK_MAXD=16 runs the RMAX-row weight phases (MK_PAR_RMAX >= 16)");
 constexpr int MAXT_PF = 5; // rows of prefill-mode and scoring launches (T >= 6 runs only as a decode verify pass)
 constexpr int NT = 512, NW = NT / 32;
 constexpr float EPS = 1e-6f;
 constexpr float ROPE_BASE = 10000000.0f;
 // conv ring: dn_proj writes positions n .. n + T - 1 while dn_core reads n - 3 .. n + T - 1 (T + 3 slots)
-constexpr int CONV_RING = 16, KV_RING = 16, H_RING = 16;
-static_assert(MAXT + 3 <= CONV_RING && 2 * MAXT - 1 <= KV_RING, "rings");
+constexpr int CONV_RING = 2 * MAXD, KV_RING = 2 * MAXD, H_RING = 2 * MAXD;
+static_assert(MAXD + 3 <= CONV_RING && 2 * MAXD - 1 <= KV_RING && MAXD + 1 <= H_RING, "rings");
 // KV cache rows per kv head and RoPE table rows past the usable context (Bufs::ctx = ctx + KV_PAD): a decode launch at
-// position n writes K / V rows up to n + 2 MAXT - 2 (the MTP block's catch-up rows up to P <= n + MAXT, then its draft
-// rows up to P + MAXT - 2), and step() admits n while n + MAXT + 2 < ctx, so rows up to ctx + MAXT - 5 are written
-constexpr int KV_PAD = 2 * MAXT;
-static_assert((2 * MAXT - 2) - (MAXT + 3) < KV_PAD, "KV_PAD: the deepest MTP draft row at the end of the context");
+// position n writes K / V rows up to n + 2 MAXD - 2 (the MTP block's catch-up rows up to P <= n + MAXD, then its draft
+// rows up to P + MAXD - 2), and step() admits n while n + MAXD + 2 < ctx, so rows up to ctx + MAXD - 5 are written
+constexpr int KV_PAD = 2 * MAXD;
+static_assert((2 * MAXD - 2) - (MAXD + 3) < KV_PAD, "KV_PAD: the deepest MTP draft row at the end of the context");
 constexpr int KVGB = NKH * HK + NVH * HK + 2 * NVH; // k | v | g | beta
 constexpr int KVGB_V = NKH * HK, KVGB_G = KVGB_V + NVH * HK, KVGB_B = KVGB_G + NVH;
 constexpr int N_ATT_SLOTS = 17; // 16 trunk attention layers + MTP block
@@ -288,18 +294,18 @@ struct QBuf {
 
 struct Ctl {
     int n;         // position of tok[0]
-    int tok[8];    // tokens fed to the main model this cycle
+    int tok[MAXD]; // tokens fed to the main model this cycle
     int dn_c;      // delta-net committed position (state covers positions < dn_c)
     int mtp_valid; // MTP kv valid for positions < mtp_valid
-    int n_out, out[8];
+    int n_out, out[MAXD];
     int n_acc;
     int mtp_R, mtp_logits, mtp_P;
-    int mtp_pos[MAXT + 3], mtp_tok[MAXT + 3]; // MTP catch-up rows (<= T + 1)
-    int tgt[8];
+    int mtp_pos[MAXD + 3], mtp_tok[MAXD + 3]; // MTP catch-up rows (<= T + 1)
+    int tgt[MAXD];
     // draft confidence: dconf[k] = the MTP's own softmax probability of draft k + 1 (tok[k + 1]) over the
     // draft vocabulary, dchain = their running product; nd_prod = drafts this launch produced (the
     // early-stop gate may end drafting before Launch::ndraft), nd_stop = the gate fired
-    float dconf[8];
+    float dconf[MAXD];
     float dchain;
     int nd_prod, nd_stop;
     int dsmp; // the drafts in tok[1..] were sampled from q' (cB.dq; speculative sampling with sampled drafts)
@@ -337,8 +343,8 @@ struct Bufs {
     const float2 * rope; // [ctx][32] (cos, sin) of pos * base^(-2i/64)
     float2 * blk_best; // per block: best (logit, id) per row, or the TOPK_MAX best when sampling
     float2 * blk_lse;  // per block: (max, sum of exp) of the draft logits (draft confidence)
-    float2 * dlog;     // MK_SPEC_LOG: per draft [MAXT][TOPK_MAX + 1]: its top logits (logit, token id), then (lse, best)
-    float2 * dq;       // sampled drafts: per draft [MAXT][TOPK_MAX] its proposal q' as (prob, token id), then (0, -1)
+    float2 * dlog;     // MK_SPEC_LOG: per draft [MAXD][TOPK_MAX + 1]: its top logits (logit, token id), then (lse, best)
+    float2 * dq;       // sampled drafts: per draft [MAXD][TOPK_MAX] its proposal q' as (prob, token id), then (0, -1)
     float2 * cand;     // [MAXT][TOPK_MAX] best (logit, id) of the main lm_head rows, descending (sampling)
     float * logits;    // [MAXT][VOCAB] main lm_head logits of a scoring launch (Launch::score == 2)
     unsigned short * pcnt; // [VOCAB] presence / frequency penalty: occurrences of each token in the response (saturating)
@@ -353,6 +359,8 @@ struct Bufs {
     int kvemu_win;             // > 0: rows are stored q8 and demoted to their mode once older than kvemu_win ("win=N")
 #endif
     int dattn;   // decode attention of all-q8 slots: 1 attn_core_q8 (default), 0 attn_core_t (MK_DATTN=0)
+    int att_i8;  // MK_ATT_I8 (q8 cache): 1 int8 Q.K^T for all-q8 slots in every decode attention kernel (aq_i8_s;
+                 // exact across depths / lanes, KLD-gated), 0 off (default)
     int mtp_win; // MK_MTP_WIN > 0: the MTP block's decode attention sees the last mtp_win positions only (drafts only)
     int mtp_kvc; // K / V-only MTP catch-up rows (mtp_kv_pass) on (default), 0 with env MK_MTP_KVC=0
     float * wvpart;  // wv split-K partial sums [WV_S][MAXT][D] (resid_wv)
@@ -364,6 +372,10 @@ struct Bufs {
     // i -> block i % G) instead of in contiguous runs, 4 split each Q8_0 k / v tile into two 8-row items (attn_kv_rh: EXACT).
     // (The host refuses bit 1.)
     int k6;
+    // DEEP2 (MK_DEEP2, bits, default 7; all bit-exact): 1 the 16-row passes' lm_head in one 16-row pass (lm_head<16>; else
+    // 8-row passes), 2 the _ck phases prefetch each warp's next sub-chunk weight units to L2 before the fill barriers,
+    // 4 dn_proj_ck's alpha / beta items in the last sub-chunk (else the first)
+    int deep2;
     int * err; // mapped host words, set only on failure: [0] no finite main logit / invalid token, [1] MTP catch-up out of range
     Ctl * ctl_eg; // mapped host copy of ctl, written by block 0 at the end of every launch (mk_egress)
 };
@@ -377,7 +389,8 @@ struct Bufs {
 #define MK_NSEQ 4
 #endif
 constexpr int NSEQ = MK_NSEQ;
-constexpr int NVIEW = 1 + 3 * NSEQ;
+constexpr int NVIEW = 1 + 3 * NSEQ + (MAXD > MAXT);
+__host__ __device__ constexpr int view_hi() { return 1 + 3 * NSEQ; } // (MAXD > MAXT: the deep pass's rows MAXT ..)
 __host__ __device__ constexpr int view_main(int k) { return 1 + k; }
 __host__ __device__ constexpr int view_full(int k) { return 1 + NSEQ + k; }
 __host__ __device__ constexpr int view_mtp(int k) { return 1 + 2 * NSEQ + k; } // (lane k's full view, row buffers at row k)
@@ -392,7 +405,7 @@ struct Launch {
     // draft early stop on the MTP's confidence f (its softmax top-1 probability, or with gate_chain the
     // running product over this launch's drafts), per draft index k: f < gate_drop[k] drops the draft and
     // stops drafting, f < gate_stop[k] keeps it and stops. All 0: off (always Launch::ndraft drafts).
-    float gate_drop[MAXT - 1], gate_stop[MAXT - 1];
+    float gate_drop[MAXD - 1], gate_stop[MAXD - 1];
     int gate_chain;
     // sampling: draft from the MTP's own sampling distribution q' and verify with min(1, p / q') plus the
     // residual max(0, p - q') (distribution-exact; higher acceptance than argmax drafts at temp 1)
@@ -414,6 +427,8 @@ struct Launch {
     } ln[NSEQ];
 };
 constexpr int TOPK_MAX = 32; // candidates kept per main lm_head row when sampling
+constexpr int LM_RB = 16;    // rows per block in Bufs::blk_best: lm_head<16> (the deep and the 16-row batched passes)
+static_assert(MAXD <= LM_RB && MAXT <= LM_RB, "blk_best rows");
 
 enum {
     PH_EMBED, PH_ATTN_PROJ, PH_ATTN_CORE, PH_ATTN_COMB, PH_RESID_O, PH_DN_PROJ, PH_DN_CORE, PH_RESID_SOUT, PH_FFN_GU,
@@ -504,7 +519,7 @@ struct Out {
 // refuses a device object built with other settings (mkl::abi_sig) instead of reading garbage.
 constexpr unsigned long long mk_abi_sig() {
     const unsigned long long v[] = {sizeof(ModelW), sizeof(Bufs), sizeof(PBufs), sizeof(Launch), sizeof(Ctl), sizeof(pf::WMat),
-                                    sizeof(pf::Out), NVIEW, MAXT, RMAX, NSEQ, MK_SPEC_LOG, MK_TEST_NAN, MK_TEST_SLOTS_FAIL, MK_KV_EMU,
+                                    sizeof(pf::Out), NVIEW, MAXT, MAXD, RMAX, NSEQ, MK_SPEC_LOG, MK_TEST_NAN, MK_TEST_SLOTS_FAIL, MK_KV_EMU,
                                     MK_PF_INFCHK,
 #ifdef __CUDA_ARCH_LIST__
                                     __CUDA_ARCH_LIST__, // (nvcc: the -arch list, e.g. 860)

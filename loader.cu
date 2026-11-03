@@ -1153,6 +1153,9 @@ MKEngine::Impl::Impl(const std::string & path, int ctx_, int ndraft_, const std:
     k8 = getenv("MK_K8") ? atoi(getenv("MK_K8")) : MK_K8_DEF;
     if (const char * e = getenv("MK_K8_NT")) k8_nt = atoi(e) == 8 ? 8 : 4;
     fprintf(stderr, "[mk] stock2: K6 %d, K8 %d (nt %d)\n", hb.k6, k8, k8_nt);
+    hb.deep2 = getenv("MK_DEEP2") ? atoi(getenv("MK_DEEP2")) : 7;
+    fprintf(stderr, "[mk] deep2: lm_head<16> %d, _ck prefetch %d, dn ab last %d\n", hb.deep2 & 1, (hb.deep2 >> 1) & 1,
+            (hb.deep2 >> 2) & 1);
     fprintf(stderr, "[mk] K5: split dn_proj -> dn_core barrier, delta-net heads in dn_proj arrival order\n");
     fprintf(stderr, "[mk] C1: ffn_gu -> ffn_down per-chunk waits instead of a grid barrier\n");
     hb.ctx = ctx + KV_PAD; // rows per kv head (KV_PAD: the MTP draft rows written past the last admitted position)
@@ -1167,6 +1170,18 @@ MKEngine::Impl::Impl(const std::string & path, int ctx_, int ndraft_, const std:
         const bool q8 = kv_mode == 1 || (kv_mode < 0 && (want_kv || rows * HD * 4 + (size_t) 1536 * 1024 * 1024 > free_b));
         hb.kvq8 = q8;
         hb.dattn = !(getenv("MK_DATTN") && atoi(getenv("MK_DATTN")) == 0);
+        // MK_ATT_I8=1 (q8 cache): int8 Q.K^T in the decode attention of the all-q8 slots, in every kernel (aq_i8_s): exact
+        // across draft depths and lanes, not bit-identical to the default fp16 Q (KLD-gated). (2: the same; it selected
+        // early K / V copies, which measured slower and were removed)
+        {
+            const int ai8 = getenv("MK_ATT_I8") ? atoi(getenv("MK_ATT_I8")) : 0;
+            hb.att_i8 = q8 && (ai8 == 1 || ai8 == 2) ? 1 : 0;
+            if (hb.att_i8)
+                fprintf(stderr, "[mk] MK_ATT_I8=%d: int8 Q.K^T in the decode attention of all-q8 slots (every kernel and draft depth; not "
+                                "bit-identical to fp16 Q)\n", ai8);
+            else if (ai8)
+                fprintf(stderr, "[mk] MK_ATT_I8=%d ignored (%s)\n", ai8, q8 ? "values: 1, 2" : "fp16 KV cache");
+        }
         // MK_MTP_WIN=N: the MTP block's decode attention sees the last N positions only (its prefill attention and
         // the KV layout are unchanged). Drafts are verified, so the output is exact; acceptance can change.
         hb.mtp_win = getenv("MK_MTP_WIN") ? atoi(getenv("MK_MTP_WIN")) : 0;
@@ -1254,7 +1269,7 @@ MKEngine::Impl::Impl(const std::string & path, int ctx_, int ndraft_, const std:
             // block's draft rows and catch-up row, up to n_draft past it, the wide pass at -d 7 included) then land in the
             // ring slots of positions before the window, not of its oldest rows (multiple of ATP: a tile never wraps)
             const int kvwr = ((hb.kvwin + ATT_BUCKET - 1) / ATT_BUCKET + 1) * ATT_BUCKET; // the most rows a window spans
-            static_assert(MAXT + MAXT <= ATP, "ring slack");
+            static_assert(MAXD + MAXD <= ATP, "ring slack");
             hb.kvrc = kvwr + ATP;
             // MK_KV_WIN_ALL=1 (test knob): rings for the q8 sides too. Their ring rows are the same q8 rows as the main
             // buffer (and k_ring_refill re-stores a q8 row exactly), so output must stay byte-identical to no window:
@@ -1295,6 +1310,12 @@ MKEngine::Impl::Impl(const std::string & path, int ctx_, int ndraft_, const std:
     mem_mark("KV cache");
     hb.apart = dalloc<float>((size_t) NKV * MAX_CH * AR * 256);
     hb.aml = dalloc<float2>((size_t) NKV * MAX_CH * AR);
+#if MK_MAXD > 8
+    if (n_draft_cap > MAXT - 1) {
+        apart_hi = dalloc<float>((size_t) NKV * MAX_CH * AR * 256);
+        aml_hi = dalloc<float2>((size_t) NKV * MAX_CH * AR);
+    }
+#endif
     hb.h_hist = dalloc<float>((size_t) H_RING * D);
     mem_mark("attn partials, h ring");
     {
@@ -1311,10 +1332,10 @@ MKEngine::Impl::Impl(const std::string & path, int ctx_, int ndraft_, const std:
     }
     mem_mark("RoPE table");
     hb.hm = dalloc<float>(D);
-    hb.blk_best = dalloc<float2>((size_t) nsm * MAXT * TOPK_MAX);
+    hb.blk_best = dalloc<float2>((size_t) nsm * LM_RB * TOPK_MAX);
     hb.blk_lse = dalloc<float2>((size_t) nsm);
-    hb.dlog = dalloc<float2>((size_t) MAXT * (TOPK_MAX + 1));
-    hb.dq = dalloc<float2>((size_t) MAXT * TOPK_MAX);
+    hb.dlog = dalloc<float2>((size_t) MAXD * (TOPK_MAX + 1));
+    hb.dq = dalloc<float2>((size_t) MAXD * TOPK_MAX);
     hb.cand = dalloc<float2>((size_t) RMAX * TOPK_MAX);
     hb.logits = nullptr; // 5 MB used by scoring launches only (score_logits): logits_alloc()
     hb.pcnt = nullptr;   // 0.5 MB for the presence / frequency penalty, allocated by the first set_penalty
