@@ -1,7 +1,7 @@
 # Benchmark suite
 
 The clients, items and scoring behind the server tables in [docs/BENCHMARKS.md](../../docs/BENCHMARKS.md) (the full run
-of 2026-10-30 and the 262,144-token run of 2026-10-20) and the README: the same prompts, request parameters, item
+of 2026-11-03, with preset F's 262,144-token run) and the README: the same prompts, request parameters, item
 selection, warm-up requests, timing fields and scoring rules. Point them at this engine's server or at llama.cpp's
 `llama-server` (the comparison column) and the numbers are comparable with the published ones, within the
 session-to-session spread described there.
@@ -16,7 +16,7 @@ No dataset is part of this repository. `fetch.py` downloads them on your machine
 | `speed_client.py` | decode, prefill, first token, follow-up turns, prompt edits, VRAM |
 | `qa_client.py` | the 282 questions |
 | `scratch_client.py` | the ~101.6k-token prompt read from scratch |
-| `maxctx_client.py` | speed and accuracy at the largest context (262,144 tokens with preset D) |
+| `maxctx_client.py` | speed and accuracy at the largest context (262,144 tokens with preset D or F) |
 | `parallel_client.py` | several agents at once: decode per request, first token on long contexts, a long prompt arriving while another request decodes (a port of open-jet's `bench/parallel_bench.py`) |
 | `score.py` | scores the answers offline (HumanEval only with `--exec-humaneval`) |
 | `summarize.py` | the tables |
@@ -79,13 +79,14 @@ context). The VRAM rows are for the whole card, so nothing else should run on it
 | preset D, 120k context | `MK_KV='K*=6,V*=5' MK_KV_WIN=2048 scripts/serve.sh 8080 120000` | `set MK_KV=K*=6,V*=5` and `set MK_KV_WIN=2048`, then `scripts\serve.bat 8080 120000` |
 | preset F, 120k context | `MK_KV='K*=5r,V*=5' MK_KV_WIN=2048 scripts/serve.sh 8080 120000` | `set MK_KV=K*=5r,V*=5` and `set MK_KV_WIN=2048`, then `scripts\serve.bat 8080 120000` |
 | preset D, 262,144 tokens | `MK_KV='K*=6,V*=5' MK_KV_WIN=2048 scripts/serve.sh 8080 262144` | as above with `262144` |
+| preset F, 262,144 tokens | `MK_KV='K*=5r,V*=5' MK_KV_WIN=2048 scripts/serve.sh 8080 262144` | as above with `262144` |
 | from-scratch prefill | add `MK_SIDE_MAX=0 MK_PARK_MIB=0` to the line of the configuration | `set MK_SIDE_MAX=0` and `set MK_PARK_MIB=0` as well |
 
 The from-scratch step needs side requests and parking off: with them on, the short request the client sends to clear
 the cache runs beside the cached conversation and keeps it, and the long prompt is then served from the cache.
 
-The llama.cpp columns were measured with llama.cpp b12024's `llama-server` (2026-10-31), tuned (q8_0 KV cache, 4 MTP
-drafts; `--spec-draft-n-max 7` for the 7-draft column, no `--spec-type` without drafts), on the same model file:
+The llama.cpp columns were measured with llama.cpp b12024's `llama-server` (2026-11-03), tuned (q8_0 KV cache, 4 MTP
+drafts; no `--spec-type` without drafts), on the same model file:
 
 ```sh
 llama-server -m Qwen3.8-27B-UD-Q4_K_XL.gguf --mmproj mmproj-BF16.gguf --no-mmproj-offload -ngl 99 -c 120000 -np 1 \
@@ -98,7 +99,7 @@ llama-server honours `cache_prompt: false`, so the speed client's own from-scrat
 separate step is needed.
 
 The parallel step serves several agents at once, on unsloth's plain `Qwen3.8-27B-Q4_K_M.gguf` (upstream open-jet's
-model). This engine: `python3 server/mk_server.py -m Qwen3.8-27B-Q4_K_M.gguf --agents 4 -d 7 --port 8080`. Upstream,
+model). This engine: `python3 server/mk_server.py -m Qwen3.8-27B-Q4_K_M.gguf --agents 4 -d 7 --kv q8 --port 8080`. Upstream,
 from an open-jet checkout at f246ff0 with its megakernel built: `python3 megakernel/server/mk_server.py -m
 Qwen3.8-27B-Q4_K_M.gguf --agents 4 --port 8080`, and with `--lib <this engine's libqwen38mk.so> -d 7` added, open-jet's
 server driving this engine. llama-server: `--parallel 4`, with the context it needs for four 23k-token conversations.
@@ -106,16 +107,15 @@ server driving this engine. llama-server: `--parallel 4`, with the context it ne
 ## 3. Run the steps
 
 All clients take `--url` (default `http://127.0.0.1:8080`), `--label` (a name for the configuration, written into every
-record) and `--out` (a JSON-lines file; records are appended). Times are for an RTX 3090 on 2026-10-30 (the full-context
-step: 2026-10-20).
+record) and `--out` (a JSON-lines file; records are appended). Times are for an RTX 3090 on 2026-11-03.
 
 | Step | Server | Command | Time |
 |---|---|---|---|
 | speed | 120k (q8_0 or preset D) | `python -I bench/suite/speed_client.py --label q8 --out speed.jsonl` | ~3 min |
-| questions | the same server, after the speed step | `python -I bench/suite/qa_client.py --label q8 --out qa.jsonl` | ~28 min |
+| questions | the same server, after the speed step | `python -I bench/suite/qa_client.py --label q8 --out qa.jsonl` | ~27 min |
 | from-scratch prefill | 120k, side requests and parking off | `python -I bench/suite/scratch_client.py --label q8 --out scratch.jsonl` | ~2 min |
-| full context | preset D at 262,144 | `python -I bench/suite/maxctx_client.py --label max_d --ctx 262144 --out max.jsonl` | ~45 min |
-| parallel agents | `--agents 4`, Q4_K_M | `python -I bench/suite/parallel_client.py --label agents --n 4 --out parallel.jsonl`, then the same with `--n 1 --tests short,ctx` | ~3 min |
+| full context | preset F at 262,144 | `python -I bench/suite/maxctx_client.py --label max_f --ctx 262144 --out max.jsonl` | ~41 min |
+| parallel agents | `--agents 4`, Q4_K_M | `python -I bench/suite/parallel_client.py --label agents --n 4 --out parallel.jsonl`, then the same with `--n 1 --tests short,ctx` | ~2 min |
 | scores | none | `python -I bench/suite/score.py qa.jsonl max.jsonl --exec-humaneval --out scores.json` | seconds |
 | tables | none | `python bench/suite/summarize.py speed.jsonl scratch.jsonl max.jsonl parallel.jsonl --scores scores.json` | seconds |
 
@@ -126,8 +126,8 @@ items already answered under the label), and takes set names to run only some se
 `maxctx_client.py` asks only the first N items of each set: a quick check of a setup, not comparable with the published
 totals. `speed_client.py --mode edit` repeats only the warm-up and the prompt-edit requests, for re-running those rows.
 
-Each 120k server needs a 24 GB card (whole-card VRAM at idle on the reference machine on 2026-10-30: 21.3 GB with q8_0,
-20.1 GB with preset D, 20.0 GB with preset F, 0.7 GB of it the desktop's); the 262,144-token server reached 23.5 GB.
+Each 120k server needs a 24 GB card (whole-card VRAM at idle on the reference machine on 2026-11-03: 21.1 GB with q8_0,
+20.0 GB with preset D, 19.8 GB with preset F, 0.6 GB of it the desktop's); preset F's 262,144-token server reached 23.0 GB.
 `maxctx_client.py --ctx` must be the server's context: it decides which items fit (the smallest needle item needs
 190,191 tokens).
 
@@ -150,7 +150,7 @@ the question totals and the full-context table, and writes them as JSON with `--
   you want.
 - **Re-runs.** `--sub LABEL:KEY[,KEY]=OTHER` takes some rows of a column from another label, e.g. a step re-run after
   something disturbed it. Keys: the row keys listed in `summarize.py`'s usage, `qa` (all question sets) or `qa.SET`.
-  The 2026-10-30 table needed none; the 2026-10-20 one was made with
+  The 2026-11-03 table needed none; the 2026-10-20 one was made with
   `--sub D:edit_msg,edit_sys,qa.gsm8k,qa.mmlu_pro=D_rerun` (a browser opened during the first pass) and its from-scratch
   rows came from separate labels (`--sub q8:pf101k=q8_scratch`).
 - **Question time** includes, on this engine, the side requests and parks the questions cause beside the cached long

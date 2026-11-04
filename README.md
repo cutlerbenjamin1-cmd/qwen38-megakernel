@@ -20,26 +20,25 @@ Built on the megakernel from [open-jet](https://github.com/L-Forster/open-jet) b
 
 ## Speed
 
-Against llama.cpp's `llama-server` (b12024, tuned, at 4 MTP drafts, its fastest setting), same session, same client,
-prompts and model file. RTX 3090, unsloth's UD-Q4_K_XL, 120k context, q8_0 KV cache, release v2026.10.30 at its default
-7 drafts.
+Against llama.cpp's `llama-server` (b12024, tuned, q8_0 KV cache, at 4 MTP drafts, its fastest setting), same session,
+same client, prompts and model file. RTX 3090, unsloth's UD-Q4_K_XL, 120k context, release v2026.11.03 at its default 7
+drafts, with the q8_0 KV cache and with [preset F](#the-full-262k-context-on-24-gb).
 
-| | llama.cpp | qwen38-megakernel | |
+| | llama.cpp | qwen38-megakernel, q8_0 | qwen38-megakernel, preset F |
 |---|---|---|---|
-| greedy decode, short prompts | 86.8 tok/s | **156.9 tok/s** | 1.8x |
-| sampled decode, thinking on | 72.8 tok/s | **138.5 tok/s** | 1.9x |
-| decode at 38k context | 66.1 tok/s | **119.7 tok/s** | 1.8x |
-| decode at 101.6k context | 54.4 tok/s | **109.2 tok/s** | 2.0x |
-| read a 101.6k-token prompt | 95.9 s | **75.1 s** | 1.3x |
-| first token, short prompt | 117 ms | **66 ms** | 1.8x |
-| edit an earlier message in an 11.7k-token chat | 266 ms | **76 ms** | 3.5x |
-| 282 benchmark questions (GSM8K, MMLU-Pro, ARC-C, MATH-500, HumanEval, NIAH, LongBench v2) | 229 right, 2,563 s | **230 right, 1,676 s** | 1.5x |
+| greedy decode, short prompts | 86.5 tok/s | **165.3 tok/s** (1.9x) | **160.1 tok/s** (1.9x) |
+| sampled decode, thinking on | 72.4 tok/s | **145.9 tok/s** (2.0x) | **146.7 tok/s** (2.0x) |
+| decode at 38k context | 65.7 tok/s | **126.9 tok/s** (1.9x) | **108.6 tok/s** (1.7x) |
+| decode at 101.6k context | 54.5 tok/s | **115.4 tok/s** (2.1x) | **116.7 tok/s** (2.1x) |
+| read a 101.6k-token prompt | 96.7 s | **72.5 s** (1.3x) | **75.2 s** (1.3x) |
+| first token, short prompt | 118 ms | **61 ms** (1.9x) | **61 ms** (1.9x) |
+| edit an earlier message in an 11.7k-token chat | 247 ms | **71 ms** (3.5x) | **72 ms** (3.4x) |
+| 282 benchmark questions (GSM8K, MMLU-Pro, ARC-C, MATH-500, HumanEval, NIAH, LongBench v2) | 229 right, 2,570 s | **230 right, 1,607 s** (1.6x) | **229 right, 1,647 s** (1.6x) |
+| VRAM, idle at 120k context | 22.8 GiB | **21.1 GiB** | **19.8 GiB** |
 
-It does this in 1.5 GiB less VRAM (21.2 against 22.7 GiB, idle at 120k). With drafting off on both sides it's still 7%
-faster on short prompts and 41% faster at 101.6k context, so the gain isn't only speculation. Token-weighted rates,
-the 7-draft llama.cpp column, the no-draft table and the method are in [docs/BENCHMARKS.md](docs/BENCHMARKS.md). The
-question totals for this engine come from its [full run](docs/BENCHMARKS.md#full-run-2026-10-30); every other row is
-one session.
+With drafting off on both sides it's still 11% faster on short prompts and 46% faster at 101.6k context, so the gain
+isn't only speculation. Preset F's replies differ from q8_0's, so its decode rows aren't like-for-like. Token-weighted
+rates, the no-draft table and the method are in [docs/BENCHMARKS.md](docs/BENCHMARKS.md). Every row is one session.
 
 ## What you get
 
@@ -52,8 +51,8 @@ one session.
   switching between conversations.
 - **[OpenAI, Anthropic and Responses APIs](#works-with-your-coding-agent)**, tested with 11 coding agents and chat UIs.
 - **Images and video**, encoded on the CPU, so they take no VRAM.
-- **Several agents at once:** `--agents 4` serves 382 tok/s in total on short prompts (Q4_K_M), 315 with ~23k tokens
-  of context each, against 137 and 97 for llama.cpp's `llama-server --parallel 4` in the same session, sampled
+- **Several agents at once:** `--agents 4` serves 424 tok/s in total on short prompts (Q4_K_M), 366 with ~23k tokens
+  of context each, against 137 and 97 for llama.cpp's `llama-server --parallel 4` measured the day before, sampled
   ([parallel agents](docs/BENCHMARKS.md#parallel-agents)).
 - **Prebuilt packages** for Windows and Linux.
 - **[In active development](docs/EXPERIMENTAL.md):** the [deep pass](docs/EXPERIMENTAL.md#the-deep-pass) (up to 15 drafts per step, q8_0 KV
@@ -149,14 +148,14 @@ attention puts most of its weight and where low-bit storage costs accuracy.
 | | q8_0 (default) | preset D | preset F |
 |---|---|---|---|
 | K / V bits (newest 2k positions at 8) | 8 / 8 | 6 / 5 | 5, rotated / 5 |
-| VRAM, idle server at 120k context | 21.3 GiB (21.2 in the llama.cpp session above) | 20.1 GiB | 20.0 GiB |
+| VRAM, idle server at 120k context | 21.1 GiB | 20.0 GiB | 19.8 GiB |
 | full 262,144-token context on 24 GB | no | yes | yes |
 | KL against llama.cpp at 32k / 100k context | 0.00219 / 0.00217 | 0.00236 / 0.00226 | 0.00242 / 0.00218 |
 | 282 benchmark questions | 230 right | 230 right | 229 right |
-| read a 101.6k-token prompt | 75.2 s | 78.1 s | 77.9 s |
+| read a 101.6k-token prompt | 72.5 s | 75.6 s | 75.2 s |
 
-At the full context a 260,896-token prompt reads in about 5.5 minutes, decode at that depth runs at 66 tok/s, and 4 of
-4 needle-in-a-haystack questions came back right. A conversation shorter than the window never leaves 8 bits, so
+At the full context, preset F reads a 260,896-token prompt in about 5.2 minutes and decodes at that depth at 70 tok/s,
+and 4 of 4 needle-in-a-haystack questions came back right. A conversation shorter than the window never leaves 8 bits, so
 preset D's output there is q8_0's.
 
 ```sh
