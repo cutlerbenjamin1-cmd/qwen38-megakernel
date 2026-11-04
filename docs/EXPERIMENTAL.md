@@ -1,12 +1,13 @@
 # Experimental builds
 
 Two opt-in source builds are in active development and on the list for the served build: the deep pass (up to 15 drafts
-per step) and int8 decode attention. Neither is in the release packages; each builds from source with one flag
-([BUILDING.md](BUILDING.md) has the rest of the build). The default build stays the served one: 7 drafts, every KV
-preset, the full 262,144-token context.
+per step) and int8 decode attention. A third, the L2 prefetch budgets, is a tool for tuning on other GPUs. None is in
+the release packages; each builds from source with one flag ([BUILDING.md](BUILDING.md) has the rest of the build). The
+default build stays the served one: 7 drafts, every KV preset, the full 262,144-token context.
 
 Contents: [the deep pass](#the-deep-pass) - [int8 decode attention](#int8-decode-attention) - [both
-together](#both-together) - [speed](#speed) - [how it was measured](#how-it-was-measured).
+together](#both-together) - [speed](#speed) - [how it was measured](#how-it-was-measured) - [L2 prefetch
+budgets](#l2-prefetch-budgets).
 
 ## The deep pass
 
@@ -112,3 +113,95 @@ the default draft policy, greedy: `qwen38_mk -m <gguf> --kv q8 -n 512 -d 7` (`-d
 - **Sessions:** each ran its builds interleaved, two rounds, with nothing else on the GPU; the rows are the means of the
   two rounds, which agreed within about 1%. A build's rate moves by a few percent from one session to another with GPU
   clocks and temperature ([BENCHMARKS.md](BENCHMARKS.md)), so compare rows within a session.
+
+## L2 prefetch budgets
+
+While DRAM would otherwise sit idle, the engine prefetches weights to L2. How much it prefetches is set by constants
+sized for the 6 MB L2 of an RTX 3090, the only GPU the engine has been tuned on. A build with `MK_L2_TUNE=1` reads them
+from the environment, so a GPU with another L2 (an RTX 4090 has 72 MB) can try other values without a device rebuild for
+each one. This is a tool for tuning, not a faster build: on an RTX 3090 no setting beat the defaults
+([below](#on-an-rtx-3090)), and nobody has measured it on another GPU yet.
+
+- **Build and run:** `make -j2 MKFLAGS=-DMK_L2_TUNE=1` (Linux / WSL2) or `.\build.ps1 -MkFlags "-DMK_L2_TUNE=1"`
+  (Windows), then the variables below at run time. The load prints the values in use (`[mk] MK_L2_TUNE: ...`) and
+  refuses a value out of range. A server reports the build in `/props` (`build_info`). A default build prints that the
+  variables are ignored; its device code is unchanged, the same PTX as without this feature.
+- **Cost to compile:** ptxas peaked at 21.5 GiB in 13 minutes, against 21.0 GiB in 12 for the default build. The numeric
+  budgets compile to almost the same code: 8 of 587 functions changed their spills, by 20 bytes or less.
+- **Not covered:** prompt processing, which has its own kernels. Also not the eviction hint on the weight loads
+  themselves: they load `evict_first`, compiled in, because a run-time switch in the hottest loads would slow the thing
+  being measured.
+
+| Variable | Default | Largest | What it sets |
+|---|---|---|---|
+| `MK_L2_DN` | `4096` | `65536` | bytes of `ssm_out` per item (1,280 items, the phase-top unit included) that `dn_core` prefetches for `resid_sout`. On Q4_K 11,520 is the whole matrix, 14.7 MB |
+| `MK_L2_ATTN` | `8` | `256` | 128-byte lines of `resid_o` per item, past the phase-top unit, that the blocks without an attention item prefetch. On Q4_K 72 is all of the matrix past those units |
+| `MK_L2_ATTN_CTX` | `1280` | `1073741824` | the longest context at which those blocks prefetch |
+| `MK_L2_TOP` | `1` | `20` | weight units per warp that each phase prefetches at its top, before its activation fill |
+| `MK_L2_CK` | `12` | `32` | lines per warp and matrix before a sub-chunk fill of the 16-row phases (the batched slots of `--agents`, the deep pass); other passes do not use it |
+| `MK_L2_MTP` | `11` | `64` | lines per row of a warp's first row pair in the MTP's row-pair phases (a Q4_K row is 23 lines) |
+| `MK_L2_MTP_R` | `12` | `128` | lines per row of a block's first 32 rows in the MTP's other phases |
+| `MK_L2_MTP_KEEP` | `0` | `1` | `1`: the MTP's prefetches go out `evict_last`, to keep those lines in L2 for the next draft step, which reads the same weights |
+
+`0` turns a budget off. A budget larger than a matrix holds stops at the end of what that prefetch reads. The values
+beyond the constants' old reach are the point: one prefetched unit per item, or one line per thread, was all a 6 MB L2
+could use.
+
+Attention deals at most 80 items (`attn_dims`, 4 KV heads x 20 chunks), so a GPU with more than 80 SMs has blocks
+without an item at every context: at least 48 of them with 128 SMs, at least 2 with 82. That is why `MK_L2_ATTN_CTX` may
+matter more there.
+
+`MK_L2_MTP_KEEP` is a prefetch hint and not a CUDA persisting L2 window because a window does not reach these weights.
+On an RTX 3090 (a 1.5 MB slice read back after three passes of a 1 GiB stream, one thread, cycles per load; 130 is a
+hit, 194 a miss), a window kept the slice for plain loads (130) but not for loads with the weights' explicit
+`evict_first` hint (194). An `evict_last` prefetch kept it through those same loads and an `evict_first` stream (130),
+and held up to about 4.5 MB of the 6 MB L2 (139; 152 at 5.6 MB, 194 at 8 MB).
+
+### On an RTX 3090
+
+Measured on 2026-11-04 (driver 610.62, 480 W power limit, WSL2, the UD-Q4_K_XL model, the q8_0 KV cache, 7 drafts,
+greedy).
+
+- **Output:** prefetches are hints, and no value changed a token. The ids of 13 runs (three prompts at 0, 4 and 7
+  drafts, the same prompts sampled, a 22.6k-token prompt) equal v2026.11.03's with every budget at its default, at `0`,
+  at its largest and at a middle set, on UD-Q4_K_XL; at the default, `0` and the largest on Q4_K_M; at the largest with
+  preset D. [`scripts/gate.sh`](BUILDING.md#checking-a-build) passes against the same reference as v2026.11.03, and
+  `scripts/exactness.py` gives the same results at `0` and at the largest values as at the defaults. The slot checks of
+  the gate pass at the largest values.
+- **The build at its defaults costs nothing measurable:** three interleaved rounds against the default build, 163.5 vs
+  163.6 tok/s on short prompts, 122.2 vs 122.6 tok/s after a 57k-token prompt, reading it at 1,652 vs 1,654 tok/s.
+- **No setting beats the defaults:** `scripts/l2_sweep.py --grid full` (18 settings, two rounds) leaves all of them
+  within the defaults' own change from run to run, 1.3% on short prompts and 1.8% after a 51.8k-token prompt. The
+  largest mean changes were +0.5% and -1.2% (`MK_L2_TOP=5`, whose two rounds differed by 2.1%). Every budget at its
+  largest does cost something where it shows: one run of 4 slots gave 388 tok/s against 413, of 2 slots 217 against 246.
+- **The settings do act on the phases they target,** so that flat table is a result and not a setting that does nothing.
+  `MK_PROFILE` on one short prompt, the change in time per call against three runs of the defaults:
+
+| Setting | Slower | Faster |
+|---|---|---|
+| `MK_L2_DN=65536` | `dn_core` 12.4 to 17.2 us, issuing the prefetches | `resid_sout` 36.2 to 35.1 us |
+| `MK_L2_DN=0` | `resid_sout` +2.4% | `dn_core` -2.3% |
+| `MK_L2_ATTN=72` | `attn_core` 17.7 to 19.8 us | `resid_o` -1.0% (within its noise) |
+| `MK_L2_ATTN=0` | `resid_o` +1.3% (within its noise) | `attn_core` -5.0% |
+| `MK_L2_TOP=0` | `attn_proj`, `dn_proj`, `ffn_down` +1.4 to +1.7% | |
+| `MK_L2_MTP=0,MK_L2_MTP_R=0` | `mtp_attn_proj`, `mtp_resid_o` +4% | `mtp_m0` -22%, `mtp_attn_core` -17% |
+
+On 6 MB these trades cancel: `MK_L2_DN=65536` costs 48 `dn_core` calls about 230 us per cycle and gives back about 50 us
+in `resid_sout` (the matrix is 14.7 MB, more than that L2 holds). What a larger L2 does to that balance is the open
+question.
+
+### Trying it on another GPU
+
+`scripts/l2_sweep.py` needs Python and the build's CLI, no compiler, and the GPU to itself:
+
+```
+python scripts/l2_sweep.py -m <gguf>                  # 7 settings, about 25 minutes
+python scripts/l2_sweep.py -m <gguf> --grid full      # 18 settings, about 55 minutes
+python scripts/l2_sweep.py -m <gguf> --set MK_L2_DN=11520,MK_L2_TOP=2 --set MK_L2_MTP_KEEP=1
+```
+
+Each setting runs in its own process, compared with runs of the defaults on both sides of it. It decodes four short
+prompts and a long one greedily, and a change smaller than the defaults' own change from run to run is marked `~`. Every
+setting must give the same tokens: a difference is reported as `OUTPUT CHANGED`, which would be a bug. `--profile` adds
+the phase tables above, one process per setting. The table goes to `results.md` in `--out` (default `l2_sweep_out`): it
+is the thing to send, with the GPU's name in its first line.

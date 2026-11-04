@@ -56,9 +56,10 @@ rates, the no-draft table and the method are in [docs/BENCHMARKS.md](docs/BENCHM
   ([parallel agents](docs/BENCHMARKS.md#parallel-agents)).
 - **Prebuilt packages** for Windows and Linux.
 - **[In active development](docs/EXPERIMENTAL.md):** the [deep pass](docs/EXPERIMENTAL.md#the-deep-pass) (up to 15 drafts per step, q8_0 KV
-  cache only for now; low-bit KV presets with it are on the list) and int8 decode attention
-  ([`-DMK_ATT_I8=1`](docs/CONFIGURATION.md#engine--d-flags), q8_0 KV cache). Both are opt-in source builds, not in the
-  packages yet.
+  cache only for now; low-bit KV presets with it are on the list), int8 decode attention
+  ([`-DMK_ATT_I8=1`](docs/CONFIGURATION.md#engine--d-flags), q8_0 KV cache) and
+  [L2 prefetch budgets](docs/EXPERIMENTAL.md#l2-prefetch-budgets) you can set at run time, to tune a GPU other than the
+  RTX 3090. All are opt-in source builds, not in the packages yet.
 
 ## Quick start
 

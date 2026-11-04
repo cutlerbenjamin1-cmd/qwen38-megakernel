@@ -223,14 +223,14 @@ def main():
     ap.add_argument("-m", "--model", default=os.environ.get("MK_MODEL"), help="the GGUF (default: MK_MODEL)")
     ap.add_argument("--exe", default=os.path.join(HERE, "qwen38_mk.exe" if WIN else "qwen38_mk"), help="the CLI of the build")
     ap.add_argument("--draft-vocab", default=dv if os.path.isfile(dv) else "", help="(default: draft_vocab_32k.bin)")
-    ap.add_argument("--grid", choices=("quick", "full"), default="quick", help="the settings tried: quick 7 (about 25 minutes at two rounds), full 18")
+    ap.add_argument("--grid", choices=("quick", "full"), default="quick", help="the settings tried: quick 7 (about 25 minutes at two rounds), full 18 (about 55)")
     ap.add_argument("--set", action="append", default=[], metavar="NAME=N[,NAME=N]", help="try this setting instead of a grid (repeatable)")
     ap.add_argument("--rounds", type=int, default=2)
     ap.add_argument("-d", "--draft", type=int, default=7)
     ap.add_argument("-n", type=int, default=512, help="tokens per prompt")
     ap.add_argument("-c", "--ctx", type=int, default=65536)
     ap.add_argument("--kv", default="q8")
-    ap.add_argument("--long-chars", type=int, default=150000, help="size of the long prompt (about 40k tokens)")
+    ap.add_argument("--long-chars", type=int, default=150000, help="size of the long prompt (about 50k tokens)")
     ap.add_argument("--long-file", default="", help="a text file as the long prompt, instead of the package's documentation")
     ap.add_argument("--no-long", action="store_true", help="only the short prompts")
     ap.add_argument("--profile", action="store_true", help="afterwards, one MK_PROFILE process per setting: phase tables in --out (not timed)")
@@ -270,6 +270,8 @@ def main():
         with open(build, encoding="utf-8", errors="replace") as f:
             info["build"] = f.read()
     print(f"{len(order)} runs: {len(grid)} settings, {a.rounds} rounds. GPU: {info['gpu_before'] or 'unknown'}", flush=True)
+    if not a.dry_run:
+        run_process(a, {}, "warmup", files)  # (the session's first process runs cold, ~1.5% low: not counted)
     runs = []
     t0 = time.time()
     for k, (r, i) in enumerate(order):

@@ -4,7 +4,8 @@ NVCC ?= /usr/local/cuda/bin/nvcc
 ARCH ?= $(or $(shell nvidia-smi --query-gpu=compute_cap --format=csv,noheader 2>/dev/null | head -n1 | tr -d '. '),86)
 ARCH := sm_$(patsubst sm_%,%,$(ARCH))
 # the engine's extra -D flags: none for the served build; debug / experiment builds, e.g. MKFLAGS=-DMK_SPEC_LOG=1; the
-# opt-in builds in development: MKFLAGS=-DMK_MAXD=16 (the deep pass), -DMK_ATT_I8=1 (int8 decode attention).
+# opt-in builds in development: MKFLAGS=-DMK_MAXD=16 (the deep pass), -DMK_ATT_I8=1 (int8 decode attention),
+# -DMK_L2_TUNE=1 (the L2 prefetch budgets from the environment).
 # ptxas peaks at ~21 GiB of RAM (2026-11-03; ~26 GiB with -DMK_ATT_I8=1).
 MKFLAGS ?=
 # ptxas / host options as single tokens (-Xptxas=a,b): ccache does not know that nvcc's -Xptxas takes the next word, so
