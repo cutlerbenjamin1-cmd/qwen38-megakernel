@@ -88,6 +88,11 @@ extern char ** environ; // (state files: the MK_* settings in the key)
 #ifndef MK_ATT_I8
 #define MK_ATT_I8 0
 #endif
+// MK_L2_TUNE 1: the L2 prefetch budgets (L2Tune below) are read from the environment (MK_L2_*, docs/EXPERIMENTAL.md), to
+// tune them on a GPU with another L2 size. 0: the constants, none of this code (the default)
+#ifndef MK_L2_TUNE
+#define MK_L2_TUNE 0
+#endif
 // Not compile-time switches (the served behaviour is built in): a -D for one of these names stops the build.
 #if defined(MK_WV)
 #error "MK_WV is built in (its served value): drop -DMK_WV"
@@ -225,6 +230,25 @@ constexpr int ATP = 32; // attention: positions per K/V tile (two tiles in fligh
 constexpr int ATT_NCH = 20;                // max split-K chunks per kv head (4 x 20 items fit one wave)
 constexpr int ATT_BUCKET = ATT_NCH * ATP;  // the chunk size steps by one tile every ATT_BUCKET positions
 static_assert(ATT_NCH <= MAX_CH, "attention partials buffer");
+// The L2 prefetch budgets, sized for the 6 MB of an RTX 3090 (hints only: no value depends on them)
+constexpr int DN_PF_ITEM = 4096; // dn_commit: bytes of resid_sout per (tile, chunk) item, the phase-top unit included
+constexpr int ATT_PFO_L = 8;     // attn_idle_pf: 128-B lines of resid_o per item, past the phase-top unit
+constexpr int MTP_PFL = 11;      // mtp_pf_gw: lines per row of a warp's first row pair in the MTP's row-pair phases
+constexpr int MTP_PFR = 12;      // mtp_pf_resid: lines per row of a block's first resid32 item in the MTP's phases
+#ifndef MK_CK_PFL
+#define MK_CK_PFL 12 // wv_pf_next: lines per warp and matrix before a sub-chunk fill of the _ck phases
+#endif
+// -DMK_L2_TUNE=1 builds: the budgets above as run-time values (MK_L2_DN, _ATTN, _ATTN_CTX, _TOP, _CK, _MTP, _MTP_R, _MTP_KEEP)
+struct L2Tune {
+    int dn;       // DN_PF_ITEM
+    int attn;     // ATT_PFO_L
+    int attn_ctx; // attn_idle_pf: the longest context it runs at (positions; constant build: 2 ATT_BUCKET)
+    int top;      // wv_pf_unit: units per warp at a phase top (constant build: 1)
+    int ck;       // MK_CK_PFL
+    int mtp;      // MTP_PFL
+    int mtpr;     // MTP_PFR
+    int keep;     // 1: the MTP phases' prefetches go out evict_last, so the lines stay in L2 for the next draft step
+};
 // largest T <= T_req whose rows n .. n+T-1 all see the same attention partition (see attn_dims)
 inline int att_cap_T(int n, int T_req) {
     const int lim = ATT_BUCKET * ((n + ATT_BUCKET) / ATT_BUCKET) - n; // rows with n + 1 + t <= next multiple
@@ -522,7 +546,7 @@ struct Out {
 constexpr unsigned long long mk_abi_sig() {
     const unsigned long long v[] = {sizeof(ModelW), sizeof(Bufs), sizeof(PBufs), sizeof(Launch), sizeof(Ctl), sizeof(pf::WMat),
                                     sizeof(pf::Out), NVIEW, MAXT, MAXD, RMAX, NSEQ, MK_SPEC_LOG, MK_TEST_NAN, MK_TEST_SLOTS_FAIL, MK_KV_EMU,
-                                    MK_PF_INFCHK, MK_ATT_I8,
+                                    MK_PF_INFCHK, MK_ATT_I8, MK_L2_TUNE,
 #ifdef __CUDA_ARCH_LIST__
                                     __CUDA_ARCH_LIST__, // (nvcc: the -arch list, e.g. 860)
 #endif

@@ -50,7 +50,7 @@ for f in "${ELF_ROOT[@]}" "${LIBS[@]}"; do patchelf --set-rpath '$ORIGIN' "$STAG
 for f in "${ELF_TOOLS[@]}"; do patchelf --set-rpath '$ORIGIN/..' "$STAGE/$f"; done
 
 cp server/*.py "$STAGE/server/"
-cp scripts/serve.sh scripts/exactness.py "$STAGE/scripts/"
+cp scripts/serve.sh scripts/exactness.py scripts/l2_sweep.py "$STAGE/scripts/"
 cp -r docs "$STAGE/"
 cp README.md LICENSE THIRD_PARTY_NOTICES.md requirements.txt draft_vocab_32k.bin "$STAGE/"
 cp "$LLAMA/LICENSE" "$STAGE/licenses/llama.cpp-LICENSE"

@@ -25,6 +25,9 @@ cudaError_t get_cW(void * dst, size_t count, size_t offset = 0);
 cudaError_t set_cBs(const void * src, size_t count, size_t offset = 0);
 cudaError_t set_cBs_async(const void * src, size_t count, size_t offset, cudaMemcpyKind kind, cudaStream_t st);
 cudaError_t set_cView(const void * src, size_t count, size_t offset = 0);
+#if MK_L2_TUNE
+cudaError_t set_cL2(const void * src, size_t count, size_t offset = 0);
+#endif
 cudaError_t set_cP(const void * src, size_t count, size_t offset = 0);
 cudaError_t set_g_iq3s_grid(const void * src, size_t count, size_t offset = 0);
 cudaError_t set_chk_layer_async(const void * src, size_t count, size_t offset, cudaMemcpyKind kind, cudaStream_t st);

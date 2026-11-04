@@ -21,6 +21,12 @@ namespace {
 __constant__ ModelW cW;
 __constant__ Bufs cBs[NVIEW];
 __constant__ int cView;
+#if MK_L2_TUNE
+__constant__ L2Tune cL2; // (its own symbol: cB's fields are an LDS of s_view plus an indexed LDC)
+#define MK_ATT_PF_CTX cL2.attn_ctx
+#else
+#define MK_ATT_PF_CTX (2 * ATT_BUCKET)
+#endif
 __shared__ int s_view;
 #define cB cBs[s_view]
 #define MK_VIEW_INIT()                          \
@@ -1691,7 +1697,6 @@ __device__ __forceinline__ void dn_inputs(const LayerW & W, int h, int kh, int n
 // DN_PF_ITEM bytes per item (1280 items, ~5 MB of the 6 MB L2): Q4_K 14 of 18 lines, Q5_K 10 of 22, Q6_K 5 of 27,
 // IQ4_XS 15 of 17, Q8_0 none. Normal priority. Issued here, after the commit, rather than by the 34 headless blocks at
 // the K5 release, so that its allocations displace the state lines. Hints only: no value changes
-constexpr int DN_PF_ITEM = 4096;
 __device__ __forceinline__ void dn_commit(float4 * Sg, const float4 (&S)[8], const Mat & sout, int h) {
     const unsigned long long pol = l2_evict_first();
 #pragma unroll
@@ -1702,7 +1707,11 @@ __device__ __forceinline__ void dn_commit(float4 * Sg, const float4 (&S)[8], con
     // (wv.cuh's wv_ubytes, defined after this point: keep the two in step)
     const int ub = ty == T_Q6K ? Q6F_UNIT
                                : 16 * (ty == T_Q5K ? 176 : ty == T_IQ4X ? 136 : ty == T_Q8_0 ? 256 : ty == T_Q3K || ty == T_IQ3S ? Q3_BLK : 144);
+#if MK_L2_TUNE
+    const int L = min(((ch - 1) * ub + 127) >> 7, (cL2.dn - ub) >> 7); // (up to the end of the item's ch units)
+#else
     const int L = min((ub + 127) >> 7, (DN_PF_ITEM - ub) >> 7);
+#endif
     if (!sout.fm || ch < 2 || L <= 0) return;
     constexpr int NI = D / 16 * WV_S;
     for (int j = (int) threadIdx.x * NVH + h; j < NI * L; j += NT * NVH) { // (blocks interleaved: ~NI L / NVH lines each)
@@ -3623,7 +3632,7 @@ __device__ __forceinline__ void attn_core_w48(const LayerW & W, int slot, int n,
     auto w48qb = [&]() -> const float * {
         return reinterpret_cast<const float * const volatile *>(sm + SM_ATTN_W48)[8 * (tid_x() >> 5) + 4];
     };
-    if (nw < 0 && slot < N_ATT_SLOTS - 1 && L_ctx <= 2 * ATT_BUCKET) { // a block without items: resid_o's prefetch (deep
+    if (nw < 0 && slot < N_ATT_SLOTS - 1 && L_ctx <= MK_ATT_PF_CTX) { // a block without items: resid_o's prefetch (deep
                                                                          // pass: its first call only)
         const int rk = att_rank(b0), ni = NKV * nch;
         if (rk >= ni) {
@@ -4050,7 +4059,7 @@ __device__ __forceinline__ bool attn_idle(const LayerW & W, int slot, int n, int
     attn_dims_w(n + T, mtp_ws(slot, n), nch, cs);
     const int rk = att_rank(b0), ni = NKV * nch;
     if (rk < ni) return false;
-    if (slot < N_ATT_SLOTS - 1 && n + T <= 2 * ATT_BUCKET) attn_idle_pf(W.o, rk - ni, (int) gridDim.x - ni);
+    if (slot < N_ATT_SLOTS - 1 && n + T <= MK_ATT_PF_CTX) attn_idle_pf(W.o, rk - ni, (int) gridDim.x - ni);
     return true;
 }
 
@@ -4907,11 +4916,14 @@ __device__ __noinline__ void sample_targets_ol(int mode, int top_k, float temp, 
 // SECOND super-block unit (CH kc + 1; the first is their own phase-top prefetch, wv_pf_unit): 1280 x 1 KB, normal
 // priority (the weight loads' evict_first lines go first). ib / nib: the block's index among the call's idle blocks /
 // their count. Hints only.
-constexpr int ATT_PFO_L = 8;
 __device__ __forceinline__ void attn_idle_pf(const Mat & m, int ib, int nib) {
     if (!m.fm) return;
     constexpr int NP = D / 16 * WV_S;
+#if MK_L2_TUNE
+    const int nsb = m.K >> 8, ch = nsb / WV_S, ub = wv_ubytes(m.type), lpu = min(((ch - 1) * ub + 127) / 128, cL2.attn);
+#else
     const int nsb = m.K >> 8, ch = nsb / WV_S, ub = wv_ubytes(m.type), lpu = min((ub + 127) / 128, ATT_PFO_L);
+#endif
     for (int i = ib * NT + (int) threadIdx.x; i < NP * lpu; i += nib * NT) {
         const int p = i / lpu, l = i - p * lpu, tile = p / WV_S, kc = p - tile * WV_S;
         pf_l2n(m.w + ((size_t) tile * nsb + ch * kc + 1) * ub + 128 * l);
@@ -5135,6 +5147,65 @@ __device__ void main_forward(const Launch & P, uint8_t * /*sm*/, unsigned & epoc
 // tid_x / ctaid_x: a copy kept across the phase calls was spilled, and its reload after the barrier's L1 invalidation
 // sat on the way to the next barrier)
 
+#if MK_L2_TUNE
+// the same lines as the constant build's below at the default budgets; more lines than threads 32..: a thread takes several
+__device__ __forceinline__ void mtp_pf_l2(const void * p) {
+    if (cL2.keep) pf_l2(p);
+    else pf_l2s(p);
+}
+__device__ __forceinline__ void mtp_pf_resid(const Mat & m, int) {
+    const int tid = tid_x(), lines = cL2.mtpr, b = (int) ctaid_x();
+    if (tid < 32 || 32 * (b + 1) > m.N) return;
+    for (int i = tid - 32; i < 32 * lines; i += NT - 32) {
+        const int r = i / lines, l = i - r * lines;
+        if (128 * l < m.rb) mtp_pf_l2(m.w + (size_t) (32 * b + r) * m.rb + 128 * l);
+    }
+}
+__device__ __forceinline__ void mtp_pf_m0eh() { mtp_pf_resid(cW.eh, MTP_PFR); }
+// f(global warp of the block whose first pair this is, line of the pair, lines per row)
+template <class F>
+__device__ __forceinline__ void mtp_pf_pairs(F && f) {
+    const int tid = tid_x(), lines = cL2.mtp;
+    if (tid < 32) return;
+    for (int i = tid - 32; i < 2 * lines * NW; i += NT - 32) {
+        const int w = i / (2 * lines), l = i - w * 2 * lines;
+        f(w * (int) gridDim.x + (int) ctaid_x(), l, lines);
+    }
+}
+__device__ __forceinline__ void mtp_pf_line(const uint8_t * a, const uint8_t * b, int rb, int l, int lines) {
+    const int ll = l < lines ? l : l - lines;
+    if (128 * ll < rb) mtp_pf_l2((l < lines ? a : b) + 128 * ll);
+}
+__device__ __forceinline__ void mtp_pf_q(const LayerW & W) {
+    mtp_pf_pairs([&](int gw, int l, int lines) {
+        if (2 * gw + 1 >= W.q.N) return;
+        const uint8_t * a = W.q.w + (size_t) 2 * gw * W.q.rb;
+        mtp_pf_line(a, a + W.q.rb, W.q.rb, l, lines);
+    });
+}
+__device__ __forceinline__ void mtp_pf_kv(const LayerW & W) {
+    mtp_pf_pairs([&](int gw, int l, int lines) {
+        const int nk = KVD / 2;
+        if (gw >= 2 * nk) return;
+        const Mat & m = gw < nk ? W.k : W.v;
+        const uint8_t * a = m.w + (size_t) 2 * (gw < nk ? gw : gw - nk) * m.rb;
+        mtp_pf_line(a, a + m.rb, m.rb, l, lines);
+    });
+}
+__device__ __forceinline__ void mtp_pf_gu(const LayerW & W) {
+    mtp_pf_pairs([&](int j, int l, int lines) {
+        if (j >= FF / 16) return;
+        mtp_pf_line(W.fg.w + (size_t) 16 * j * W.fg.rb, W.fu.w + (size_t) 16 * j * W.fu.rb, W.fg.rb, l, lines);
+    });
+}
+__device__ __forceinline__ void mtp_pf_head() {
+    mtp_pf_pairs([&](int gw, int l, int lines) {
+        if (2 * gw >= cW.dq4_n) return;
+        const uint8_t * a = cW.dq4 + (size_t) 2 * gw * DQ4_RB;
+        mtp_pf_line(a, a + DQ4_RB, DQ4_RB, l, lines);
+    });
+}
+#else
 // resid32's first item of this block (rows 32 b .. 32 b + 31): the first `lines` (<= 15) 128-B lines of each row
 __device__ __forceinline__ void mtp_pf_resid(const Mat & m, int lines) {
     const int i = tid_x() - 32, r = i / lines, l = i - r * lines, b = (int) ctaid_x();
@@ -5145,10 +5216,9 @@ __device__ __forceinline__ void mtp_pf_resid(const Mat & m, int lines) {
 // weights, instruction fetches: ~10 serial misses behind the flood): mtp_m0 +2.2 .. 2.6 us per draft step, mtp_eh
 // -0.5 .. -0.7 us. Folding the draft passes' M0 into the previous lm_head phase (no M0 phase, so no prefetch from it)
 // measured +0.06 .. 0.09 ms per launch
-__device__ __forceinline__ void mtp_pf_m0eh() { mtp_pf_resid(cW.eh, 12); }
+__device__ __forceinline__ void mtp_pf_m0eh() { mtp_pf_resid(cW.eh, MTP_PFR); }
 // row-pair phases (gemv_pairs, ffn_gu_q4k, the draft head): warp w's first pair (rows a, b), its first MTP_PFL lines of
 // each row (2880 B Q4_K rows: the first half), prefetched by thread 32 + 2 MTP_PFL w + l of the block
-constexpr int MTP_PFL = 11;
 static_assert(32 + 2 * MTP_PFL * NW <= NT, "mtp_pf_gw: one line per thread");
 // this thread's (global warp of the block whose pair it prefetches, line l of the pair); -1: none
 __device__ __forceinline__ int mtp_pf_gw(int & l) {
@@ -5191,6 +5261,7 @@ __device__ __forceinline__ void mtp_pf_head() {
     const uint8_t * a = cW.dq4 + (size_t) 2 * gw * DQ4_RB;
     mtp_pf_line(a, a + DQ4_RB, l);
 }
+#endif
 // the next draft's token_embd row (its M0's PCIe read of the mapped table; Q4_K rows), one line per lane of a warp
 __device__ __forceinline__ void mtp_pf_embd(int tok) {
     const int lane = threadIdx.x & 31;
@@ -6320,6 +6391,9 @@ cudaError_t set_cBs_async(const void * src, size_t count, size_t offset, cudaMem
     return cudaMemcpyToSymbolAsync(::cBs, src, count, offset, kind, st);
 }
 cudaError_t set_cView(const void * src, size_t count, size_t offset) { return cudaMemcpyToSymbol(::cView, src, count, offset); }
+#if MK_L2_TUNE
+cudaError_t set_cL2(const void * src, size_t count, size_t offset) { return cudaMemcpyToSymbol(::cL2, src, count, offset); }
+#endif
 cudaError_t set_cP(const void * src, size_t count, size_t offset) { return cudaMemcpyToSymbol(::cP, src, count, offset); }
 cudaError_t set_g_iq3s_grid(const void * src, size_t count, size_t offset) {
     return cudaMemcpyToSymbol(::g_iq3s_grid, src, count, offset);

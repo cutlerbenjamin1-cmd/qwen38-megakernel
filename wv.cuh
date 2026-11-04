@@ -821,7 +821,14 @@ __device__ __forceinline__ void wv_pf_unit(const Mat & m, int tile, int sb, int 
     const int lane = threadIdx.x & 31, ub = wv_ubytes(m.type), pb = ub / nparts;
     if (128 * lane >= pb) return;
     const size_t nsb = (size_t) (m.K >> 8), off = ((size_t) tile * nsb + sb) * ub + part * pb + 128 * lane;
+#if MK_L2_TUNE
+    for (int u = 0; u < cL2.top; u++) { // (u > 0: the units after it; the tile's own)
+        const size_t o = off + (size_t) u * ub;
+        if (o < ((size_t) tile + 1) * nsb * ub) pf_l2n(m.w + o);
+    }
+#else
     if (off < ((size_t) tile + 1) * nsb * ub) pf_l2n(m.w + off);
+#endif
 }
 
 // ---- phases ----------------------------------------------------------------------------------------------------------
@@ -1835,13 +1842,14 @@ __device__ __forceinline__ LaneT<8> rows16_dp_x8(const Mat & m, int j, int grp) 
 // _ck phases: L2 prefetch of tile `tile`'s units from super-block sb on, MK_CK_PFL 128-B lines per warp and matrix,
 // issued before a sub-chunk fill so the warp's weight stream keeps running through the fill's barriers (the T <= MAXT
 // phases fill once). Normal L2 priority: the lines are read once, within microseconds
-#ifndef MK_CK_PFL
-#define MK_CK_PFL 12
-#endif
 template <bool X16>
 __device__ __forceinline__ void wv_pf_next(const Mat & m, int tile, int sb) {
     const int lane = threadIdx.x & 31;
+#if MK_L2_TUNE
+    if (lane >= cL2.ck) return;
+#else
     if (lane >= MK_CK_PFL) return;
+#endif
     // (X16 Q6_K too is FM, Q6F_UNIT: its units were taken as 16 x Q6_BLK, prefetching the wrong lines)
     const int ub = wv_ubytes(m.type);
     const size_t nsb = (size_t) (m.K >> 8), off = ((size_t) tile * nsb + sb) * ub + 128 * lane;
