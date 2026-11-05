@@ -3416,13 +3416,16 @@ __device__ __forceinline__ void attn_core_q8_t(const LayerW & W, int slot, int n
         // low-bit tiles that landed at the end of interval jt - 1, K(jt + 1) and V(jt - 1), are expanded to int8 in interval jt)
         if constexpr (MIX) {
 #if MK_W48X
-            // Everything but the MMAs runs on the group that is not multiplying. K(t): issued at the start of interval t - 3, landed
-            // by its end, to bytes in t - 2, converted to fp16 fragments in t - 1 by the group that multiplies S(t) in t, its stage
-            // free from then on. V(t): issued at the start of t, to bytes in t + 1, read in t + 2. So S's conversion runs under the
-            // other group's MMAs, and the tensor pipe is the only thing left on the S and P V warps. {K(0), K(1)} landed, K(0) ->
-            // bytes by all warps; interval -1: K(2), K(0) converted, K(1) -> bytes.
+            // Warp groups 0 - 3, 12 - 15: S(t) on the group of t's parity; in t + 1 the same group runs softmax(t), converts K(t + 2)
+            // and issues the next copies; the P V warps only multiply. K(t): issued at the start of interval t - 4, landed by the
+            // end of t - 3, to bytes in t - 2, converted to fp16 fragments in t - 1, its stage free from then on (S(t) reads the
+            // fragments in registers). V(t): issued in t - 1, landed by the end of t, to bytes in t + 1, read in t + 2. So S's
+            // conversion runs under the other group's MMAs and each copy has two intervals to land. Prologue: K(0) .. K(3) and V(0)
+            // landed, K(0) and K(1) -> bytes (all warps), K(0) converted.
             issue(tid, kring, 0, vring, -1, NT);
             issue(tid, kring + AQ_STG, 1, vring, -1, NT);
+            issue(tid, kring + 2 * AQ_STG, 2, vring, -1, NT);
+            issue(tid, kring + 3 * AQ_STG, 3, vring, 0, NT);
             asm volatile("cp.async.commit_group;" ::: "memory");
             asm volatile("cp.async.wait_group 0;" ::: "memory");
 #else
@@ -3435,8 +3438,16 @@ __device__ __forceinline__ void attn_core_q8_t(const LayerW & W, int slot, int n
 #endif
             __syncthreads();
             const int kb0 = kbt(0); // K(0) -> bytes now (all warps); K(1) in interval 0
+#if MK_W48X
+            const int kb1 = ntl > 1 ? kbt(1) : 8;
+            if (kb1 != 8) kv_tile_expand<false>(kring + AQ_STG, kb1, TP, warp, NW, KVQ_ROW);
+#endif
             if (kb0 != 8) {
                 kv_tile_expand<false>(kring, kb0, TP, warp, NW, KVQ_ROW);
+#if MK_W48X
+            }
+            if (kb0 != 8 || kb1 != 8) {
+#endif
                 __syncthreads();
             }
         } else if (!kv0) {
@@ -3459,21 +3470,26 @@ __device__ __forceinline__ void attn_core_q8_t(const LayerW & W, int slot, int n
                 for (int k = 0; k < 4; k++) acc[i][j][k] = 0.f;
 
 #if MK_W48X
-        for (int jt = MIX ? -1 : 0; jt < ntl + 2; jt++) {
-            // MIX: warps 0 - 3 and 12 - 15 are two groups: S(t) on the group of t's parity, in interval t + 1 the same group
-            // runs softmax(t), issues K(t + 4) and converts K(t + 2) (one warp of each group per SMSP)
+        if constexpr (MIX) {
+            if (warp < 4) {
+                const int kbj = kbt(0);
+                aqx_conv(acc, kring + (8 * warp + g8) * KVQ_ROW, tig, kbj == 8 ? 0x8080u : 0u, aq_sub(kbj));
+            }
+        }
+        for (int jt = 0; jt < ntl + 2; jt++) {
+            // MIX: the two warp groups (one warp of each per SMSP), rC: this interval's converting group
             const int sg = warp < 4 ? 0 : warp >= 12 ? 1 : -1;
             const bool rC = sg >= 0 && sg != (jt & 1);
             if constexpr (MIX) {
                 if (rC) {
-                    if (jt + 3 < ntl) issue_kx(jt + 3, kring + ((jt + 3) % NSK) * AQ_STG);
-                    if (jt >= 0 && jt < ntl) issue_vx(jt, vring + (jt % NSV) * AQ_STG);
+                    if (jt + 4 < ntl) issue_kx(jt + 4, kring + ((jt + 4) % NSK) * AQ_STG);
+                    if (jt + 1 < ntl) issue_vx(jt + 1, vring + ((jt + 1) % NSV) * AQ_STG);
                     if (jt + 1 < ntl) {
                         const int kbj = kbt(jt + 1);
                         aqx_conv(acc, kring + ((jt + 1) % NSK) * AQ_STG + (8 * (warp & 3) + g8) * KVQ_ROW, tig, kbj == 8 ? 0x8080u : 0u, aq_sub(kbj));
                     }
                 } else if (sg >= 0) {
-                    if (jt >= 0 && jt < ntl) {
+                    if (jt < ntl) {
                         float s[MT][4];
                         aqx_mma<MT, MTA, LDH>(s, acc, (unsigned) __cvta_generic_to_shared(sQ + (lane & 15) * LDH + (lane >> 4) * 8));
 #pragma unroll
@@ -3704,8 +3720,8 @@ __device__ __forceinline__ void attn_core_q8_t(const LayerW & W, int slot, int n
             }
             asm volatile("cp.async.commit_group;" ::: "memory");
 #if MK_W48X
-            if constexpr (MIX) { // (the copies a group issued in this interval: the other group expands them in the next)
-                if (sg >= 0) asm volatile("cp.async.wait_group 0;" ::: "memory");
+            if constexpr (MIX) { // (the copies this group issued in jt - 1: expanded in jt + 1)
+                if (sg >= 0 && !rC) asm volatile("cp.async.wait_group 0;" ::: "memory");
             } else
 #endif
             if constexpr (MIX) asm volatile("cp.async.wait_group 1;" ::: "memory");
@@ -4022,16 +4038,18 @@ __device__ __forceinline__ void attn_core_w48(const LayerW & W, int slot, int n,
         issue(tid, kring + AQ_STG, 1, vring, -1, NT);
         asm volatile("cp.async.commit_group;" ::: "memory");
 #if MK_W48X
-        // MIX: attn_core_q8_t's schedule, in the same three K and three V stages: K(t + 3) goes into K(t)'s stage at the start of
-        // interval t (K(t) was converted in t - 1), V(t) into V(t - 3)'s (read in t - 1). {K(0), K(1)} landed, K(0) -> bytes.
+        // MIX: attn_core_q8_t's warp groups, in the same three K and three V stages, so one interval for a copy to land: K(t + 3)
+        // goes into K(t)'s stage at the start of interval t (K(t) was converted in t - 1), V(t) into V(t - 3)'s (read in t - 1).
+        // Prologue: K(0) .. K(2) landed, K(0) and K(1) -> bytes, K(0) converted.
         if constexpr (MIX) {
+            issue(tid, kring + 2 * AQ_STG, 2, vring, -1, NT);
+            asm volatile("cp.async.commit_group;" ::: "memory");
             asm volatile("cp.async.wait_group 0;" ::: "memory");
             __syncthreads();
-            const int kb0 = kbt(0);
-            if (kb0 != 8) {
-                kv_tile_expand<false>(kring, kb0, TP, warp, NW, KVQ_ROW);
-                __syncthreads();
-            }
+            const int kb0 = kbt(0), kb1 = ntl > 1 ? kbt(1) : 8;
+            if (kb0 != 8) kv_tile_expand<false>(kring, kb0, TP, warp, NW, KVQ_ROW);
+            if (kb1 != 8) kv_tile_expand<false>(kring + AQ_STG, kb1, TP, warp, NW, KVQ_ROW);
+            if (kb0 != 8 || kb1 != 8) __syncthreads();
         } else {
             asm volatile("cp.async.wait_group 1;" ::: "memory");
             __syncthreads();
@@ -4079,14 +4097,20 @@ __device__ __forceinline__ void attn_core_w48(const LayerW & W, int slot, int n,
                 for (int k = 0; k < 4; k++) acc[i][j][k] = 0.f;
 
 #if MK_W48X
-        for (int jt = MIX ? -1 : 0; jt < ntl + 2; jt++) {
-            // MIX: the two warp groups of attn_core_q8_t (S(t) in t; softmax(t), K(t + 4) copies, K(t + 2) conversion in t + 1)
+        if constexpr (MIX) {
+            if (warp < 4) {
+                const int kbj = kbt(0);
+                aqx_conv(acc, kring + (8 * warp + g8) * KVQ_ROW, tig, kbj == 8 ? 0x8080u : 0u, aq_sub(kbj));
+            }
+        }
+        for (int jt = 0; jt < ntl + 2; jt++) {
+            // MIX: the two warp groups of attn_core_q8_t, rC: this interval's converting group
             const int sg = warp < 4 ? 0 : warp >= 12 ? 1 : -1;
             const bool rC = sg >= 0 && sg != (jt & 1);
             if constexpr (MIX) {
                 if (rC) {
                     if (jt + 3 < ntl) issue_kx(jt + 3, kring + ((jt + 3) % NSK) * AQ_STG);
-                    if (jt >= 0 && jt < ntl) issue_vx(jt, vring + (jt % NSV) * AQ_STG);
+                    if (jt < ntl) issue_vx(jt, vring + (jt % NSV) * AQ_STG);
                     if (jt + 1 < ntl) {
                         const int kbj = kbt(jt + 1);
                         aqx_conv(acc, kring + ((jt + 1) % NSK) * AQ_STG + (8 * (warp & 3) + g8) * KVQ_ROW, tig, kbj == 8 ? 0x8080u : 0u, aq_sub(kbj));
@@ -4099,8 +4123,8 @@ __device__ __forceinline__ void attn_core_w48(const LayerW & W, int slot, int n,
                         const int vbx = vbt(jt - 1);
                         if (vbx != 8) kvx_tile<8>(vring + ((jt - 1) % NSV) * AQ_STG, vbx, 8 * (warp & 3));
                     }
-                } else if (sg >= 0) {
-                    if (jt >= 0 && jt < ntl) {
+                } else if (sg >= 0 && jt < ntl) {
+                    {
                         float s[MT][4];
                         aqx_mma<MT, MT, LDH>(s, acc, (unsigned) __cvta_generic_to_shared(sQ + (lane & 15) * LDH + (lane >> 4) * 8));
 #pragma unroll
@@ -4395,7 +4419,11 @@ __device__ __noinline__ void attn_core(const LayerW & W, int slot, int n, uint8_
         else if (cB.att_i8) attn_core_w48i<T>(W, slot, n, -1, b0);
 #endif
         else
+#if MK_W48X // (all-q8 slots too: the same partials, and its schedule is the faster one)
+        attn_core_w48m<T>(W, slot, n, b0);
+#else
         attn_core_w48q<T>(W, slot, n, -1, b0);
+#endif
         return;
     } else if (attn_idle<T>(W, slot, n, b0)) {
         return;
@@ -4413,7 +4441,11 @@ __device__ __noinline__ void attn_core(const LayerW & W, int slot, int n, uint8_
         if (cB.dattn && n + T > ATT_BUCKET) {
             if (!q8) attn_core_q8m<T>(W, slot, n, b0);
             else
+#if MK_W48X
+            attn_core_q8m<T>(W, slot, n, b0);
+#else
             attn_core_q8<T>(W, slot, n, b0);
+#endif
         } else {
             attn_core_t<T, true>(W, slot, n, b0);
         }
