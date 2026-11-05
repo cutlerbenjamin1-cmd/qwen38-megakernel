@@ -6520,10 +6520,13 @@ template void pk_attn2<false, true>(dim3, int, int, int, int, int, float *, int)
 template void pk_attn2<true, false>(dim3, int, int, int, int, int, float *, int);
 template void pk_attn2<true, true>(dim3, int, int, int, int, int, float *, int);
 void pk_attn2_comb(dim3 grid, int T, int nfull, int S, const float * part) { ::pk_attn2_comb<<<grid, 256>>>(T, nfull, S, part); }
+// MK_PFX bit 64: pk_attn8, else pk_attn9 (the same outputs). VB = 8: pk_attn9's all-q8 form (pk_attn8 reads the slot's bits at run time).
+int pk_attn_old = 0;
 template <bool QROW, bool KLOW, bool EXA, int KB, int VB>
 void pk_attn8(dim3 grid, int T, int n0, int slot, int nfull, int S, float * part, int r0, int segt, int exh, float * part2,
               int exa) {
-    ::pk_attn8<QROW, KLOW, EXA, KB, VB><<<grid, A2_NT, A8_SMEM>>>(T, n0, slot, nfull, S, part, r0, segt, exh, part2, exa);
+    if (pk_attn_old) ::pk_attn8<QROW, KLOW, EXA, KB, (VB == 8 ? 0 : VB)><<<grid, A2_NT, A8_SMEM>>>(T, n0, slot, nfull, S, part, r0, segt, exh, part2, exa);
+    else ::pk_attn9<QROW, KLOW, EXA, KB, VB><<<grid, A2_NT, A8_SMEM>>>(T, n0, slot, nfull, S, part, r0, segt, exh, part2, exa);
 }
 template void pk_attn8<false, false>(dim3, int, int, int, int, int, float *, int, int, int, float *, int);
 template void pk_attn8<true, false>(dim3, int, int, int, int, int, float *, int, int, int, float *, int);
@@ -6535,6 +6538,8 @@ template void pk_attn8<false, false, true>(dim3, int, int, int, int, int, float 
 template void pk_attn8<false, true, true>(dim3, int, int, int, int, int, float *, int, int, int, float *, int);
 template void pk_attn8<false, true, true, 6, 5>(dim3, int, int, int, int, int, float *, int, int, int, float *, int);
 template void pk_attn8<false, true, true, 5, 5>(dim3, int, int, int, int, int, float *, int, int, int, float *, int);
+template void pk_attn8<false, false, false, 0, 8>(dim3, int, int, int, int, int, float *, int, int, int, float *, int);
+template void pk_attn8<false, false, true, 0, 8>(dim3, int, int, int, int, int, float *, int, int, int, float *, int);
 void pk_attn8_combx(dim3 grid, int T, int n0, int nfull, int S, int segt, int exh, int r0, const float * part, const float * part2,
                     int exa) {
     ::pk_attn8_combx<<<grid, 256>>>(T, n0, nfull, S, segt, exh, r0, part, part2, exa);
@@ -6552,12 +6557,24 @@ void pk_attn_attr() {
     CK(cudaFuncSetAttribute(::pk_attn8<true, true>, cudaFuncAttributeMaxDynamicSharedMemorySize, A8_SMEM));
     CK(cudaFuncSetAttribute(::pk_attn8<false, true, false, 6, 5>, cudaFuncAttributeMaxDynamicSharedMemorySize, A8_SMEM));
     CK(cudaFuncSetAttribute(::pk_attn8<false, true, false, 5, 5>, cudaFuncAttributeMaxDynamicSharedMemorySize, A8_SMEM));
+    CK(cudaFuncSetAttribute(::pk_attn9<false, false>, cudaFuncAttributeMaxDynamicSharedMemorySize, A8_SMEM));
+    CK(cudaFuncSetAttribute(::pk_attn9<true, false>, cudaFuncAttributeMaxDynamicSharedMemorySize, A8_SMEM));
+    CK(cudaFuncSetAttribute(::pk_attn9<false, true>, cudaFuncAttributeMaxDynamicSharedMemorySize, A8_SMEM));
+    CK(cudaFuncSetAttribute(::pk_attn9<true, true>, cudaFuncAttributeMaxDynamicSharedMemorySize, A8_SMEM));
+    CK(cudaFuncSetAttribute(::pk_attn9<false, true, false, 6, 5>, cudaFuncAttributeMaxDynamicSharedMemorySize, A8_SMEM));
+    CK(cudaFuncSetAttribute(::pk_attn9<false, true, false, 5, 5>, cudaFuncAttributeMaxDynamicSharedMemorySize, A8_SMEM));
+    CK(cudaFuncSetAttribute(::pk_attn9<false, false, false, 0, 8>, cudaFuncAttributeMaxDynamicSharedMemorySize, A8_SMEM));
 }
 void pk_attn8_exa_attr() {
     CK(cudaFuncSetAttribute(::pk_attn8<false, false, true>, cudaFuncAttributeMaxDynamicSharedMemorySize, A8_SMEM));
     CK(cudaFuncSetAttribute(::pk_attn8<false, true, true>, cudaFuncAttributeMaxDynamicSharedMemorySize, A8_SMEM));
     CK(cudaFuncSetAttribute(::pk_attn8<false, true, true, 6, 5>, cudaFuncAttributeMaxDynamicSharedMemorySize, A8_SMEM));
     CK(cudaFuncSetAttribute(::pk_attn8<false, true, true, 5, 5>, cudaFuncAttributeMaxDynamicSharedMemorySize, A8_SMEM));
+    CK(cudaFuncSetAttribute(::pk_attn9<false, false, true>, cudaFuncAttributeMaxDynamicSharedMemorySize, A8_SMEM));
+    CK(cudaFuncSetAttribute(::pk_attn9<false, true, true>, cudaFuncAttributeMaxDynamicSharedMemorySize, A8_SMEM));
+    CK(cudaFuncSetAttribute(::pk_attn9<false, true, true, 6, 5>, cudaFuncAttributeMaxDynamicSharedMemorySize, A8_SMEM));
+    CK(cudaFuncSetAttribute(::pk_attn9<false, true, true, 5, 5>, cudaFuncAttributeMaxDynamicSharedMemorySize, A8_SMEM));
+    CK(cudaFuncSetAttribute(::pk_attn9<false, false, true, 0, 8>, cudaFuncAttributeMaxDynamicSharedMemorySize, A8_SMEM));
 }
 void pk_attn2_occupancy(int * nb) {
     CK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(nb, ::pk_attn2<true, false>, A2_NT, A2_SMEM));

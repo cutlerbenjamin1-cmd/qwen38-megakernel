@@ -205,8 +205,9 @@ hf download unsloth/Qwen3.8-27B-GGUF Qwen3.8-27B-UD-Q4_K_XL.gguf mmproj-BF16.ggu
   at most 1e-4; a NaN fails). `bench/dattn_bench` with `TINV=1` tests its own, older copies of the decode attention
   kernels (up to 5 tokens) for bit-identical output across variants and token counts, at 4 and 5 tokens.
   `bench/mmq_bench check` tests the engine's own prefill GEMM kernels (`prefill_gemm.cuh`, on random data in the engine's
-  layouts) against a scalar fp64 reference (relative error at most 3e-3), and tile sizes bit for bit. Each exits 1 on a
-  failure.
+  layouts) against a scalar fp64 reference (relative error at most 3e-3), and tile sizes bit for bit.
+  `bench/attn_bench` tests the engine's prefill attention kernel (`prefill_attn.cuh`, on random data in the engine's KV
+  layouts, past the q8 window) bit for bit against the one it replaced, `pk_attn8`. Each exits 1 on a failure.
 - **Server tests:** `python -m pytest -q tests` runs without a GPU, against fake engines (the CI runs it on Python 3.10,
   3.11 and 3.12).
 - **GGUF parser:** `make tests/gguf_fuzz && tests/gguf_fuzz` feeds `gguf.h` malformed and randomly corrupted files under

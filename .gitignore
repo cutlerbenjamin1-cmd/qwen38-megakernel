@@ -22,6 +22,7 @@ bench/mmq_e*
 bench/resid_bench
 bench/wvgemm_bench
 bench/dattn_bench
+bench/attn_bench
 bench/wv_ref.cuh.tmp
 bench/*_tmp/
 # benchmark suite downloads (bench/suite/fetch.py)
