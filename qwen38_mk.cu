@@ -3180,7 +3180,10 @@ __device__ __forceinline__ void kvx_tile(uint8_t * st, int bits, int r0) {
     else if (bits == 4) kvx_rows<4, N>(st, r0);
     else kvx_rows<7, N>(st, r0);
 }
-constexpr int AQX_KP = 2; // attn_core_q8_t, T up to this: K -> bytes on the P V warps (few MMAs), not on the multiplying group
+// attn_core_q8_t's split of the work around the MMAs by T, from the role shares in the engine (Nsight, 101k positions): up to T
+// AQX_CP the K and V copies run on the P V warps (the converting group's warp 0 holds all of the softmax there), above on the
+// converting group; up to T AQX_VH the multiplying group expands V; the P V warps expand the rest after their MMAs
+constexpr int AQX_CP = 2, AQX_VH = 2;
 #endif
 
 // MIX = false: all-q8 slots (attn_core_q8). MIX = true (attn_core_q8m): K and V of the slot each q8 or q4 .. q7 (MK_KV), the
@@ -3295,6 +3298,28 @@ __device__ __forceinline__ void attn_core_q8_t(const LayerW & W, int slot, int n
                 const __half * vs;
                 kv_tile_src(1, slot, g, c0 + tv * TP, wsr, wsm, kf.vb, tv >= jtr_v, vq, vs);
                 aq_issue<128, true>((warp & 3) * 32 + lane, kring, vq, vs, -1, dv, vq, vs, tnp(tv), 8, vbt(tv));
+            }
+        };
+        auto issue_kp = [&](int tk, uint8_t * dk) { // by the 8 P V warps
+            if (tk < jff) {
+                if (tk < jtr_k) aqx_side<8>(warp - 4, lane, cB.kvp[0][slot], cB.kvs[0][slot], rowb + tk * TP, kf.kb, dk);
+                else aqx_side<8>(warp - 4, lane, cB.kvrp[0][slot], cB.kvrs[0][slot], rrow(tk), 8, dk);
+            } else {
+                const int8_t * kq;
+                const __half * ks;
+                kv_tile_src(0, slot, g, c0 + tk * TP, wsr, wsm, kf.kb, tk >= jtr_k, kq, ks);
+                aq_issue<256, true>((warp - 4) * 32 + lane, dk, kq, ks, tnp(tk), vring, kq, ks, -1, kbt(tk), 8);
+            }
+        };
+        auto issue_vp = [&](int tv, uint8_t * dv) { // likewise
+            if (tv < jff) {
+                if (tv < jtr_v) aqx_side<8>(warp - 4, lane, cB.kvp[1][slot], cB.kvs[1][slot], rowb + tv * TP, kf.vb, dv);
+                else aqx_side<8>(warp - 4, lane, cB.kvrp[1][slot], cB.kvrs[1][slot], rrow(tv), 8, dv);
+            } else {
+                const int8_t * vq;
+                const __half * vs;
+                kv_tile_src(1, slot, g, c0 + tv * TP, wsr, wsm, kf.vb, tv >= jtr_v, vq, vs);
+                aq_issue<256, true>((warp - 4) * 32 + lane, kring, vq, vs, -1, dv, vq, vs, tnp(tv), 8, vbt(tv));
             }
         };
 #endif
@@ -3421,12 +3446,12 @@ __device__ __forceinline__ void attn_core_q8_t(const LayerW & W, int slot, int n
         // low-bit tiles that landed at the end of interval jt - 1, K(jt + 1) and V(jt - 1), are expanded to int8 in interval jt)
         if constexpr (MIX) {
 #if MK_W48X
-            // Warp groups 0 - 3, 12 - 15: S(t) on the group of t's parity; in t + 1 the same group runs softmax(t), converts K(t + 2)
-            // and issues the next copies; the P V warps only multiply. K(t): issued at the start of interval t - 4, landed by the
-            // end of t - 3, to bytes in t - 2, converted to fp16 fragments in t - 1, its stage free from then on (S(t) reads the
-            // fragments in registers). V(t): issued in t - 1, landed by the end of t, to bytes in t + 1, read in t + 2. So S's
-            // conversion runs under the other group's MMAs and each copy has two intervals to land. Prologue: K(0) .. K(3) and V(0)
-            // landed, K(0) and K(1) -> bytes (all warps), K(0) converted.
+            // Warp groups 0 - 3, 12 - 15: S(t) on the group of t's parity; in t + 1 the same group runs softmax(t) and converts K(t + 2)
+            // (AQX_CP, AQX_VH: who else does what). K(t): issued in interval t - 4, landed by the end of t - 3, to bytes in t - 2,
+            // converted to fp16 fragments in t - 1, its stage free from then on (S(t) reads the fragments in registers). V(t): issued
+            // in t - 1, landed by the end of t, to bytes in t + 1, read in t + 2. So S's conversion runs under the other group's
+            // MMAs and each copy has at least one interval to land. Prologue: K(0) .. K(3) and V(0) landed, K(0) and K(1) -> bytes
+            // (all warps), K(0) converted.
             issue(tid, kring, 0, vring, -1, NT);
             issue(tid, kring + AQ_STG, 1, vring, -1, NT);
             issue(tid, kring + 2 * AQ_STG, 2, vring, -1, NT);
@@ -3488,8 +3513,10 @@ __device__ __forceinline__ void attn_core_q8_t(const LayerW & W, int slot, int n
             const bool rC = sg >= 0 && sg != (jt & 1);
             if constexpr (MIX) {
                 if (rC) {
-                    if (jt + 4 < ntl) issue_kx(jt + 4, kring + ((jt + 4) % NSK) * AQ_STG);
-                    if (jt + 1 < ntl) issue_vx(jt + 1, vring + ((jt + 1) % NSV) * AQ_STG);
+                    if constexpr (T > AQX_CP) {
+                        if (jt + 4 < ntl) issue_kx(jt + 4, kring + ((jt + 4) % NSK) * AQ_STG);
+                        if (jt + 1 < ntl) issue_vx(jt + 1, vring + ((jt + 1) % NSV) * AQ_STG);
+                    }
                     if (jt + 1 < ntl) {
                         const int kbj = kbt(jt + 1);
                         aqx_conv(acc, kring + ((jt + 1) % NSK) * AQ_STG + (8 * (warp & 3) + g8) * KVQ_ROW, tig, kbj == 8 ? 0x8080u : 0u, aq_sub(kbj));
@@ -3507,17 +3534,11 @@ __device__ __forceinline__ void attn_core_q8_t(const LayerW & W, int slot, int n
                             so[8 * LDS + 1] = s[i][3];
                         }
                     }
-                    // K(jt + 2) and V(jt - 1) -> bytes after the MMAs (both landed by the end of jt - 1; all TP rows: stale ones past np
-                    // stay finite under zero scales)
-                    if constexpr (T > AQX_KP) {
-                        if (jt + 2 < ntl) {
-                            const int kbx = kbt(jt + 2);
-                            if (kbx != 8) kvx_tile<8>(kring + ((jt + 2) % NSK) * AQ_STG, kbx, 8 * (warp & 3));
+                    if constexpr (T <= AQX_VH) {
+                        if (jt >= 1 && jt - 1 < ntl) {
+                            const int vbx = vbt(jt - 1);
+                            if (vbx != 8) kvx_tile<8>(vring + ((jt - 1) % NSV) * AQ_STG, vbx, 8 * (warp & 3));
                         }
-                    }
-                    if (jt >= 1 && jt - 1 < ntl) {
-                        const int vbx = vbt(jt - 1);
-                        if (vbx != 8) kvx_tile<8>(vring + ((jt - 1) % NSV) * AQ_STG, vbx, 8 * (warp & 3));
                     }
                 }
             }
@@ -3697,10 +3718,23 @@ __device__ __forceinline__ void attn_core_q8_t(const LayerW & W, int slot, int n
             if (warp >= 4) {
                 if constexpr (MIX) {
 #if MK_W48X
-                    if constexpr (T <= AQX_KP) {
-                        if (warp < 12 && jt + 2 < ntl) {
+                    if (warp < 12) {
+                        // K(jt + 2) and V(jt - 1) -> bytes (both landed by the end of jt - 1; all TP rows: stale ones past np stay finite
+                        // under zero scales)
+                        if (jt + 2 < ntl) {
                             const int kbx = kbt(jt + 2);
                             if (kbx != 8) kvx_tile<4>(kring + ((jt + 2) % NSK) * AQ_STG, kbx, 4 * (warp - 4));
+                        }
+                        if constexpr (T > AQX_VH) {
+                            if (jt >= 1 && jt - 1 < ntl) {
+                                const int vbx = vbt(jt - 1);
+                                if (vbx != 8) kvx_tile<4>(vring + ((jt - 1) % NSV) * AQ_STG, vbx, 4 * (warp - 4));
+                            }
+                        }
+                        if constexpr (T <= AQX_CP) { // the copies of interval jt - 1 landed; the next ones
+                            asm volatile("cp.async.wait_group 0;" ::: "memory");
+                            if (jt + 4 < ntl) issue_kp(jt + 4, kring + ((jt + 4) % NSK) * AQ_STG);
+                            if (jt + 1 < ntl) issue_vp(jt + 1, vring + ((jt + 1) % NSV) * AQ_STG);
                         }
                     }
 #else
@@ -3727,7 +3761,9 @@ __device__ __forceinline__ void attn_core_q8_t(const LayerW & W, int slot, int n
             asm volatile("cp.async.commit_group;" ::: "memory");
 #if MK_W48X
             if constexpr (MIX) { // (the copies this group issued in jt - 1: expanded in jt + 1)
-                if (sg >= 0 && !rC) asm volatile("cp.async.wait_group 0;" ::: "memory");
+                if constexpr (T > AQX_CP) {
+                    if (sg >= 0 && !rC) asm volatile("cp.async.wait_group 0;" ::: "memory");
+                }
             } else
 #endif
             if constexpr (MIX) asm volatile("cp.async.wait_group 1;" ::: "memory");
