@@ -42,6 +42,7 @@ __shared__ int s_view;
         __syncthreads();                        \
     } while (0)
 extern __shared__ __align__(16) uint8_t smem[];
+__shared__ int s_args[4]; // the call's scalars through shared memory, as in the engine (ml_n(), s_mtp): ptxas must not see them as uniform
 
 namespace kold {
 __device__ __forceinline__ void attn_idle_pf(const Mat &, int, int) {}
@@ -62,10 +63,13 @@ __device__ __forceinline__ void attn_idle_pf(const Mat &, int, int) {}
 } // namespace knew
 
 #define KVB_KERNEL(NAME, NS)                                                                                        \
-    __global__ void __launch_bounds__(NT, 1) NAME(int q8, int T, int slot, int n, int b0, int reps) {               \
+    __global__ void __launch_bounds__(NT, 1) NAME(int q8, int T, int slot_, int n_, int b0_, int reps) {            \
         MK_VIEW_INIT();                                                                                             \
         const LayerW W = cL;                                                                                        \
+        if (threadIdx.x == 0) { s_args[0] = slot_; s_args[1] = n_; s_args[2] = b0_; }                               \
+        __syncthreads();                                                                                            \
         for (int rep = 0; rep < reps; rep++) {                                                                      \
+            const int slot = s_args[0], n = s_args[1], b0 = s_args[2];                                              \
             if (q8) {                                                                                               \
                 switch (T) {                                                                                        \
                 case 1: NS::attn_core_q8<1>(W, slot, n, b0); break;                                                 \
