@@ -123,7 +123,7 @@ bench/dattn_bench: bench/dattn_bench.cu
 
 # mmq_bench check: the prefill GEMM kernels (prefill_gemm.cuh) against a scalar reference on the engine's layouts
 bench/mmq_bench: bench/mmq_bench.cu prefill_gemm.cuh mk_shared.cuh mk_launch.h wv_host.cuh
-	$(NVCC) -O3 -std=c++17 -arch=$(ARCH) -lineinfo -Xptxas=-dlcm=cg -I$(LLAMA)/ggml/include -I$(LLAMA)/include $(MMQFLAGS) $< -o $@
+	$(NVCC) -O3 -std=c++17 -arch=$(ARCH) -lineinfo -Xptxas=-dlcm=cg -Ibench/stub $(MMQFLAGS) $< -o $@
 
 check: bench/wvgemm_bench bench/dattn_bench bench/mmq_bench
 	bench/wvgemm_bench check
