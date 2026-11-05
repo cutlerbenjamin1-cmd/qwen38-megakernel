@@ -192,7 +192,9 @@ question.
 
 ### Trying it on another GPU
 
-`scripts/l2_sweep.py` needs Python and the build's CLI, no compiler, and the GPU to itself:
+`scripts/l2_sweep.py` needs Python and the build's CLI, no compiler, and the GPU to itself. On an RTX 40 card an sm_86
+build runs the same code as an sm_89 one: with CUDA 13.2.2 all 157 code sections of this build came out byte-identical
+for the two architectures (2026-11-04), and only the ELF header's architecture differs.
 
 ```
 python scripts/l2_sweep.py -m <gguf>                  # 7 settings, about 25 minutes

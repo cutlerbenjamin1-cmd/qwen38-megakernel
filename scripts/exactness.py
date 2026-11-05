@@ -103,9 +103,9 @@ def sha256(path):
 
 
 def build_info():
-    info = os.path.join(HERE, "BUILD_INFO.txt")  # (release packages)
+    info = os.path.join(HERE, "BUILD_INFO.txt")  # (release packages; PowerShell's utf8 starts it with a BOM)
     if os.path.isfile(info):
-        with open(info, encoding="utf-8", errors="replace") as f:
+        with open(info, encoding="utf-8-sig", errors="replace") as f:
             return f.readline().strip()
     try:
         r = subprocess.run(["git", "-C", HERE, "describe", "--always", "--dirty"], capture_output=True, text=True, timeout=30)

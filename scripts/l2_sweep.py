@@ -267,7 +267,7 @@ def main():
             "env": {k: v for k, v in sorted(os.environ.items()) if k.startswith("MK_") and k != "MK_API_KEY"}}
     build = os.path.join(HERE, "BUILD_INFO.txt")
     if os.path.isfile(build):
-        with open(build, encoding="utf-8", errors="replace") as f:
+        with open(build, encoding="utf-8-sig", errors="replace") as f:
             info["build"] = f.read()
     print(f"{len(order)} runs: {len(grid)} settings, {a.rounds} rounds. GPU: {info['gpu_before'] or 'unknown'}", flush=True)
     if not a.dry_run:

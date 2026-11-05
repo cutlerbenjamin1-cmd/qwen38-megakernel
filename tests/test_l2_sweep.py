@@ -63,6 +63,22 @@ class Units(unittest.TestCase):
         self.assertEqual(sweep.fmt_delta(rows[0]["metrics"]["short"], noise["short"]), "~+0.0%")
 
 
+class BuildInfoBom(unittest.TestCase):
+    def test_the_bom_of_a_package_does_not_reach_the_output(self):
+        # scripts/package_release.ps1 writes BUILD_INFO.txt as PowerShell's utf8, with a BOM: exactness.py printed it last
+        # and died on a cp1252 console
+        spec2 = importlib.util.spec_from_file_location("exactness", os.path.join(ROOT, "scripts", "exactness.py"))
+        ex = importlib.util.module_from_spec(spec2)
+        spec2.loader.exec_module(ex)
+        with tempfile.TemporaryDirectory() as d:
+            with open(os.path.join(d, "BUILD_INFO.txt"), "wb") as f:
+                f.write(b"\xef\xbb\xbfqwen38-megakernel v1, Windows x64\r\ncommit x\r\n")
+            ex.HERE = d
+            line = ex.build_info()
+        self.assertEqual(line, "qwen38-megakernel v1, Windows x64")
+        line.encode("cp1252")
+
+
 @unittest.skipIf(os.name == "nt", "the stub is a POSIX script")
 class Runs(unittest.TestCase):
     def setUp(self):
