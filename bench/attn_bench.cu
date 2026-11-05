@@ -216,7 +216,6 @@ struct Plan {
     int T, n0, nfull, S, segt, exh, exa;
     float *part, *part2;
 };
-#define AT_FN(K) K
 #define L_(K, ...) K<__VA_ARGS__><<<p.grid, A2_NT, A8_SMEM>>>(p.T, p.n0, 0, p.nfull, p.S, p.part, 0, p.segt, p.exh, p.part2, p.exa)
 // one launch of variant v of form f (qrow: QROW; exa: EXA)
 template <int V> void launch1(Form f, bool klow, bool qrow, bool exa, const Plan & p);
@@ -225,6 +224,7 @@ template <int V> void launch1(Form f, bool klow, bool qrow, bool exa, const Plan
         if (f == F_D) L_(K, false, true, true, 6, 5);                                             \
         else if (f == F_F) L_(K, false, true, true, 5, 5);                                        \
         else if (klow) L_(K, false, true, true);                                                 \
+        else if (f == F_Q8) Q8EXA;                                                               \
         else L_(K, false, false, true);                                                          \
     } else if (qrow) {                                                                           \
         if (klow) L_(K, true, true);                                                             \
@@ -233,13 +233,25 @@ template <int V> void launch1(Form f, bool klow, bool qrow, bool exa, const Plan
         if (f == F_D) L_(K, false, true, false, 6, 5);                                            \
         else if (f == F_F) L_(K, false, true, false, 5, 5);                                       \
         else if (klow) L_(K, false, true);                                                       \
+        else if (f == F_Q8) Q8PLN;                                                               \
         else L_(K, false, false);                                                                \
     }
-template <> void launch1<0>(Form f, bool klow, bool qrow, bool exa, const Plan & p) { LAUNCH_BODY(pk_attn8) }
+template <> void launch1<0>(Form f, bool klow, bool qrow, bool exa, const Plan & p) {
+#define Q8EXA L_(pk_attn8, false, false, true)
+#define Q8PLN L_(pk_attn8, false, false)
+    LAUNCH_BODY(pk_attn8)
+#undef Q8EXA
+#undef Q8PLN
+}
 #ifdef AB_NEW
-template <> void launch1<1>(Form f, bool klow, bool qrow, bool exa, const Plan & p) { LAUNCH_BODY(pk_attn9) }
+template <> void launch1<1>(Form f, bool klow, bool qrow, bool exa, const Plan & p) {
+#define Q8EXA L_(pk_attn9, false, false, true, 0, 8)
+#define Q8PLN L_(pk_attn9, false, false, false, 0, 8)
+    LAUNCH_BODY(pk_attn9)
+#undef Q8EXA
+#undef Q8PLN
+}
 #endif
-template <template <bool, bool, bool, int, int> class> struct Unused {};
 #define ATTR1(K, ...) CK(cudaFuncSetAttribute(K<__VA_ARGS__>, cudaFuncAttributeMaxDynamicSharedMemorySize, A8_SMEM))
 #define ATTR_ALL(K)                  \
     ATTR1(K, false, true, true, 6, 5); \
@@ -359,6 +371,8 @@ int main(int argc, char ** argv) {
     ATTR_ALL(pk_attn8);
 #ifdef AB_NEW
     ATTR_ALL(pk_attn9);
+    ATTR1(pk_attn9, false, false, false, 0, 8);
+    ATTR1(pk_attn9, false, false, true, 0, 8);
 #endif
     int nsm = 0, occ = 0;
     CK(cudaDeviceGetAttribute(&nsm, cudaDevAttrMultiProcessorCount, 0));
