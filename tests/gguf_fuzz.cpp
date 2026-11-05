@@ -30,7 +30,7 @@ void put_str(Bytes & b, const std::string & s) {
 
 struct Spec { // a small, valid file; the tests change one field at a time
     uint32_t version = 3;
-    uint64_t n_tensors_hdr = 2, n_kv_hdr = 4;
+    uint64_t n_tensors_hdr = 2, n_kv_hdr = 5;
     uint32_t align = 32;
     uint64_t arr_n = 3, str_arr_n = 2, str_len = 5;
     uint32_t arr_type = 4;
@@ -67,6 +67,9 @@ Bytes build(const Spec & s) {
     put<uint64_t>(b, s.str_len);
     b.insert(b.end(), {'h', 'e', 'l', 'l', 'o'});
     put_str(b, "x");
+    put_str(b, "test.float");
+    put<uint32_t>(b, 6);
+    put<float>(b, 2.5f);
     // tensor infos
     put_str(b, "a");
     put<uint32_t>(b, s.a_dims);
@@ -173,6 +176,7 @@ int dump(const char * path) {
     printf("size %zu, %zu tensors, %zu ints, %zu strs\n", g.size, g.tensors.size(), g.ints.size(), g.strs.size());
     for (const auto & [k, v] : g.ints) printf("int %s = %" PRIu64 "\n", k.c_str(), v);
     for (const auto & [k, v] : g.strs) printf("str %s = %zu bytes, hash %zu\n", k.c_str(), v.size(), std::hash<std::string>()(v));
+    for (const auto & [k, v] : g.floats) printf("float %s = %.9g\n", k.c_str(), v);
     for (const auto & [k, t] : g.tensors) {
         printf("tensor %s type %u ne", k.c_str(), t.type);
         for (auto n : t.ne) printf(" %" PRIu64, n);
@@ -195,7 +199,8 @@ int main(int argc, char ** argv) {
         gguf::File g(g_path);
         const auto & a = g.get("a");
         const auto & b = g.get("b");
-        const bool same = g.strs["general.architecture"] == "qwen35" && g.ints["general.alignment"] == 32 && a.nbytes == 32 &&
+        const bool same = g.strs["general.architecture"] == "qwen35" && g.ints["general.alignment"] == 32 &&
+                          g.floats["test.float"] == 2.5f && a.nbytes == 32 &&
                           b.nbytes == 288 && ((const float *) a.data)[3] == 4.5f && b.data[287] == (uint8_t) 287 &&
                           b.data == a.data + 32 && (size_t) (b.data + b.nbytes - g.base) == g.size;
         g_n++;
@@ -221,7 +226,7 @@ int main(int argc, char ** argv) {
     expect("big-endian version", with([](Spec & s) { s.version = 3u << 24; }), 0);
     expect("2^62 kvs", with([](Spec & s) { s.n_kv_hdr = 1ull << 62; }), 0);
     expect("2^62 tensors", with([](Spec & s) { s.n_tensors_hdr = 1ull << 62; }), 0);
-    expect("more kvs than written", with([](Spec & s) { s.n_kv_hdr = 5; }), 0);
+    expect("more kvs than written", with([](Spec & s) { s.n_kv_hdr = 6; }), 0);
     expect("array of 2^62 u32", with([](Spec & s) { s.arr_n = 1ull << 62; }), 0);
     expect("array of 2^61 + 1 u64 (byte count wraps)", with([](Spec & s) { s.arr_type = 10; s.arr_n = (1ull << 61) + 1; }), 0);
     expect("nested array", with([](Spec & s) { s.arr_type = 9; }), 0);

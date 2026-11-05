@@ -90,6 +90,7 @@ struct File {
     std::map<std::string, Tensor> tensors;
     std::map<std::string, uint64_t> ints;
     std::map<std::string, std::string> strs;
+    std::map<std::string, float> floats; // float32 kvs (rope.freq_base, layer_norm_rms_epsilon)
     std::map<std::string, uint64_t> arrs; // element count of each array kv (e.g. tokenizer.ggml.tokens: the vocabulary)
 
     static constexpr uint64_t MAX_ALIGNMENT = 1u << 20; // general.alignment: a power of two up to this
@@ -170,7 +171,7 @@ struct File {
             case 2: case 3: skip(2); break;
             case 4: ints[key] = rd<uint32_t>(); break;
             case 5: ints[key] = (uint64_t) rd<int32_t>(); break;
-            case 6: skip(4); break;
+            case 6: floats[key] = rd<float>(); break;
             case 8: strs[key] = rds(); break;
             case 9: { // arrays are skipped; their elements are scalars or strings (ggml rejects nested arrays too)
                 const uint32_t et = rd<uint32_t>();

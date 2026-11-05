@@ -164,6 +164,8 @@ error naming the field. A tensor's byte size always comes from its type and dime
 loader then reads every tensor by the shape it expects (`File::get(name, dims)`, `gguf::shape_is`): each matrix is
 exactly [K, N] (further dimensions 1), `token_embd` exactly [5120, 248320], the norms and vectors their exact sizes, so
 a file with the right names but a short or reshaped tensor is refused, naming it, instead of being read past its end.
+The values compiled into the kernel are checked too: a file whose `qwen35.rope.freq_base` or
+`qwen35.attention.layer_norm_rms_epsilon` differs is refused, naming the key (without the key: a warning).
 `tests/gguf_fuzz.cpp` (`make tests/gguf_fuzz`) feeds it malformed and randomly corrupted files (size and offset lies
 included) under AddressSanitizer / UBSan, reads every byte of every tensor of the files that parse and tries the
 shape-checked reads; UD-Q4_K_XL, UD-Q4_K_M and Q4_K_M pass every check. The vision projector (mmproj) is read through

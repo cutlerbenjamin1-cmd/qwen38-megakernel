@@ -137,7 +137,13 @@ class Warmer {
             failed_ = true;
             return false;
         }
-        th_ = std::thread([this, dev] { run(dev); });
+        try {
+            th_ = std::thread([this, dev] { run(dev); });
+        } catch (const std::exception & ex) { // (no thread to be had: this runs inside a C API call, nothing may escape it)
+            fprintf(stderr, "[mk] keep-warm: off (%s)\n", ex.what());
+            failed_ = true;
+            return false;
+        }
         return true;
     }
 
@@ -347,7 +353,8 @@ int mk_slot_prefill(void * hp, int slot, int budget) {
     }
 }
 
-// one step of the n slots: out[i * per + j] = the j-th token slot i emitted, counts[i] how many (0: its context is full)
+// one step of the n slots: out[i * per + j] = the j-th token slot i emitted, counts[i] how many (0: its context is full);
+// a slot listed twice fails the call (-1) before anything runs
 static void slots_out(const std::vector<std::vector<int>> & em, int n, int * out, int per, int * counts) {
     for (int i = 0; i < n; i++) {
         counts[i] = std::min((int) em[i].size(), per);

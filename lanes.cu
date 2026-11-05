@@ -93,6 +93,15 @@ auto MKEngine::Impl::lane_ok(int k) -> Lane & {
     return lanes[k];
 }
 
+void MKEngine::Impl::slots_ok(const std::vector<int> & slots) {
+    std::vector<char> seen(lanes.size(), 0);
+    for (int s : slots) {
+        lane_ok(s);
+        if (seen[s]) throw std::runtime_error("slot " + std::to_string(s) + " is listed twice");
+        seen[s] = 1;
+    }
+}
+
 void MKEngine::Impl::ck_slots_free(std::vector<CkSlot> & v) noexcept {
     for (CkSlot & s : v) {
         if (s.ev) cudaEventDestroy(s.ev);
@@ -648,7 +657,7 @@ int MKEngine::slot_prefill(int slot, int budget) {
 std::vector<std::vector<int>> MKEngine::slots_step(const std::vector<int> & slots) {
     Impl & I = *p_;
     MK_LANE_OUT();
-    for (int s : slots) I.lane_ok(s); // (every slot before any of them changes)
+    I.slots_ok(slots); // (every slot before any of them changes)
     std::vector<std::vector<int>> out(slots.size());
     std::vector<int> ks, at, firsts;
     for (size_t i = 0; i < slots.size(); i++) {
@@ -680,8 +689,8 @@ std::vector<std::vector<int>> MKEngine::slots_step(const std::vector<int> & slot
 // the next chunk of slot pslot's prompt, then the step (separate launches; the chunk first: a failure in it leaves the
 // decoding slots unstepped, so no emitted token is lost with the call's error)
 std::vector<std::vector<int>> MKEngine::slots_step_mixed(int pslot, int budget, const std::vector<int> & slots, int & remain) {
-    p_->lane_ok(pslot); // (a dead slot fails the call before anything changes)
-    for (int s : slots) p_->lane_ok(s);
+    p_->lane_ok(pslot); // (a dead slot, or one listed twice, fails the call before anything changes)
+    p_->slots_ok(slots);
     remain = slot_prefill(pslot, budget);
     return slots_step(slots);
 }

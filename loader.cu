@@ -746,6 +746,18 @@ MKEngine::Impl::Impl(const std::string & path, int ctx_, int ndraft_, const std:
     // block_count NLA: the 64 layers + the MTP layer; NL: a conversion without the MTP layer
     if ((file.ints["qwen35.block_count"] != NLA && file.ints["qwen35.block_count"] != NL) || file.ints["qwen35.embedding_length"] != D)
         throw std::runtime_error("unexpected model dimensions (this kernel is specialised for the 27B)");
+    // compiled in (the RoPE tables, the RMS norms): a model of these shapes with other values would load and answer wrong
+    for (const auto & [key, want] : {std::pair<const char *, float>{"qwen35.rope.freq_base", ROPE_BASE},
+                                     std::pair<const char *, float>{"qwen35.attention.layer_norm_rms_epsilon", EPS}}) {
+        const auto it = file.floats.find(key);
+        if (it == file.floats.end()) {
+            fprintf(stderr, "[mk] warning: the model has no %s: this kernel takes it as %g\n", key, want);
+        } else if (it->second != want) {
+            char msg[160];
+            snprintf(msg, sizeof msg, "the model's %s is %g, this kernel is built for %g", key, it->second, want);
+            throw std::runtime_error(msg);
+        }
+    }
     if (ctx > ctx_limit())
         throw std::runtime_error("context of " + std::to_string(ctx) + " positions exceeds the model's context length (" +
                                  std::to_string(ctx_limit()) + ", qwen35.context_length)");

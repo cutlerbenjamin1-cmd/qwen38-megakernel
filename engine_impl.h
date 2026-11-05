@@ -927,6 +927,9 @@ struct MKEngine::Impl {
     void lane_dead(int k, const std::string & why);
     // lane k for a call that continues its prompt or reply: refused when it does not exist or is dead
     Lane & lane_ok(int k);
+    // the lanes of one step: each lane_ok and listed once (two rows of a batched launch would update one lane's KV cache);
+    // so at most lanes.size() <= NSEQ of them, what Launch::ln holds
+    void slots_ok(const std::vector<int> & slots);
     // a slot call's body f on lanes ks, then the engine's own sequence back in; an MKCudaError marks every lane in ks
     // dead on its way to the caller (MKCancelled does not: the prefill put the state back itself)
     template <class F> void lanes_call(const std::vector<int> & ks, F f) {

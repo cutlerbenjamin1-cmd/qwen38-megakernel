@@ -18,11 +18,13 @@ On WSL2 every device allocation is charged to Windows commit (also inside the VR
 CAPI_COMMIT_MIN_GB (default 45) of Windows commit free. CAPI_DEVOOM=0 skips them."""
 import ctypes
 import os
+import struct
 import subprocess
 import sys
+import tempfile
 
 LIB, MODEL, DV = sys.argv[1:4]
-CASES = ("penalty", "slots_oom", "slots_fit", "ctor_oom", "slots_devoom", "ctor_devoom", "policy")
+CASES = ("penalty", "slots_dup", "slots_oom", "slots_fit", "ctor_oom", "slots_devoom", "ctor_devoom", "policy", "model_values")
 PROMPT = b"<|im_start|>user\nWrite a short poem about a lighthouse.<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"
 vp, ip = ctypes.c_void_p, ctypes.POINTER(ctypes.c_int)
 SKIP_RC = 77  # a case's exit code for SKIP (automake's convention)
@@ -162,6 +164,8 @@ def lib():
                                  ctypes.c_ulonglong, ctypes.c_int, ctypes.c_int]
     L.mk_slot_prefill.argtypes = [vp, ctypes.c_int, ctypes.c_int]
     L.mk_slots_step.argtypes = [vp, ip, ctypes.c_int, ip, ctypes.c_int, ip]
+    L.mk_slots_step_mixed.argtypes = [vp, ctypes.c_int, ctypes.c_int, ip, ctypes.c_int, ip, ctypes.c_int, ip, ip]
+    L.mk_slot_sequence.argtypes = [vp, ctypes.c_int, ip, ctypes.c_int]
     L.mk_tokenize.argtypes = [vp, ctypes.c_char_p, ctypes.c_int, ip, ctypes.c_int]
     return L
 
@@ -242,6 +246,76 @@ def case_penalty(L):
     ok &= check(begin(L, h, 1, toks, n) and slot_steps(L, h, [0, 1], 3), "slots 0 + 1: 3 batched steps", L)
     ok &= check(main_steps(L, h, 2), "own sequence after the slot calls: 2 penalised steps", L)
     L.mk_free(h)
+    return ok
+
+
+def slot_seq(L, h, slot):
+    out = (ctypes.c_int * 8192)()
+    return out[:L.mk_slot_sequence(h, slot, out, 8192)]
+
+
+def case_slots_dup(L):
+    # a slot listed twice is refused before anything runs: five ids used to write past Launch::ln, and two rows of one
+    # batched launch updated one slot's KV cache; mk_slots_step_mixed refuses before it feeds the prompt chunk
+    h = new(L)
+    if not check(bool(h), "engine", L):
+        return False
+    toks, n = ids(L, h)
+    ok = check(L.mk_slots_open2(h, 4, 4096, 0) > 0, "slots_open 4 x 4096", L)
+    for s in range(4):
+        ok &= check(begin(L, h, s, toks, n), f"slot {s}: begin + prefill", L)
+    ok &= check(slot_steps(L, h, [0, 1, 2, 3], 2), "slots 0-3: 2 batched steps", L)
+    before = [slot_seq(L, h, s) for s in range(4)]
+
+    def arrays(slots):
+        return (ctypes.c_int * len(slots))(*slots), (ctypes.c_int * (16 * len(slots)))(), (ctypes.c_int * len(slots))()
+    for slots in ([0, 0], [3, 1, 3], [0, 1, 2, 3, 0]):
+        sa, out, cnt = arrays(slots)
+        ok &= check(L.mk_slots_step(h, sa, len(slots), out, 16, cnt) == -1 and "listed twice" in err(L), f"step {slots}: refused", L)
+    ok &= check([slot_seq(L, h, s) for s in range(4)] == before, "the refused steps changed no slot")
+    ok &= check(L.mk_slot_begin2(h, 0, toks, n, 0.0, 1.0, 20, 0.0, 1, 0, 0) >= 0, "slot 0: begin a prompt", L)
+    fed = len(slot_seq(L, h, 0))
+    sa, out, cnt = arrays([1, 1])
+    left = ctypes.c_int(-1)
+    ok &= check(L.mk_slots_step_mixed(h, 0, 64, sa, 2, out, 16, cnt, ctypes.byref(left)) == -1 and "listed twice" in err(L),
+                "mixed step [1, 1]: refused", L)
+    ok &= check(len(slot_seq(L, h, 0)) == fed, "the refused mixed step fed no prompt chunk")
+    ok &= check(L.mk_slot_prefill(h, 0, 1 << 30) == 0, "slot 0: its prompt still prefills", L)
+    ok &= check(slot_steps(L, h, [0, 1, 2, 3], 2), "slots 0-3: 2 more batched steps", L)
+    L.mk_free(h)
+    return ok
+
+
+def case_model_values(L):
+    # a model whose RoPE base or RMS epsilon is not the one compiled in is refused. A sparse copy of the model with one key
+    # changed: the same size and header, no tensor data, as neither the vocabulary nor the refusal reads any
+    with open(MODEL, "rb") as f:
+        head = f.read(64 * MiB)
+    ok = True
+    for key, val in ((b"qwen35.rope.freq_base", 10000.0), (b"qwen35.attention.layer_norm_rms_epsilon", 1e-5)):
+        at = head.find(struct.pack("<Q", len(key)) + key)
+        if not check(at >= 0, f"{key.decode()} is in the model's first 64 MiB"):
+            ok = False
+            continue
+        at += 8 + len(key)
+        if not check(struct.unpack_from("<I", head, at)[0] == 6, f"{key.decode()} is a float32"):
+            ok = False
+            continue
+        changed = bytearray(head)
+        struct.pack_into("<f", changed, at + 4, val)
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "changed.gguf")
+            with open(path, "wb") as f:
+                f.write(changed)
+                f.truncate(os.path.getsize(MODEL))
+            h = L.mk_new2(path.encode(), 8192, 7, DV.encode(), 1, 0)
+            ok &= check(not h and key.decode() in err(L), f"{key.decode()} = {val:g}: refused ({err(L)})")
+            if h:
+                L.mk_free(h)
+    h = new(L)
+    ok &= check(bool(h), "the model itself loads", L)
+    if h:
+        L.mk_free(h)
     return ok
 
 
