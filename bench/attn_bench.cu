@@ -8,7 +8,8 @@
 // of output floats that differ from the reference.
 // env: AB_VARS (substring of "01": 0 pk_attn8, 1 pk_attn9; default both), EXA=1 (MK_EXACT form, unsplit), EXA=2 (split, + pk_attn8_combx),
 // QROW=1 (QROW form, q8 / low-bit generic), QSCALE (Q multiplier, default 1), SPECIAL=1 (Inf / NaN / zero rows in Q and the
-// K scales), SEED, WARM_MS (default 4000: clocks), STOP_AFTER_OLD=1 / NCU_VAR=<v> NCU_N=<launches> (only that variant, for ncu).
+// K scales), SEED, WARM_MS (default 4000: clocks), NCU_N=<launches> (the first variant of AB_VARS only, for ncu), OUT_REPS (repeat the
+// new kernels' output comparison), DIFF_HIST=1 (where outputs differ: per head, row of a query tile, dim / 8).
 #define MK_SHARED_NS
 #include "../mk_shared.cuh"
 #include <random>
@@ -479,7 +480,10 @@ int main(int argc, char ** argv) {
             continue;
         }
         bool have_ref = false;
+        const int oreps = getenv("OUT_REPS") ? atoi(getenv("OUT_REPS")) : 1; // (> 1: a race would show as an occasional difference)
+        for (int orep = 0; orep < oreps; orep++)
         for (int v : vs) { // outputs (non-final launches may start at cold clocks: not timed)
+            if (orep > 0 && v == vs[0]) continue;
             CK(cudaMemset(y2, 0xff, (size_t) T * VD * 4));
             run(v, pl, T, n0);
             CK(cudaDeviceSynchronize());
@@ -504,6 +508,18 @@ int main(int argc, char ** argv) {
                     nnan += std::isnan(out[i]);
                 }
                 printf("  v%d vs ref: differing %zu / %zu (first %zd, max|d| %.3g), NaN %zu%s\n", v, nbits, out.size(), (ssize_t) first, md, nnan, nbits ? "  <<< NOT EXACT" : "");
+                if (nbits && getenv("DIFF_HIST")) { // where: per output head, per row of a query tile, per dim / 8
+                    size_t hh[NH] = {}, hr[A2_Q] = {}, hd[HD / 8] = {};
+                    for (size_t i = 0; i < out.size(); i++)
+                        if (memcmp(&out[i], &ref[i], 4)) hh[(i % VD) / HD]++, hr[(i / VD) % A2_Q]++, hd[(i % HD) / 8]++;
+                    printf("  head:");
+                    for (int k = 0; k < NH; k++) printf(" %zu", hh[k]);
+                    printf("\n  row:");
+                    for (int k = 0; k < A2_Q; k++) printf(" %zu", hr[k]);
+                    printf("\n  dim/8:");
+                    for (int k = 0; k < HD / 8; k++) printf(" %zu", hd[k]);
+                    printf("\n");
+                }
             }
             fflush(stdout);
         }
