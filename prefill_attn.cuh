@@ -1605,32 +1605,22 @@ __global__ void __launch_bounds__(A2_NT, 1) pk_attn9(int T, int n0, int slot, in
         const int ia = it + A8_NS - 1; // refill the stage of tile it - 1 with tile ia
         uint8_t * sta = asm_ + st_c;
         unsigned ksn = 0u;
-        if (ia < it1) {
-            if (ia < itf) {
-                issue_fast(st_c);
-            } else {
-                const int kba = ia * A2_K, npa = min(A2_K, pmax + 1 - kba);
-                ksn = issue_tile(sta, ia, npa);
-            }
-        } else {
-            pf::cpa_commit();
+        const unsigned cpok = ia < itf && ia < it1;
+        a9_cp16p(cpok, smem0 + st_c + cpd[0], cps[0]);
+        cps[0] += cpi[0];
+#pragma unroll
+        for (int k = 1; k < A9_NSL; k++) {
+            a9_cp16p(cpok & (tid + A2_NT * k < cpn), smem0 + st_c + cpd[k], cps[k]);
+            cps[k] += cpi[k];
         }
+        pf::cpa_commit();
         const uint8_t * st = asm_ + st_a;
         const unsigned ka = smem0 + st_a + kofs;
         // K(it + 1), V(it + 1) in the main format (their stage landed before this tile's barrier; a tile past it1 converts a stale stage
-        // nobody reads): the warp-specific part here, the common part inside the P V loop's basic block, where ptxas overlaps it with
-        // the MMAs (no test: a branch inside it costs ~9%). A tile of another format: the K writes go to the fp16 V buffer of tile it + 1,
-        // which the tail overwrites with the real conversion.
-        uint8_t * stk = stv;
-        if constexpr (A9_HK) {
-            if constexpr (KB != 0) stk = it + 1 < itm ? stv : reinterpret_cast<uint8_t *>(sVc);
-            if (warp < 8) {
-                a9_cv<VB>(stv, sVc, 2, vbs);
-                if constexpr (KB != 0) a9_k_rows<KB, 1>(stk, warp + 24);
-            } else if (warp == 9 && it + 1 < itf) {
-                a9_ks(stv);
-            }
-        }
+        // nobody reads) run during P V(it): the common part inside the P V loop's basic block, where ptxas overlaps it with the MMAs
+        // (no format test: a branch inside it costs ~9%), the warp-specific part just before it. On a tile of another format the K
+        // writes go to the fp16 V buffer of tile it + 1, which the tail overwrites with the real conversion.
+        const unsigned stko = it + 1 < itm ? st_b : A8_NS * A8_STG + ((it + 1) & 1) * A2_K * A2_LD * 2;
         const float * ksp = reinterpret_cast<const float *>(st + A8_KB) + 16 * hf + 2 * t4;
         // S for this warp's 16 positions: per 32-dim block two IMMAs (n8 tiles of positions 16 hf + 0..7, 8..15)
         float s[2][4];
@@ -1638,8 +1628,6 @@ __global__ void __launch_bounds__(A2_NT, 1) pk_attn9(int T, int n0, int slot, in
         for (int ni = 0; ni < 2; ni++) s[ni][0] = s[ni][1] = s[ni][2] = s[ni][3] = 0.f;
 #pragma unroll
         for (int b = 0; b < 8; b++) {
-            // K(it + 1) -> int8 (its stage landed before this tile's barrier; first read by tile it + 1's S MMAs): rows warp,
-            // warp + 12 at b = 0, the third row with warps 0 - 7's third V chunk at b = 5
             unsigned kf[4];
             pf::ldsm_x4(kf, ka + 32 * b);
             int d0[4], d1[4];
@@ -1667,7 +1655,6 @@ __global__ void __launch_bounds__(A2_NT, 1) pk_attn9(int T, int n0, int slot, in
                 s[1][2] = fmaf(a8_i2f(d1[2]), q1 * k1.x, s[1][2]);
                 s[1][3] = fmaf(a8_i2f(d1[3]), q1 * k1.y, s[1][3]);
             }
-            // V(it + 1) -> fp16 (its buffer was last read by P V of tile it - 1) between the MMAs
         }
         if constexpr (QROW) {
 #pragma unroll
@@ -1756,6 +1743,14 @@ __global__ void __launch_bounds__(A2_NT, 1) pk_attn9(int T, int n0, int slot, in
         }
         m0 = mn0;
         m1 = mn1;
+        if constexpr (A9_HK) {
+            if (warp < 8) {
+                a9_cv<VB>(stv, sVc, 2, vbs);
+                if constexpr (KB != 0) a9_k_rows<KB, 1>(asm_ + stko, warp + 24);
+            } else if (warp == 9 && it + 1 < itf) {
+                a9_ks(stv);
+            }
+        }
         // O += P V for this warp's 128 dims (fp16-accumulated per tile, as pk_attn2's PV16)
         {
             const unsigned A0[4] = {P0.x, P0.y, P0.z, P0.w}, A1[4] = {P1.x, P1.y, P1.z, P1.w};
@@ -1764,7 +1759,7 @@ __global__ void __launch_bounds__(A2_NT, 1) pk_attn9(int T, int n0, int slot, in
                 unsigned b[4], h0[2], h1[2];
                 if constexpr (A9_HK) {
                     if constexpr (KB != 0) {
-                        if (j == 0) a9_k_rows<KB, 2>(stk, warp);
+                        if (j == 0) a9_k_rows<KB, 2>(asm_ + stko, warp);
                     }
                     if (j == 2) a9_cv<VB>(stv, sVc, 0, vbs);
                     if (j == 5) a9_cv<VB>(stv, sVc, 1, vbs);
@@ -1787,7 +1782,10 @@ __global__ void __launch_bounds__(A2_NT, 1) pk_attn9(int T, int n0, int slot, in
                 o[2 * j + 1][3] = o[2 * j + 1][3] * al1 + w1.y;
             }
         }
-        if (ia < it1 && ia >= itf) a8_st_ks(sta, ksn); // K scales of a tile not on the copy plan
+        if (ia < it1 && ia >= itf) { // not on the copy plan
+            const int kba = ia * A2_K, npa = min(A2_K, pmax + 1 - kba);
+            a8_st_ks(sta, issue_tile(sta, ia, npa));
+        }
         if (!A9_HK || it + 1 >= itm) { // the next tile's real conversion
             expand_k(it + 1, warp, A2_NT / 32);
             a9_cv<VB>(stv, sVc, 0, vbn);
