@@ -4162,11 +4162,12 @@ __device__ __forceinline__ void attn_core_w48(const LayerW & W, int slot, int n,
                         const int kbx = kbt(jt + 2);
                         if (kbx != 8) kvx_tile<8>(kring + ((jt + 2) % NSK) * AQ_STG, kbx, 8 * (warp & 3));
                     }
+                } else if (sg < 0) { // V -> bytes before the P V MMAs: the S warps get the tensor pipe first, two warps share its tail
                     if (jt >= 1 && jt - 1 < ntl) {
                         const int vbx = vbt(jt - 1);
-                        if (vbx != 8) kvx_tile<8>(vring + ((jt - 1) % NSV) * AQ_STG, vbx, 8 * (warp & 3));
+                        if (vbx != 8) kvx_tile<4>(vring + ((jt - 1) % NSV) * AQ_STG, vbx, 4 * (warp - 4));
                     }
-                } else if (sg >= 0 && jt < ntl) {
+                } else if (jt < ntl) {
                     {
                         float s[MT][4];
                         aqx_mma<MT, MT, LDH>(s, acc, (unsigned) __cvta_generic_to_shared(sQ + (lane & 15) * LDH + (lane >> 4) * 8));
