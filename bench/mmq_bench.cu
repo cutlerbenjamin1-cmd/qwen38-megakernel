@@ -1,11 +1,16 @@
 // mmq_bench: correctness + throughput of the prefill fp16 tensor-core GEMM (prefill_gemm.cuh) on random data in the engine's
 // on-device layouts (loader.cu's repacks are not run: the bytes are random in the layouts they produce; wv_relayout is the engine's).
 //   make bench/mmq_bench          every kernel listed below (~20 s); MMQFLAGS=-DMMQ_SET=1: plain Q5_K only
-//   bench/mmq_bench check [ntok]  each kernel against a scalar fp64 reference on the pre-wv rows, and each candidate (MMQ_NEW lines)
+//   bench/mmq_bench check [ntok]  each kernel against a scalar fp64 reference on the pre-wv rows, and each candidate (MMQ_CAND)
 //                                 bit for bit against its old kernel on normal and on wide-range data (exit status 1 on a failure)
 //   bench/mmq_bench time <kernel-regex> <K> <N> [ntok] [reps] [nlay]
 //                                 launch times (nlay weight copies, cycled: L2 cannot hold them, as in the engine), old and candidate
-//                                 interleaved launch by launch; warmed up >= 4 s first (the memory clock drops at idle)
+//                                 interleaved launch by launch; warmed up >= 4 s first (the memory clock drops at idle). Cycles, not seconds:
+//                                 a prefill runs at the power cap, and interleaved launches share one clock
+//   bench/mmq_bench sustain <kernel-regex> <K> <N> [ntok] [secs] [rounds]
+//                                 old and candidate in turns of secs seconds: launches / s with the power cap in the loop, the number that counts
+// A plain q5k `time` run under ncu matches a served mmh<13, 0> launch of the same shape (K 5120 N 6144, 1024 tokens: Compute Throughput 74.26 vs 74.15%,
+// 620 vs 623 us, the same stall mix and instruction counts, L2 hit rate 89.48 in both).
 #define MK_SHARED_NS // (anonymous, as in qwen38_mk.cu)
 #include "../mk_shared.cuh"
 #include "../mk_launch.h" // MK_GLU_MIX_PAIRS
@@ -52,29 +57,29 @@ struct KR {
     const char * name;
     int type, lay, type2, lay2;
     bool glu;
-    int nb, bx;
+    int nb;
     void (*attr)();
     void (*run)(const WMat &, const WMat &, const __half *, int, const Out &);
     const char * oldn; // a candidate: the name of the kernel it must match bit for bit
 };
-template <int TYPE, int NB, int TY2, int BX> constexpr int ksm() {
-    if constexpr (TY2 >= 0) return hm_smem2<TYPE, TY2, NB, BX>();
-    else return hm_smem<TYPE, NB, BX>();
+template <int TYPE, int NB, int TY2> constexpr int ksm() {
+    if constexpr (TY2 >= 0) return hm_smem2<TYPE, TY2, NB>();
+    else return hm_smem<TYPE, NB>();
 }
-template <int TYPE, bool GLU, int NB, int LAY, int TY2, int LY2, int BX> void k_attr() {
-    CK(cudaFuncSetAttribute(mmh<TYPE, GLU, NB, LAY, TY2, LY2, BX>, cudaFuncAttributeMaxDynamicSharedMemorySize, ksm<TYPE, NB, TY2, BX>()));
+template <int TYPE, bool GLU, int NB, int LAY, int TY2, int LY2> void k_attr() {
+    CK(cudaFuncSetAttribute(mmh<TYPE, GLU, NB, LAY, TY2, LY2>, cudaFuncAttributeMaxDynamicSharedMemorySize, ksm<TYPE, NB, TY2>()));
 }
-template <int TYPE, bool GLU, int NB, int LAY, int TY2, int LY2, int BX>
+template <int TYPE, bool GLU, int NB, int LAY, int TY2, int LY2>
 void k_run(const WMat & W, const WMat & Wu, const __half * X, int ntok, const Out & O) {
-    const int nrt = W.N / (GLU ? BX / 2 : BX);
-    mmh<TYPE, GLU, NB, LAY, TY2, LY2, BX><<<dim3(nrt, (ntok + NB - 1) / NB), 2 * BX, ksm<TYPE, NB, TY2, BX>()>>>(
+    const int nrt = W.N / (GLU ? BM / 2 : BM);
+    mmh<TYPE, GLU, NB, LAY, TY2, LY2><<<dim3(nrt, (ntok + NB - 1) / NB), 256, ksm<TYPE, NB, TY2>()>>>(
         W, X, ntok, O, GLU && TY2 < 0 ? Wu.w : nullptr, TY2 >= 0 ? Wu : WMat{});
 }
-#define MMQ_K(nm, TYPE, GLU, NB, LAY, TY2, LY2, BX, oldn)                                                                     \
-    {nm, TYPE, LAY, TY2, LY2, GLU, NB, BX, k_attr<TYPE, GLU, NB, LAY, TY2, LY2, BX>, k_run<TYPE, GLU, NB, LAY, TY2, LY2, BX>, oldn},
-#define MMQ_PLAIN(nm, TYPE, NB, LAY) MMQ_K(nm, TYPE, false, NB, LAY, -1, LAY, BM, nullptr)
-#define MMQ_FUSED(nm, TYPE, LAY) MMQ_K(nm, TYPE, true, BN, LAY, -1, LAY, BM, nullptr)
-#define MMQ_MIX(TG, LG, TU, LU) MMQ_K(#TG "_" #LG "__" #TU "_" #LU, TG, true, BN, LG, TU, LU, BM, nullptr)
+#define MMQ_K(nm, TYPE, GLU, NB, LAY, TY2, LY2, oldn)                                                                     \
+    {nm, TYPE, LAY, TY2, LY2, GLU, NB, k_attr<TYPE, GLU, NB, LAY, TY2, LY2>, k_run<TYPE, GLU, NB, LAY, TY2, LY2>, oldn},
+#define MMQ_PLAIN(nm, TYPE, NB, LAY) MMQ_K(nm, TYPE, false, NB, LAY, -1, LAY, nullptr)
+#define MMQ_FUSED(nm, TYPE, LAY) MMQ_K(nm, TYPE, true, BN, LAY, -1, LAY, nullptr)
+#define MMQ_MIX(TG, LG, TU, LU) MMQ_K(#TG "_" #LG "__" #TU "_" #LU, TG, true, BN, LG, TU, LU, nullptr)
 static const KR g_k[] = {
     MMQ_PLAIN("q5k", TQ5K, BN, 1)
 #if MMQ_SET == 0
@@ -82,12 +87,12 @@ static const KR g_k[] = {
     MMQ_PLAIN("q80", TQ80, BN, 1) MMQ_PLAIN("q3k", TQ3K, BN, 1) MMQ_PLAIN("iq3s", TIQ3S, BN, 1)
     MMQ_PLAIN("q5k_l0", TQ5K, BN, 0) MMQ_PLAIN("q4k_l0", TQ4K, BN, 0) MMQ_PLAIN("iq4x_l0", TIQ4, BN, 0) MMQ_PLAIN("iq4nl_l0", TIQ4NL, BN, 0)
     MMQ_PLAIN("q6k_l0", TQ6K, BN, 0) MMQ_PLAIN("q80_l0", TQ80, BN, 0) MMQ_PLAIN("q3k_l0", TQ3K, BN, 0) MMQ_PLAIN("iq3s_l0", TIQ3S, BN, 0)
-    MMQ_PLAIN("q5k_nb64", TQ5K, 64, 1) MMQ_PLAIN("q5k_nb32", TQ5K, 32, 1)
+    MMQ_K("q5k_nb64", TQ5K, false, 64, 1, -1, 1, "q5k") MMQ_K("q5k_nb32", TQ5K, false, 32, 1, -1, 1, "q5k") // (any NB: the same bits)
     MMQ_FUSED("glu_q5k", TQ5K, 1) MMQ_FUSED("glu_q4k", TQ4K, 1) MMQ_FUSED("glu_iq4x", TIQ4, 1) MMQ_FUSED("glu_q5k_l0", TQ5K, 0)
     MK_GLU_MIX_PAIRS(MMQ_MIX)
 #endif
-#ifdef MMQ_NEW // candidates, compile-time list: -DMMQ_NEW='MMQ_K("q5k_w16", TQ5K, false, 64, 1, -1, 1, 256, "q5k") ...'
-    MMQ_NEW
+#ifdef MMQ_CAND // candidates: -DMMQ_CAND='"file"', lines like MMQ_K("q5k_nb64", TQ5K, false, 64, 1, -1, 1, "q5k") (the last name: the kernel it must match)
+#include MMQ_CAND
 #endif
 };
 
@@ -218,7 +223,7 @@ static double kv_iq4(unsigned q) { // kvalues_iq4nl (the bytes of IQ4U_T* minus 
 // Scalar value of element e of a row, from the pre-wv bytes: d * sc * (q - 32) etc. as ggml dequantizes.
 static double deq(const Mx & m, int row, int e) {
     const uint8_t * rw = m.w.data() + (size_t) row * m.rb;
-    const int nb = m.K / 256, b = e >> 8, w = e & 255, sb = w >> 5, l = w & 31;
+    const int b = e >> 8, w = e & 255, sb = w >> 5, l = w & 31;
     const int p = w >> 6, ww = w & 63, sub = ww >> 5, i = ww & 31, hh = i >> 4, ii = i & 15, tq = ii >> 2, mm = ii & 3;
     const uint8_t * mp = m.meta.empty() ? nullptr : m.meta.data() + (size_t) row * (m.meta.size() / m.N);
     if (m.type == TQ4K || m.type == TQ5K) {
@@ -268,7 +273,6 @@ static double deq(const Mx & m, int row, int e) {
     const int qs = blk[16 * p + 8 * hh + 4 * sub + tq], qh = (mb[2 * p + hh] >> (4 * sub + tq)) & 1;
     const int gv = (g_grid[qs | (qh << 8)] >> (8 * mm)) & 0xff, sg = (blk[64 + 8 * p + 4 * hh + mm] >> (4 * sub + tq)) & 1;
     return (double) hf(mb + 12) * (1 + 2 * ((mb[8 + p] >> (4 * sub)) & 0xF)) * (sg ? -gv : gv);
-    (void) nb;
 }
 
 static std::vector<__half> gen_x(int ntok, int K, XS & r, bool wide) {
@@ -443,7 +447,7 @@ static void time_k(const KR & k, int K, int N, int ntok, int reps, int nlay) {
     const double fl = 2.0 * K * (double) N * ntok * (k.glu ? 2.0 : 1.0), mn = med(tn);
     // (GLU: N gate rows and N up rows)
     printf("%-22s K %5d N %5d tok %4d grid %3d x %2d nb %3d: median %8.3f ms min %8.3f  %6.1f TFLOPS  %5.1f%% of the 1.665 GHz fp16 peak", k.name, K, N, ntok,
-           N / (k.glu ? k.bx / 2 : k.bx), (ntok + k.nb - 1) / k.nb, k.nb, mn, *std::min_element(tn.begin(), tn.end()), fl / (mn * 1e-3) / 1e12,
+           N / (k.glu ? BM / 2 : BM), (ntok + k.nb - 1) / k.nb, k.nb, mn, *std::min_element(tn.begin(), tn.end()), fl / (mn * 1e-3) / 1e12,
            100.0 * fl / (mn * 1e-3) / (328 * 1.665e9 * 256));
     if (old) {
         const double mo = med(to);
@@ -453,6 +457,88 @@ static void time_k(const KR & k, int K, int N, int ntok, int reps, int nlay) {
     fflush(stdout);
     CK(cudaEventDestroy(ea));
     CK(cudaEventDestroy(eb));
+    CK(cudaFree(dx));
+    CK(cudaFree(dy));
+    for (auto & m : ms) m.free_dev();
+    for (auto & m : us) m.free_dev();
+}
+
+// ---- sustain -------------------------------------------------------------------------------------------------------
+// Old and candidate in turns of [secs] s each, back to back: launches / s with the power cap in the loop (interleaved launches share one clock, so `time`
+// cannot show that a kernel with a higher tensor duty draws more power and loses clock). nvidia-smi samples per segment.
+static void sustain_k(const KR & k, int K, int N, int ntok, double secs, int nlay, int rounds) {
+    const KR * old = k.oldn ? find_k(k.oldn) : nullptr;
+    XS r{0x123456789ABCDEFull};
+    std::vector<Mx> ms, us;
+    for (int l = 0; l < nlay; l++) {
+        ms.push_back(gen(k.type, k.lay, K, N, r, false));
+        if (k.glu) us.push_back(gen(k.type2 >= 0 ? k.type2 : k.type, k.type2 >= 0 ? k.lay2 : k.lay, K, N, r, false));
+    }
+    auto xh = gen_x(ntok, K, r, false);
+    __half * dx;
+    CK(cudaMalloc(&dx, xh.size() * 2));
+    CK(cudaMemcpy(dx, xh.data(), xh.size() * 2, cudaMemcpyHostToDevice));
+    float * dy;
+    CK(cudaMalloc(&dy, (size_t) ntok * N * 4));
+    const Out O = k.glu ? Out{nullptr, N, OUT_STORE, reinterpret_cast<__half *>(dy)} : Out{dy, N, OUT_STORE, nullptr};
+    k.attr();
+    if (old) old->attr();
+    static const WMat W0{};
+    std::atomic<bool> stop{false};
+    std::mutex mu;
+    double clk = 0, pw = 0;
+    int nclk = 0;
+    std::thread smi([&] {
+        while (!stop) {
+            FILE * f = popen("nvidia-smi --query-gpu=clocks.sm,power.draw --format=csv,noheader,nounits 2>/dev/null", "r");
+            double c = 0, p = 0;
+            if (f) {
+                if (fscanf(f, "%lf, %lf", &c, &p) == 2) {
+                    std::lock_guard<std::mutex> l(mu);
+                    clk += c;
+                    pw += p;
+                    nclk++;
+                }
+                pclose(f);
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(300));
+        }
+    });
+    double tot[2] = {0, 0}, fl = 2.0 * K * (double) N * ntok * (k.glu ? 2.0 : 1.0);
+    long cnt[2] = {0, 0};
+    auto seg = [&](const KR & kk, int w) {
+        // the first third of a segment: the power loop settles
+        for (int phase = 0; phase < 2; phase++) {
+            const auto ts = std::chrono::steady_clock::now();
+            long n = 0;
+            const double dur = phase ? secs : secs / 3;
+            {
+                std::lock_guard<std::mutex> l(mu);
+                clk = pw = 0;
+                nclk = 0;
+            }
+            while (std::chrono::duration<double>(std::chrono::steady_clock::now() - ts).count() < dur) {
+                for (int i = 0; i < 8; i++, n++) kk.run(ms[n % nlay].W, k.glu ? us[n % nlay].W : W0, dx, ntok, O);
+                CK(cudaDeviceSynchronize());
+            }
+            const double el = std::chrono::duration<double>(std::chrono::steady_clock::now() - ts).count();
+            if (phase) {
+                std::lock_guard<std::mutex> l(mu);
+                tot[w] += el;
+                cnt[w] += n;
+                printf("  %-14s %6.1f launches/s  %6.1f TFLOPS  %5.0f MHz %5.0f W\n", kk.name, n / el, n * fl / el / 1e12, nclk ? clk / nclk : 0.0, nclk ? pw / nclk : 0.0);
+                fflush(stdout);
+            }
+        }
+    };
+    for (int rr = 0; rr < rounds; rr++) {
+        if (old) seg(*old, 0);
+        seg(k, 1);
+    }
+    stop = true;
+    smi.join();
+    if (old) printf("%-22s K %5d N %5d tok %4d: sustained %+.2f%% time vs %s\n", k.name, K, N, ntok, 100.0 * ((tot[1] / cnt[1]) / (tot[0] / cnt[0]) - 1.0), k.oldn);
+    fflush(stdout);
     CK(cudaFree(dx));
     CK(cudaFree(dy));
     for (auto & m : ms) m.free_dev();
@@ -482,6 +568,14 @@ int main(int argc, char ** argv) {
             if (std::regex_search(k.name, re)) time_k(k, K, N, ntok, reps, nlay);
         return 0;
     }
-    fprintf(stderr, "usage: %s check [ntok] | time <kernel-regex> <K> <N> [ntok] [reps] [nlay]\n", argv[0]);
+    if (mode == "sustain" && argc >= 5) {
+        const std::regex re(argv[2]);
+        const int K = atoi(argv[3]), N = atoi(argv[4]), ntok = argc > 5 ? atoi(argv[5]) : 1024, rounds = argc > 7 ? atoi(argv[7]) : 2;
+        const double secs = argc > 6 ? atof(argv[6]) : 6.0;
+        for (const KR & k : g_k)
+            if (std::regex_search(k.name, re)) sustain_k(k, K, N, ntok, secs, 4, rounds);
+        return 0;
+    }
+    fprintf(stderr, "usage: %s check [ntok] | time <kernel-regex> <K> <N> [ntok] [reps] [nlay] | sustain <kernel-regex> <K> <N> [ntok] [secs] [rounds]\n", argv[0]);
     return 2;
 }

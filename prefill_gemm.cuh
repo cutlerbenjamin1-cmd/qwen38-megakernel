@@ -127,12 +127,12 @@ template <> struct HT<TIQ3S> { static constexpr int SR = 48, NS = 4; static cons
 template <int TYPE> struct SBT { static constexpr int R = 0, NC = 0; };
 template <> struct SBT<TQ5K> { static constexpr int R = 48, NC = 3; };
 constexpr int HCH = 2; // stages accumulated in fp16 before adding to the fp32 accumulators
-constexpr int HMI = 1, HWR = 16 * HMI; // warp tiles: 8 warps of 16 rows, each over all NB tokens
+constexpr int HMI = 1, HWR = 16 * HMI, HNWM = BM / HWR; // warp tiles: 8 warps of 16 rows, each over all NB tokens
 // NB: tokens per CTA (BN = 128 or, for short prompts, 64 / 32; picked per GEMM by the host, see Impl::pf_nb).
 // Each output element is the same sequence of fp16 products and sums in any NB (the K order per row and token does
 // not depend on which other tokens share the CTA), so every NB gives bit-identical results.
 template <int NB> __host__ __device__ constexpr int hm_x() { return NB * 128; } // activation tile per stage: NB tokens x 64 halves, 16 B chunks XOR-swizzled
-template <int TYPE, int NB = BN, int BX = BM> __host__ __device__ constexpr int hm_stage() { return HT<TYPE>::SR * BX + hm_x<NB>(); }
+template <int TYPE, int NB = BN> __host__ __device__ constexpr int hm_stage() { return HT<TYPE>::SR * BM + hm_x<NB>(); }
 // (A deeper cp.async pipeline for the narrow tiles, up to 8 stages, is no faster.)
 // At NB = 32 every type fits two CTAs per SM (<= 49,216 B smem, Q6_K's; <= 96 registers), at NB = 64 / 128 one.
 // Per-stage mbarriers (MBL) instead of the per-stage CTA barrier: full[b] completes when the 256 threads' copies of the
@@ -146,8 +146,8 @@ __host__ __device__ constexpr bool pf_mbl(int tg, int tu, bool mix) {
            (tg == TQ6K && (tu == TQ6K || tu == TQ5K)) || (tg == TQ3K && tu == TIQ4);
 }
 constexpr int MBB = 64; // MBL: full[4] + empty[4]
-template <int TYPE, int NB = BN, int BX = BM> __host__ __device__ constexpr int hm_smem() {
-    return HT<TYPE>::NS * hm_stage<TYPE, NB, BX>() + 2 * SBT<TYPE>::R * BX + (HT<TYPE>::SEP ? 2 * 2 * BX * 8 : 0) +
+template <int TYPE, int NB = BN> __host__ __device__ constexpr int hm_smem() {
+    return HT<TYPE>::NS * hm_stage<TYPE, NB>() + 2 * SBT<TYPE>::R * BM + (HT<TYPE>::SEP ? 2 * 2 * BM * 8 : 0) +
            (pf_mbl(TYPE, TYPE, false) ? MBB : 0);
 }
 
@@ -201,22 +201,21 @@ __host__ __device__ constexpr bool pf_wown(int t, bool mix) { return !mix && (t 
 
 // Mixed-type GLU tiles: both halves' weight bytes + the activations per stage; 4 stages if they fit (NB 32: in 48 KB, two
 // CTAs per SM like the same-type kernels; else in 99 KB), else 3
-template <int TG, int TU, int NB, int BX = BM> __host__ __device__ constexpr int hm_stage2() { return BX / 2 * (HT<TG>::SR + HT<TU>::SR) + hm_x<NB>(); }
-template <int TG, int TU, int BX = BM> __host__ __device__ constexpr int hm_sep2() { // + the halves' super-block buffers
-    return (HT<TG>::SEP || HT<TU>::SEP ? 2 * 2 * BX * 8 : 0) + 2 * BX / 2 * (SBT<TG>::R + SBT<TU>::R);
+template <int TG, int TU, int NB> __host__ __device__ constexpr int hm_stage2() { return BM / 2 * (HT<TG>::SR + HT<TU>::SR) + hm_x<NB>(); }
+template <int TG, int TU> __host__ __device__ constexpr int hm_sep2() { // + the halves' super-block buffers
+    return (HT<TG>::SEP || HT<TU>::SEP ? 2 * 2 * BM * 8 : 0) + 2 * BM / 2 * (SBT<TG>::R + SBT<TU>::R);
 }
-template <int TG, int TU, int NB, int BX = BM> __host__ __device__ constexpr int hm_ns2() {
-    return 4 * hm_stage2<TG, TU, NB, BX>() + hm_sep2<TG, TU, BX>() + (pf_mbl(TG, TU, true) ? MBB : 0) <= (NB <= 32 ? 48 : 99) * 1024 ? 4 : 3;
+template <int TG, int TU, int NB> __host__ __device__ constexpr int hm_ns2() {
+    return 4 * hm_stage2<TG, TU, NB>() + hm_sep2<TG, TU>() + (pf_mbl(TG, TU, true) ? MBB : 0) <= (NB <= 32 ? 48 : 99) * 1024 ? 4 : 3;
 }
-template <int TG, int TU, int NB, int BX = BM> __host__ __device__ constexpr int hm_smem2() {
-    return hm_ns2<TG, TU, NB, BX>() * hm_stage2<TG, TU, NB, BX>() + hm_sep2<TG, TU, BX>() + (pf_mbl(TG, TU, true) ? MBB : 0);
+template <int TG, int TU, int NB> __host__ __device__ constexpr int hm_smem2() {
+    return hm_ns2<TG, TU, NB>() * hm_stage2<TG, TU, NB>() + hm_sep2<TG, TU>() + (pf_mbl(TG, TU, true) ? MBB : 0);
 }
 
 // The weight rows of a CTA that share a type: all BM rows (TW2: the same-type fused gate / up, rows 0 .. BM/2 - 1 from W,
 // the rest from W2), or one half (BM/2 rows) of a mixed-type gate / up. HB: the rows' offset in a stage; TB: the first
 // thread of the per-row copies (scale streams, Q6_K meta, Q3_K / IQ3_S extra bytes): threads TB .. TB + ROWS - 1.
-template <int TYPE, int LAY, int ROWS, bool TW2, int HB, int TB, bool OWN = false, int BX = BM> struct HalfW {
-    static constexpr int NT = 2 * BX; // threads per CTA
+template <int TYPE, int LAY, int ROWS, bool TW2, int HB, int TB, bool OWN = false> struct HalfW {
     static constexpr bool FMT = LAY && (TYPE == TIQ4 || TYPE == TQ4K || TYPE == TQ5K); // fragment-ordered
     static constexpr bool FM6 = LAY && TYPE == TQ6K;
     static constexpr int BLK = WT<TYPE>::BLK, NCH = WT<TYPE>::NCH, SR = HT<TYPE>::SR;
@@ -233,8 +232,8 @@ template <int TYPE, int LAY, int ROWS, bool TW2, int HB, int TB, bool OWN = fals
     // CPTS super-block buffer chunks and the per-row bytes of the half's 16-row tile t (the chunk index order of the tiles is
     // contiguous in every layout: FMT / FM6 by tile, row-major by row).
     static constexpr int WB = TB / 16, CPT = WCH / (ROWS / 16), CPTS = WCHS / (ROWS / 16);
-    static constexpr int WIT = OWN ? (CPT + 31) / 32 : (WCH + NT - 1) / NT;
-    static constexpr int WITS = !WCHS ? 1 : OWN ? (CPTS + 31) / 32 : (WCHS + NT - 1) / NT;
+    static constexpr int WIT = OWN ? (CPT + 31) / 32 : (WCH + 255) / 256;
+    static constexpr int WITS = !WCHS ? 1 : OWN ? (CPTS + 31) / 32 : (WCHS + 255) / 256;
     static constexpr int UB = FM6 ? F6U : 16 * (TYPE == TIQ4 ? 136 : BLK); // LAY: bytes per (tile, super-block) unit
     // LAY 1 offset types (ffn_down): value blocks and meta entries are tile-major, so the row's stream advances by
     // 16 entries per block (VST: value bytes per super-block, EST: meta bytes per Q6_K / Q3_K block pair or IQ3_S block)
@@ -264,7 +263,7 @@ template <int TYPE, int LAY, int ROWS, bool TW2, int HB, int TB, bool OWN = fals
         wmask = smask = 0u;
 #pragma unroll
         for (int k = 0; k < WIT; k++) {
-            int i = tid + k * NT;
+            int i = tid + k * 256;
             if constexpr (OWN) {
                 const bool own = town && wl + 32 * k < CPT;
                 i = own ? tw * CPT + wl + 32 * k : WCH;
@@ -350,7 +349,7 @@ template <int TYPE, int LAY, int ROWS, bool TW2, int HB, int TB, bool OWN = fals
         if constexpr (SNC > 0) {
 #pragma unroll
             for (int k = 0; k < WITS; k++) {
-                int i = tid + k * NT;
+                int i = tid + k * 256;
                 if constexpr (OWN) {
                     const bool own = town && wl + 32 * k < CPTS;
                     i = own ? tw * CPTS + wl + 32 * k : WCHS;
@@ -391,12 +390,12 @@ template <int TYPE, int LAY, int ROWS, bool TW2, int HB, int TB, bool OWN = fals
                 const unsigned d = sbba + (sb & 1) * SBR * ROWS;
 #pragma unroll
                 for (int k = 0; k < WITS; k++)
-                    if (OWN ? (smask >> k) & 1u : WCHS % NT == 0 || tid + k * NT < WCHS)
+                    if (OWN ? (smask >> k) & 1u : WCHS % 256 == 0 || tid + k * 256 < WCHS)
                         cpa16(d + sdst[k], ssrc[k] + (size_t) sb * (LAY ? UB : BLK));
             }
 #pragma unroll
         for (int k = 0; k < WIT; k++)
-            if (OWN ? (wmask >> k) & 1u : WCH % NT == 0 || tid + k * NT < WCH) {
+            if (OWN ? (wmask >> k) & 1u : WCH % 256 == 0 || tid + k * 256 < WCH) {
                 if constexpr (LAY) { // (FMT: whole FM chunks to the FMT stage layout)
                     cpa16(s + wdst[k], wsrc[k] + (size_t) sb * UB + p * winc[k]);
                 } else if constexpr (TYPE == TIQ4) // block pairs of 272 B: headers, then the even and the odd block's indices
@@ -487,14 +486,14 @@ template <int TYPE, int LAY, int ROWS, bool TW2, int HB, int TB, bool OWN = fals
             const __half dd = *reinterpret_cast<const __half *>(row + 64 + 2 * j);
             a = b = __half2half2(dd);
         }
-        if constexpr (SEP) sws[(st & 1) * 2 * BX + j * BX + hg] = make_uint2(h2u(a), h2u(b));
+        if constexpr (SEP) sws[(st & 1) * 2 * BM + j * BM + hg] = make_uint2(h2u(a), h2u(b));
     }
 
     // fp16 A fragments a[j][kk][0..3] of stage st for the lane's rows (local rw = 16-row tile base + g, global rwg)
     __device__ __forceinline__ void frag(const uint8_t * stg, int st, int rw, int rwg, int g, int t4, const uint2 * sws,
                                          unsigned (&a)[2][2][4]) const {
         const uint8_t * sw = stg + HB;
-        const uint2 * ws = sws + (st & 1) * 2 * BX;
+        const uint2 * ws = sws + (st & 1) * 2 * BM;
         const int p = st & 3;
         constexpr float OFF = TYPE == TQ6K || TYPE == TIQ3S ? -1056.f
                             : TYPE == TQ3K                  ? -1028.f
@@ -619,8 +618,8 @@ template <int TYPE, int LAY, int ROWS, bool TW2, int HB, int TB, bool OWN = fals
         for (int j = 0; j < 2; j++) {
             uint2 sA, sB;
             if constexpr (SEP) {
-                sA = ws[j * BX + rwg + (FMT ? 8 * (g & 1) : 0)]; // FMT: the lane's rows A / B (above)
-                sB = ws[j * BX + rwg + (FMT ? 8 - 8 * (g & 1) : 8)];
+                sA = ws[j * BM + rwg + (FMT ? 8 * (g & 1) : 0)]; // FMT: the lane's rows A / B (above)
+                sB = ws[j * BM + rwg + (FMT ? 8 - 8 * (g & 1) : 8)];
             } else { // Q6_K: (S_j0, S_j1) in the row -> broadcast pairs (FM6: in the row's meta slot)
                 const int z = (g >> 1) & 3;
                 const __half2 qa = *reinterpret_cast<const __half2 *>(FM6 ? sw + F6M + 16 * rw + 8 + 4 * j : ra + 16 * (3 ^ z) + 8 + 4 * j);
@@ -647,9 +646,8 @@ template <int TYPE, int LAY, int ROWS, bool TW2, int HB, int TB, bool OWN = fals
     }
 };
 
-// BX: weight rows per CTA (threads 2 BX, warps BX / 16, one 16-row tile per warp). Same products, sums and epilogue per element at any BX.
-template <int TYPE, bool GLU = false, int NB = BN, int LAY = 0, int TYPE2 = -1, int LAY2 = LAY, int BX = BM>
-__global__ void __launch_bounds__(2 * BX, 1)
+template <int TYPE, bool GLU = false, int NB = BN, int LAY = 0, int TYPE2 = -1, int LAY2 = LAY>
+__global__ void __launch_bounds__(256, 1)
     mmh(WMat W, const __half * X, int ntok, Out O, const uint8_t * W2 = nullptr, WMat Wu = WMat{}) {
     constexpr bool MIX = TYPE2 >= 0;
     static_assert(MIX || !GLU || TYPE == TQ4K || TYPE == TQ5K || TYPE == TIQ4, "same-type fused gate / up needs in-row scales");
@@ -658,27 +656,26 @@ __global__ void __launch_bounds__(2 * BX, 1)
     static_assert(HMI == 1, "one 16-row MMA tile per warp");
     constexpr int TU = MIX ? TYPE2 : TYPE, LU = MIX ? LAY2 : LAY;
     constexpr bool WOWN = pf_wown(TYPE, MIX) && HT<TYPE>::NS == 4; // warp-owned weight copies, one barrier per two stages
-    constexpr int NT = 2 * BX, HNW = BX / HWR; // threads, warps per CTA
-    using HA = HalfW<TYPE, LAY, MIX ? BX / 2 : BX, GLU && !MIX, 0, 0, WOWN, BX>;
-    using HU = HalfW<TU, LU, BX / 2, false, BX / 2 * HT<TYPE>::SR, BX / 2, false, BX>;
-    constexpr int WPART = MIX ? BX / 2 * (HT<TYPE>::SR + HT<TU>::SR) : BX * HT<TYPE>::SR; // weight bytes per stage
-    constexpr int STG = MIX ? hm_stage2<TYPE, TU, NB, BX>() : hm_stage<TYPE, NB, BX>();
-    constexpr int NSH = MIX ? hm_ns2<TYPE, TU, NB, BX>() : HT<TYPE>::NS;
+    using HA = HalfW<TYPE, LAY, MIX ? BM / 2 : BM, GLU && !MIX, 0, 0, WOWN>;
+    using HU = HalfW<TU, LU, BM / 2, false, BM / 2 * HT<TYPE>::SR, BM / 2>;
+    constexpr int WPART = MIX ? BM / 2 * (HT<TYPE>::SR + HT<TU>::SR) : BM * HT<TYPE>::SR; // weight bytes per stage
+    constexpr int STG = MIX ? hm_stage2<TYPE, TU, NB>() : hm_stage<TYPE, NB>();
+    constexpr int NSH = MIX ? hm_ns2<TYPE, TU, NB>() : HT<TYPE>::NS;
     constexpr bool MBL = pf_mbl(TYPE, TU, MIX) && NSH == 4 && !WOWN; // per-stage mbarriers, copies two stages ahead
-    constexpr int SMEM = MIX ? hm_smem2<TYPE, TU, NB, BX>() : hm_smem<TYPE, NB, BX>();
+    constexpr int SMEM = MIX ? hm_smem2<TYPE, TU, NB>() : hm_smem<TYPE, NB>();
     static_assert(STG == WPART + hm_x<NB>(), "stage layout");
-    static_assert(NB * (BX + 4) * 4 <= SMEM, "epilogue tile");
-    constexpr int HWT = NB, HNI = HWT / 8, XIT = NB * 8 / NT, FG = frag_g(TYPE, TU, GLU, MIX);
+    static_assert(NB * (BM + 4) * 4 <= (MIX ? hm_smem2<TYPE, TU, NB>() : hm_smem<TYPE, NB>()), "epilogue tile");
+    constexpr int HWT = NB / (8 / HNWM), HNI = HWT / 8, XIT = NB * 8 / 256, FG = frag_g(TYPE, TU, GLU, MIX);
     extern __shared__ __align__(16) uint8_t sm[];
     const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5, g = lane >> 2, t4 = lane & 3;
-    const int wm = warp % HNW, wn = warp / HNW; // warp tile: rows HWR wm .., tokens HWT wn ..
+    const int wm = warp % HNWM, wn = warp / HNWM; // warp tile: rows HWR wm .., tokens HWT wn ..
     const int ntt = gridDim.y;
     const int lin = blockIdx.y * gridDim.x + blockIdx.x;
-    const int row0 = (lin / ntt) * (GLU ? BX / 2 : BX), tok0 = (lin % ntt) * NB;
+    const int row0 = (lin / ntt) * (GLU ? BM / 2 : BM), tok0 = (lin % ntt) * NB;
     const unsigned sbase = (unsigned) __cvta_generic_to_shared(sm);
-    // after the stages: the halves' super-block buffers (SBT), then the scale pairs sws [2][2 j][BX]
+    // after the stages: the halves' super-block buffers (SBT), then the scale pairs sws [2][2 j][BM]
     uint8_t * sbbs = sm + NSH * STG;
-    constexpr int SBBA = 2 * HA::SBR * (MIX ? BX / 2 : BX), SBBU = MIX ? 2 * HU::SBR * BX / 2 : 0;
+    constexpr int SBBA = 2 * HA::SBR * (MIX ? BM / 2 : BM), SBBU = MIX ? 2 * HU::SBR * BM / 2 : 0;
     uint2 * sws = reinterpret_cast<uint2 *>(sbbs + SBBA + SBBU);
 
     HA ha;
@@ -689,7 +686,7 @@ __global__ void __launch_bounds__(2 * BX, 1)
     unsigned xdst[XIT];
 #pragma unroll
     for (int k = 0; k < XIT; k++) {
-        const int i = tid + k * NT, t = i >> 3, c = i & 7;
+        const int i = tid + k * 256, t = i >> 3, c = i & 7;
         xsrc[k] = X + (size_t) (tok0 + t) * W.K + 8 * c;
         xdst[k] = WPART + t * 128 + ((c ^ (t & 7)) << 4);
     }
@@ -709,16 +706,16 @@ __global__ void __launch_bounds__(2 * BX, 1)
         const uint8_t * stg = sm + (st % NSH) * STG;
         const int hr = tid >> 1, j = tid & 1;
         if constexpr (!MIX) ha.scales(stg, st, hr, j, sws, hr);
-        else if (warp < HNW / 2) ha.scales(stg, st, hr, j, sws, hr);
-        else hu.scales(stg, st, hr - BX / 2, j, sws, hr);
+        else if (warp < 4) ha.scales(stg, st, hr, j, sws, hr);
+        else hu.scales(stg, st, hr - BM / 2, j, sws, hr);
     };
     // fp16 A fragments of stage st: the stage's weights times their scales (sws / the Q6_K meta slot)
     auto frag = [&](int st, unsigned (&a)[HMI][2][2][4]) {
         const uint8_t * stg = sm + (st % NSH) * STG;
         const int rwg = HWR * wm + g;
         if constexpr (!MIX) ha.frag(stg, st, rwg, rwg, g, t4, sws, a[0]);
-        else if (warp < HNW / 2) ha.frag(stg, st, rwg, rwg, g, t4, sws, a[0]);
-        else hu.frag(stg, st, rwg - BX / 2, rwg, g, t4, sws, a[0]);
+        else if (warp < 4) ha.frag(stg, st, rwg, rwg, g, t4, sws, a[0]);
+        else hu.frag(stg, st, rwg - BM / 2, rwg, g, t4, sws, a[0]);
     };
 
     float acc[HMI][HNI][4];
@@ -733,8 +730,8 @@ __global__ void __launch_bounds__(2 * BX, 1)
         if (tid == 0)
 #pragma unroll
             for (int b = 0; b < 4; b++) {
-                mb_init(mbf + 8 * b, NT);
-                mb_init(mbe + 8 * b, HNW);
+                mb_init(mbf + 8 * b, 256);
+                mb_init(mbe + 8 * b, 8);
             }
         __syncthreads();
         for (int s = 0; s < 2; s++) { // (nst >= 2)
@@ -875,14 +872,14 @@ __global__ void __launch_bounds__(2 * BX, 1)
     // OUT_ADD: the y elements this thread adds to in the store loop below, loaded here (they do not depend on the tile), so
     // their latency overlaps the last conversions and the staging through se. The loop loaded each one right before its
     // add, behind the previous iteration's store: one exposed load latency per iteration (16 at NB = 128)
-    constexpr int EIT = GLU ? 1 : NB * BX / 4 / NT;
-    static_assert(GLU || NB * BX / 4 % NT == 0, "epilogue: whole float4 iterations per thread");
+    constexpr int EIT = GLU ? 1 : NB * BM / 4 / 256;
+    static_assert(GLU || NB * BM / 4 % 256 == 0, "epilogue: whole float4 iterations per thread");
     float4 yo[EIT];
     if constexpr (!GLU) {
         if (O.mode == OUT_ADD)
 #pragma unroll
             for (int k = 0; k < EIT; k++) {
-                const int i = tid + NT * k, tk = i / (BX / 4), c = (i % (BX / 4)) * 4;
+                const int i = tid + 256 * k, tk = i / (BM / 4), c = (i % (BM / 4)) * 4;
                 yo[k] = tok0 + tk < ntok ? __ldcg(reinterpret_cast<const float4 *>(O.y + (size_t) (tok0 + tk) * O.ldy + row0 + c))
                                          : make_float4(0.f, 0.f, 0.f, 0.f);
             }
@@ -893,9 +890,9 @@ __global__ void __launch_bounds__(2 * BX, 1)
         for (int ni = 0; ni < HNI; ni++) conv(mi, ni);
     cpa_wait<0>();
     __syncthreads();
-    constexpr int ELD = BX + 4;
+    constexpr int ELD = BM + 4;
     float * se = reinterpret_cast<float *>(sm);
-    const bool fmt = MIX && warp >= HNW / 2 ? HU::FMT : HA::FMT; // FMT: rows A / B (rawq)
+    const bool fmt = MIX && warp >= 4 ? HU::FMT : HA::FMT; // FMT: rows A / B (rawq)
 #pragma unroll
     for (int mi = 0; mi < HMI; mi++)
 #pragma unroll
@@ -911,15 +908,15 @@ __global__ void __launch_bounds__(2 * BX, 1)
     if constexpr (GLU) {
         // (token, 16-group of the 64 outputs): lanes 8 q' .. 8 q' + 7 take 8 consecutive tokens of one group, so their float4
         // reads of se (ELD = 132: rows of 33 16-B units) hit 8 distinct bank quads per quarter warp
-        for (int i = tid; i < NB * (BX / 32); i += NT) {
-            const int w = i >> 5, tk = 8 * (BX == BM ? w : w & (NB / 8 - 1)) + (i & 7), q = (BX == BM ? 0 : 4 * (w / (NB / 8))) + ((i >> 3) & 3);
+        for (int i = tid; i < NB * 4; i += 256) {
+            const int tk = 8 * (i >> 5) + (i & 7), q = (i >> 3) & 3;
             if (tok0 + tk >= ntok) continue;
             const float * gp = se + tk * ELD + 16 * q;
             float gf[16], uf[16];
 #pragma unroll
             for (int m = 0; m < 4; m++) {
                 *reinterpret_cast<float4 *>(gf + 4 * m) = *reinterpret_cast<const float4 *>(gp + 4 * m);
-                *reinterpret_cast<float4 *>(uf + 4 * m) = *reinterpret_cast<const float4 *>(gp + BX / 2 + 4 * m);
+                *reinterpret_cast<float4 *>(uf + 4 * m) = *reinterpret_cast<const float4 *>(gp + BM / 2 + 4 * m);
             }
             __align__(16) __half hv[16];
             // the 16 denominators first: each division below branches to its slow path (FCHK), which kept the next
@@ -947,8 +944,8 @@ __global__ void __launch_bounds__(2 * BX, 1)
         return;
     }
 #pragma unroll
-    for (int k = 0; k < EIT; k++) { // (i = tid, tid + NT, .. < NB BX / 4)
-        const int i = tid + NT * k, tk = i / (BX / 4), c = (i % (BX / 4)) * 4;
+    for (int k = 0; k < EIT; k++) { // (i = tid, tid + 256, .. < NB BM / 4)
+        const int i = tid + 256 * k, tk = i / (BM / 4), c = (i % (BM / 4)) * 4;
         if (tok0 + tk >= ntok) continue;
         float4 v = *reinterpret_cast<const float4 *>(se + tk * ELD + c);
 #if MK_PF_INFCHK
