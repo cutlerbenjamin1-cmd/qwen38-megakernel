@@ -88,6 +88,15 @@ extern char ** environ; // (state files: the MK_* settings in the key)
 #ifndef MK_ATT_I8
 #define MK_ATT_I8 0
 #endif
+// MK_W48X 1: decode attention on low-bit MK_KV slots with cheap K / V copies and expansion (attn_core_q8m, attn_core_w48m:
+// same staged bytes, same partials). 0: the old path. Compile-time: a run-time bit shifts ptxas's register allocation.
+#ifndef MK_W48X
+#define MK_W48X 0
+#endif
+// MK_W48X_Q8 1 (with MK_W48X 1): all-q8 slots run those MIX kernels too (no q8 instances in the build). 0: their own kernels
+#ifndef MK_W48X_Q8
+#define MK_W48X_Q8 0
+#endif
 // MK_L2_TUNE 1: the L2 prefetch budgets (L2Tune below) are read from the environment (MK_L2_*, docs/EXPERIMENTAL.md), to
 // tune them on a GPU with another L2 size. 0: the constants, none of this code (the default)
 #ifndef MK_L2_TUNE
