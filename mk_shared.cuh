@@ -88,10 +88,10 @@ extern char ** environ; // (state files: the MK_* settings in the key)
 #ifndef MK_ATT_I8
 #define MK_ATT_I8 0
 #endif
-// MK_W48X 1: decode attention on low-bit MK_KV slots with cheap K / V copies and expansion (attn_core_q8m, attn_core_w48m:
+// MK_W48X 1 (default): decode attention on low-bit MK_KV slots with cheap K / V copies and expansion (attn_core_q8m, attn_core_w48m:
 // same staged bytes, same partials). 0: the old path. Compile-time: a run-time bit shifts ptxas's register allocation.
 #ifndef MK_W48X
-#define MK_W48X 0
+#define MK_W48X 1
 #endif
 // MK_W48X_Q8 1 (with MK_W48X 1): all-q8 slots run those MIX kernels too (no q8 instances in the build). 0: their own kernels
 #ifndef MK_W48X_Q8
