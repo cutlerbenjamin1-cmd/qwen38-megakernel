@@ -1197,12 +1197,14 @@ __global__ void __launch_bounds__(256) pk_attn8_combx(int T, int n0, int nfull, 
     }
 }
 
-// >>> pk_attn9
 // ------------------------------------------------------------------------------------------
 // pk_attn9: pk_attn8 (same units, same stages, every output element the same floating-point chain: bit-identical) with the
 // per-tile data movement rewritten for instruction count, the kernel being compute-limited. Each thread's copies are a fixed
 // plan set up once (running source pointers, stage offsets; warp-uniform kinds; idle chunks predicated, not branched
 // around), for the main-format tiles with all rows; the rest (ring tiles, the last partial tile) keep pk_attn8's a8_issue.
+// Order: tile t's copies are issued in tile t - 2, every thread waits for its own before barrier(t - 1) (wait_group 0, then __syncthreads), the
+// conversions run in tile t - 1 only and S / P V read the results after barrier(t). What a tile writes it does not read. Warps are in no fixed
+// order inside a tile (one can reach its tail before another starts P V), so a conversion store goes only to this thread's own slots.
 __device__ __forceinline__ void cp_async16_to(unsigned d, const void * gsrc) {
     asm volatile("cp.async.cg.shared.global [%0], [%1], 16;" ::"r"(d), "l"(gsrc) : "memory");
 }
@@ -1608,7 +1610,6 @@ __global__ void __launch_bounds__(A2_NT, 1) pk_attn9(int T, int n0, int slot, in
         const int vbn = vbt(it + 1); // V(it + 1)'s format
         const int ia = it + A8_NS - 1; // refill the stage of tile it - 1 with tile ia
         uint8_t * sta = asm_ + st_c;
-        unsigned ksn = 0u;
         const unsigned cpok = ia < itf && ia < it1;
         a9_cp16p(cpok, smem0 + st_c + cpd[0], cps[0]);
         cps[0] += cpi[0];
