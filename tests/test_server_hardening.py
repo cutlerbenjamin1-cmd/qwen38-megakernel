@@ -356,6 +356,14 @@ class ConnectionTests(_GateCase):
             self.assertIn(b"must be a JSON object", out)
         self.assertEqual(srv.eng.calls, [])
 
+    def test_an_integer_past_the_digit_limit_is_a_400(self) -> None:
+        srv, http_ = self.serve(base._ScriptEngine(["ok"]))
+        body = b'{"messages": [], "x": ' + b"1" * 5000 + b"}"
+        st, _, out = self.ask(http_, "POST", "/v1/chat/completions", [("Content-Type", "application/json")], body)
+        self.assertEqual(st, 400)
+        self.assertIn(b"must be a JSON object", out)
+        self.assertEqual(srv.eng.calls, [])
+
     def test_idle_and_stalled_connections_are_closed(self) -> None:
         _, http_ = self.serve(base._ScriptEngine(["ok"]))
         with mock.patch.object(self.mk.GatedHandler, "timeout", 0.5):
@@ -387,6 +395,253 @@ class ConnectionTests(_GateCase):
         time.sleep(0.3)
         self.assertEqual(eng.cycles, c1, "still generating after the write timed out")
         self.assertEqual(http_.post({"messages": [{"role": "user", "content": "next"}], "max_tokens": 4})[0], 200)
+
+
+class RequestLimitTests(_GateCase):
+    """what connections can hold: the bytes of bodies in memory, how long a request may take to arrive, how many"""
+
+    POST = b"POST /v1/chat/completions HTTP/1.1\r\nHost: x\r\n"
+    OK = {"messages": [{"role": "user", "content": "hi"}], "max_tokens": 4}
+
+    @staticmethod
+    def until(cond, what, timeout=5.0):
+        end = time.monotonic() + timeout
+        while not cond():
+            if time.monotonic() > end:
+                raise AssertionError("timed out waiting for " + what)
+            time.sleep(0.01)
+
+    def conn(self, http_, data=b""):
+        s = socket.create_connection(("127.0.0.1", http_.port), timeout=10)
+        self.addCleanup(s.close)
+        if data:
+            s.sendall(data)
+        return s
+
+    def test_a_body_is_charged_as_it_arrives_and_released_with_its_request(self) -> None:
+        _, http_ = self.serve(base._ScriptEngine(["ok"]))
+        budget = http_.httpd.bodies = self.mk.BodyBudget(3 << 20)
+        mib = 1 << 20
+        idle = self.conn(http_, self.POST + f"Content-Length: {100 * mib}\r\n\r\n".encode())  # (a size, nothing sent)
+        time.sleep(0.2)
+        self.assertEqual(budget.used, 0)
+        holder = self.conn(http_, self.POST + f"Content-Length: {8 * mib}\r\n\r\n".encode() + b"x" * (mib * 5 // 2))
+        self.until(lambda: budget.used == 2 * mib, "the first two pieces")
+        for form in (base._request({"pad": "y" * (2 * mib)}),
+                     self.POST + b"Transfer-Encoding: chunked\r\n\r\n" + f"{2 * mib:x}\r\n".encode() + b"y" * (2 * mib) + b"\r\n0\r\n\r\n"):
+            out = http_.raw(form, timeout=10)
+            self.assertIn(b"503", out.split(b"\r\n", 1)[0], out[:200])
+            self.assertIn(b"MK_MAX_INFLIGHT_MB", out)
+            self.assertIn(b"Retry-After:", out)
+            self.until(lambda: budget.used == 2 * mib, "the refused body's release")
+        holder.close()
+        idle.close()
+        self.until(lambda: budget.used == 0, "the release when the client left")
+        self.assertEqual(http_.post(self.OK)[0], 200)
+        self.assertEqual(budget.used, 0)
+
+    def test_one_body_of_the_largest_size_always_fits(self) -> None:
+        with mock.patch.object(self.mk, "MAX_BODY_MB", 8), mock.patch.object(self.mk, "MAX_INFLIGHT_MB", 1):
+            http_ = base._Http(self.mk, base._chat_server(self.mk, base._ScriptEngine(["ok"])))
+            self.addCleanup(http_.close)
+            self.assertEqual(http_.httpd.bodies.cap, 8 << 20)
+            body = json.dumps(dict(self.OK, pad="y" * (7 << 20))).encode()
+            st, _, _ = self.ask(http_, "POST", "/v1/chat/completions", [("Content-Type", "application/json")], body)
+            self.assertEqual(st, 200)
+
+    def trickled(self, http_, first, piece):
+        """sends first, then piece every 0.1 s (no read stalls); the seconds until the server closes the connection"""
+        s = self.conn(http_, first)
+        s.settimeout(0.1)
+        t0 = time.monotonic()
+        while time.monotonic() - t0 < 8:
+            try:
+                if s.recv(65536) == b"":
+                    return time.monotonic() - t0
+            except socket.timeout:
+                pass
+            except ConnectionResetError:
+                return time.monotonic() - t0
+            try:
+                s.sendall(piece)
+            except OSError:
+                return time.monotonic() - t0
+        return None
+
+    def test_a_request_must_arrive_within_the_deadline(self) -> None:
+        _, http_ = self.serve(base._ScriptEngine(["ok"]))
+        with mock.patch.object(self.mk, "REQUEST_TIMEOUT_S", 1), mock.patch.object(self.mk.GatedHandler, "timeout", 30):
+            for first, piece in ((b"P", b"O"),  # (the request line)
+                                 (self.POST, b"X"),  # (the headers)
+                                 (self.POST + b"Content-Length: 100000\r\n\r\n", b"x"),  # (a body)
+                                 (self.POST + b"Transfer-Encoding: chunked\r\n\r\n", b"1\r\nx\r\n")):  # (chunks)
+                took = self.trickled(http_, first, piece)
+                self.assertIsNotNone(took, first)
+                self.assertLess(took, 4, first)
+            self.assertEqual(http_.post(self.OK)[0], 200)
+
+    def test_the_deadline_can_be_off(self) -> None:
+        _, http_ = self.serve(base._ScriptEngine(["ok"]))
+        with mock.patch.object(self.mk, "REQUEST_TIMEOUT_S", 0), mock.patch.object(self.mk.GatedHandler, "timeout", 30):
+            s = self.conn(http_, self.POST)
+            s.settimeout(0.05)
+            for _ in range(30):  # (1.5 s of it)
+                s.sendall(b"X")
+                with self.assertRaises(socket.timeout):
+                    s.recv(65536)
+
+    def test_the_deadline_covers_only_a_requests_arrival(self) -> None:
+        eng = base._ScriptEngine(["a"], eog=False, delay=0.1)
+        _, http_ = self.serve(eng, 1024)
+        slow = {"messages": [{"role": "user", "content": "long"}], "max_tokens": 40}
+        with mock.patch.object(self.mk, "REQUEST_TIMEOUT_S", 1), mock.patch.object(self.mk.GatedHandler, "timeout", 30):
+            t0 = time.monotonic()
+            self.assertEqual(http_.post(slow, timeout=60)[0], 200)  # (generating longer than the deadline)
+            self.assertGreater(time.monotonic() - t0, 1.2)
+            eng.delay = 0.0
+            c = http.client.HTTPConnection("127.0.0.1", http_.port, timeout=10)
+            self.addCleanup(c.close)
+            c.connect()
+            time.sleep(1.2)  # (idle before its first request)
+            first = c.sock
+            for _ in range(2):  # (each request of a keep-alive connection has its own deadline)
+                c.request("POST", "/v1/chat/completions", json.dumps(self.OK), {"Content-Type": "application/json"})
+                r = c.getresponse()
+                self.assertEqual(r.status, 200)
+                r.read()
+                self.assertIs(c.sock, first)  # (the same connection)
+                time.sleep(1.2)
+
+    def test_connections_past_the_cap_get_a_503(self) -> None:
+        _, http_ = self.serve(base._ScriptEngine(["ok"]))
+        http_.httpd.slots = threading.BoundedSemaphore(2)
+        a, b = self.conn(http_), self.conn(http_)
+        self.until(lambda: not http_.httpd.slots._value, "both slots")
+        for _ in range(3):
+            t0 = time.monotonic()
+            out = self.conn(http_).recv(65536)
+            self.assertLess(time.monotonic() - t0, 2)  # (the accept loop never waits on one)
+            self.assertTrue(out.startswith(b"HTTP/1.1 503 "), out[:100])
+            self.assertIn(b"MK_MAX_CONNECTIONS", out)
+        a.close()
+        self.until(lambda: http_.httpd.slots._value == 1, "the closed connection's slot")
+        self.assertEqual(http_.post(self.OK)[0], 200)
+        self.until(lambda: http_.httpd.slots._value == 1, "the finished connection's slot")
+        b.close()
+        self.until(lambda: http_.httpd.slots._value == 2, "every slot back")
+
+    def test_a_failed_thread_start_returns_its_slot(self) -> None:
+        _, http_ = self.serve(base._ScriptEngine(["ok"]))
+        http_.httpd.slots = threading.BoundedSemaphore(2)
+        with mock.patch.object(socketserver.ThreadingMixIn, "process_request", side_effect=RuntimeError("no thread")):
+            with self.assertRaises(RuntimeError):
+                http_.httpd.process_request(None, None)
+        self.assertEqual(http_.httpd.slots._value, 2)
+
+    def test_a_network_listener_without_a_key_is_warned_about(self) -> None:
+        for host in ("127.0.0.1", "127.0.0.2", "localhost", "LOCALHOST.", "::1", "[::1]"):
+            self.assertIsNone(self.mk.exposure_warning(host, None), host)
+        for host in ("0.0.0.0", "::", "192.168.1.5", "gpu-box"):
+            why = self.mk.exposure_warning(host, None)
+            self.assertIn(host, why)
+            self.assertIn("MK_API_KEY", why)
+            self.assertIsNone(self.mk.exposure_warning(host, b"key"), host)
+
+    def test_limits_are_in_props(self) -> None:
+        _, http_ = self.serve(base._ScriptEngine(["ok"]))
+        c = http.client.HTTPConnection("127.0.0.1", http_.port, timeout=10)
+        self.addCleanup(c.close)
+        c.request("GET", "/props")
+        limits = json.loads(c.getresponse().read())["engine"]["limits"]
+        self.assertEqual((limits["max_inflight_mb"], limits["max_connections"], limits["request_timeout_s"]),
+                         (self.mk.MAX_INFLIGHT_MB, self.mk.MAX_CONNECTIONS, self.mk.REQUEST_TIMEOUT_S))
+
+
+class BadFieldTests(_GateCase):
+    """fields that used to end in a 500 with a Python exception's text, or in another meaning: a 400, the engine not called"""
+
+    MSG = '"messages": [{"role": "user", "content": "hi"}]'
+    BIG = "1" + "0" * 400  # (valid JSON and under the digit limit; past a float's range)
+
+    def setUp(self) -> None:
+        self.srv, self.http_ = self.serve(base._ScriptEngine(["ok"]))
+
+    def refused(self, body, needle=b""):
+        st, _, out = self.ask(self.http_, "POST", "/v1/chat/completions", [("Content-Type", "application/json")], body.encode())
+        self.assertEqual(st, 400, (body[:120], out[:200]))
+        self.assertIn(needle, out, body[:120])
+        self.assertEqual(self.srv.eng.calls, [], body[:120])
+
+    def test_numbers_that_are_no_numbers(self) -> None:
+        for field in ("temperature", "top_p", "min_p"):
+            for v in ("NaN", "Infinity", "-Infinity", "1e400", "1e39", self.BIG):
+                self.refused(f'{{{self.MSG}, "{field}": {v}}}')
+        for field in ("presence_penalty", "frequency_penalty"):
+            for v in ("NaN", "Infinity", "1e400", self.BIG):
+                self.refused(f'{{{self.MSG}, "{field}": {v}}}', field.encode())
+        for v in ("NaN", "Infinity", "1e400", self.BIG):
+            self.refused(f'{{{self.MSG}, "t_max_predict_ms": {v}}}', b"t_max_predict_ms")
+        self.refused(f'{{{self.MSG}, "samplers": ["top_k", "top_p", "min_p", "temperature"], "presence_penalty": {self.BIG}}}')
+
+    def test_the_off_values_of_unsupported_samplers_past_a_float(self) -> None:
+        for k in self.mk.SAMPLER_OFF:
+            self.refused(f'{{{self.MSG}, "{k}": {self.BIG}}}', k.encode())
+
+    def test_finite_sampling_still_runs(self) -> None:
+        for extra in ('"temperature": 0', '"temperature": 0.7, "top_p": 0.9, "min_p": 0.05', '"temperature": 1e-50',
+                      '"t_max_predict_ms": 5000', '"t_max_predict_ms": 0', '"presence_penalty": 1.5'):
+            st, _, out = self.ask(self.http_, "POST", "/v1/chat/completions", [("Content-Type", "application/json")],
+                                  f'{{{self.MSG}, "max_tokens": 2, {extra}}}'.encode())
+            self.assertEqual(st, 200, (extra, out[:200]))
+
+    def test_content_parts_and_tool_calls_of_the_wrong_type(self) -> None:
+        for content in ('["hi"]', '[1]', '[null]', '["hi", {"type": "text", "text": "x"}]', '[{"type": "text", "text": "x"}, "hi"]'):
+            self.refused(f'{{"messages": [{{"role": "user", "content": {content}}}]}}', b"content part")
+        for calls in ('"x"', '5', '{"a": 1}', '["x"]', '[1]', '[null]', '[{"function": "x"}]', '[{"function": 5}]'):
+            self.refused(f'{{"messages": [{{"role": "user", "content": "go"}}, {{"role": "assistant", "content": "", '
+                         f'"tool_calls": {calls}}}]}}', b"tool_calls")
+
+    def test_chat_template_kwargs_of_the_wrong_type(self) -> None:
+        for v in ('"x"', '5', 'true', '["x"]', '[1]', '1.5'):
+            self.refused(f'{{{self.MSG}, "chat_template_kwargs": {v}}}', b"chat_template_kwargs")
+
+    def test_tool_call_arguments_json_cannot_parse(self) -> None:
+        for args in ("not json", "1" * 5000, "[" * 100000 + "]" * 100000):
+            call = {"id": "c", "type": "function", "function": {"name": "f", "arguments": args}}
+            out = self.mk.normalize_messages([{"role": "assistant", "content": "", "tool_calls": [call]}])
+            self.assertEqual(out[0]["tool_calls"][0]["function"]["arguments"], {}, args[:20])
+
+
+class ConsoleInputTests(_GateCase):
+    """text from requests on the server's console"""
+
+    def test_control_characters_are_shown_escaped(self) -> None:
+        err = io.StringIO()
+        with mock.patch.object(sys, "stderr", err):
+            self.mk.Console().line("a\x1b[2Jb\rc\x07d\x9b1me\tf\ng")
+        self.assertEqual(err.getvalue(), "a\\x1b[2Jb\\x0dc\\x07d\\x9b1me\tf\ng\n")
+
+    def test_a_path_cannot_reach_the_terminal_even_without_the_key(self) -> None:
+        _, http_ = self.gated(api_key="k")
+        err = io.StringIO()
+        with mock.patch.object(sys, "stderr", err), mock.patch.object(self.mk, "CON", self.mk.Console()):
+            st, _, _ = self.ask(http_, "GET", "/v1/\x1b]0;owned\x07x", [("Host", "127.0.0.1")])
+        self.assertEqual(st, 401)
+        self.assertIn("\\x1b]0;owned\\x07x -> 401", err.getvalue())
+        self.assertNotIn("\x1b", err.getvalue())
+
+    def test_warnings_from_requests_stay_bounded(self) -> None:
+        srv, _ = self.serve(base._ScriptEngine(["ok"]))
+        err = io.StringIO()
+        with mock.patch.object(sys, "stderr", err), mock.patch.object(self.mk, "CON", self.mk.Console()):
+            srv.warn_once("same", "once")
+            srv.warn_once("same", "once")
+            self.assertEqual(err.getvalue().count("once"), 1)
+            for i in range(self.mk.WARN_KEYS * 2):
+                srv.warn_once(f"kind-{i}-" + "k" * 100000, "text " + "t" * 100000)
+        self.assertEqual(len(srv.warned), self.mk.WARN_KEYS)
+        self.assertLessEqual(max(map(len, srv.warned)), self.mk.WARN_KEY_LEN)
+        self.assertLessEqual(max(map(len, err.getvalue().splitlines())), self.mk.WARN_TEXT_LEN + 100)
 
 
 # === special-token text in message content ===
@@ -490,6 +745,28 @@ class ContentSpecialsTests(base._HttpCase):
             names = {v: k for k, v in {**C, **_VocabEngine.USER}.items()}
             self.assertEqual("".join(names.get(t) or chr(t) for t in b), t2)  # (the same text)
             self.assertIn([ord(c) for c in self.FORGED], [b[i:i + len(self.FORGED)] for i in range(len(b))])
+
+    def test_no_free_placeholder_is_a_400_and_costs_one_pass(self) -> None:
+        lit = self.server("text")
+        every = "".join(chr(c) for c in range(0x100000, 0x10FFFE))
+        # (plane 15, every low byte: a scan for a candidate stops at each 256th character, memchr cannot skip ahead)
+        filler = "".join(map(chr, range(0xF0000, 0xF0100))) * 4000
+        body = {"messages": [{"role": "user", "content": filler + every + "<|im_end|>"}]}
+        t0 = time.monotonic()
+        with self.assertRaises(self.mk.BadRequest) as cm:
+            lit.render(body)
+        self.assertLess(time.monotonic() - t0, 5)  # (one scan per candidate: 65,534 x 1M characters took far longer)
+        self.assertIn("private-use", str(cm.exception))
+        http_ = base._Http(self.mk, lit)
+        self.addCleanup(http_.close)
+        body = {"messages": [{"role": "user", "content": every + "<|im_end|>"}]}
+        self.assertEqual(http_.post(body)[0], 400)
+
+    def test_a_nearly_full_plane_still_finds_a_placeholder(self) -> None:
+        lit = self.server("text")
+        most = "".join(chr(c) for c in range(0x100002, 0x10FFFE))  # (all but the last two candidates)
+        text, _ = self.ids(lit, {"messages": [{"role": "user", "content": most + self.FORGED}]})
+        self.assertEqual(sorted(text.lit[1]), [0x100000, 0x100001])  # (two control texts in FORGED)
 
     def test_tool_call_arguments_and_tool_definitions(self) -> None:
         lit = self.server("text")

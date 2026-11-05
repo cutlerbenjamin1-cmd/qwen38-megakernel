@@ -45,7 +45,10 @@
 #   MK_MAX_BODY_MB, MK_MAX_IMAGES, MK_IMAGE_MAX_PIXELS, MK_MAX_VIDEO_FRAMES
 #                       request limits: body size (default 128 MB), images per request (32), pixels per image
 #                       (100,000,000; checked before decoding), video frames per request (256)
+#   MK_MAX_INFLIGHT_MB, MK_MAX_CONNECTIONS
+#                       request bodies in memory at once (default 256 MB), open connections (256): past them a 503
 #   MK_TIMEOUT_S        seconds a connection may make no progress before it closes (default 600, 0 = never)
+#   MK_REQUEST_TIMEOUT_S seconds a request may take to arrive before its connection closes (default 300, 0 = no limit)
 #   MK_PYTHON           Python with jinja2 (default python3)
 set -euo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"

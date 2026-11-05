@@ -25,7 +25,10 @@ reply after a pause starts at full speed.
 Limits (environment): MK_MAX_BODY_MB (request body, Content-Length or chunked, default 128), MK_MAX_IMAGES (images per
 request, default 32),
 MK_MAX_VIDEO_FRAMES (video frames per request, default 256), MK_TIMEOUT_S (a connection that sends and takes nothing
-for this long is closed, default 600, 0 = never); --api-key / MK_API_KEY requires that key on every request but /health;
+for this long is closed, default 600, 0 = never), MK_REQUEST_TIMEOUT_S (a request must arrive within this long of its
+first byte, default 300, 0 = no limit), MK_MAX_INFLIGHT_MB (request bodies in memory at once, default 256: past it a
+503), MK_MAX_CONNECTIONS (open connections, default 256: past it a 503); --api-key / MK_API_KEY requires that key on
+every request but /health;
 the image library refuses images over MK_IMAGE_MAX_PIXELS (default 100,000,000) before decoding them. A request
 whose client disconnects stops at the next prefill chunk (2048 tokens) or engine cycle. A connection the server closes
 while the client is still sending (an early 4xx for a body it does not read) is half-closed and drained first (bounded),
@@ -41,9 +44,11 @@ import ctypes
 import errno
 import hashlib
 import hmac
+import io
 import ipaddress
 import itertools
 import json
+import math
 import os
 import queue
 import random
@@ -72,6 +77,11 @@ TOPK_MAX = 32
 DEF_TEMP, DEF_TOP_P, DEF_TOP_K, DEF_MIN_P = 1.0, 0.95, 20, 0.0
 # request limits; main() reads them from the environment
 MAX_BODY_MB = 128  # MK_MAX_BODY_MB: request body (several screenshots as base64 data: URLs fit)
+MAX_INFLIGHT_MB = 256  # MK_MAX_INFLIGHT_MB: request bodies in memory at once, all connections (at least MK_MAX_BODY_MB)
+MAX_CONNECTIONS = 256  # MK_MAX_CONNECTIONS: open connections (each holds a thread)
+REQUEST_TIMEOUT_S = 300  # MK_REQUEST_TIMEOUT_S: a request's headers and body arrive within this long of its first byte
+FLT_MAX = 3.4028234663852886e38  # (the engine takes sampling values as fp32)
+WARN_KEYS, WARN_KEY_LEN, WARN_TEXT_LEN = 256, 128, 2000  # warn_once: its keys and texts can come from a request
 MAX_IMAGES = 32  # MK_MAX_IMAGES: images per request
 MAX_STOP, MAX_STOP_LEN = 64, 1024  # stop strings per request, characters per stop string
 MAX_VIDEO_FRAMES = 256  # MK_MAX_VIDEO_FRAMES: video frames per request (all of its videos; 64 s at 4 fps)
@@ -84,6 +94,10 @@ VIDEO_TS_MS = 5000  # llama.cpp's video timestamp interval (mtmd_helper_video_in
 LINGER_S, LINGER_IDLE_S, LINGER_BYTES = 30.0, 5.0, 1 << 30
 # the engine and encoder libraries next to the repo root: qwen38mk.dll / qwen38vision.dll on Windows
 LIB_MK, LIB_VISION = ("qwen38mk.dll", "qwen38vision.dll") if os.name == "nt" else ("libqwen38mk.so", "libqwen38vision.so")
+
+
+# control characters in a log line (a request's path or fields reach the console): shown escaped, but for tab and newline
+LOG_CONTROL = re.compile("[\x00-\x08\x0b-\x1f\x7f-\x9f]")
 
 
 class Console:
@@ -123,7 +137,7 @@ class Console:
             live = self.tty()
             if live:
                 self._erase(s)
-            s.write(text + "\n")
+            s.write(LOG_CONTROL.sub(lambda m: f"\\x{ord(m.group()):02x}", text) + "\n")
             if live:
                 self._draw(s)
             s.flush()
@@ -1116,6 +1130,15 @@ class Prompt(str):
     lit = None
 
 
+def free_private_use(text):
+    """the plane 16 private-use characters text does not contain, highest first; nothing is scanned before the first one
+    is asked for, and then text once (a text holding them all must not cost one scan per candidate)"""
+    used = set(text)
+    for c in range(0x10FFFD, 0xFFFFF, -1):
+        if chr(c) not in used:
+            yield chr(c)
+
+
 class LiteralTemplate:
     """the chat template, rendering special-token text inside the request's messages and tools as text (--content-specials
     text). render() renders the request as it is (the prompt text is unchanged: /apply-template, token counts), and when
@@ -1134,11 +1157,15 @@ class LiteralTemplate:
     def render(self, **ctx):
         text = self.template.render(**ctx)
         found = {}  # control text -> its placeholder
-        free = (chr(c) for c in range(0x10FFFD, 0xFFFFF, -1) if chr(c) not in text)  # (plane 16: private use)
+        free = free_private_use(text)
 
         def place(m):
             if m.group() not in found:
-                found[m.group()] = next(free)
+                p = next(free, None)
+                if p is None:
+                    raise BadRequest("the request's content has special-token text and uses every private-use character "
+                                     "of plane 16, so that text cannot be marked as text")
+                found[m.group()] = p
             return found[m.group()]
 
         def mark(x):
@@ -1211,10 +1238,12 @@ def normalize_messages(messages, media=None):
         content = m.get("content")
         if isinstance(content, list):
             for part in content:
-                if isinstance(part, dict) and part.get("type") not in (None, "text", "image_url", *VIDEO_PARTS):
+                if not isinstance(part, dict):
+                    raise BadRequest("messages: each content part must be an object")
+                if part.get("type") not in (None, "text", "image_url", *VIDEO_PARTS):
                     raise BadRequest(f"unsupported content part type {part.get('type')!r} (text, image_url, "
                                      f"input_video and video_url only)")
-            kinds = {p.get("type") for p in content if isinstance(p, dict)}
+            kinds = {p.get("type") for p in content}
             if kinds & {"image_url", *VIDEO_PARTS}:
                 if media is None:
                     what = "image" if "image_url" in kinds else "video"
@@ -1240,14 +1269,18 @@ def normalize_messages(messages, media=None):
             m["content"] = ""
         if m.get("role") == "assistant" and m.get("tool_calls"):
             calls = []
+            if not isinstance(m["tool_calls"], list):
+                raise BadRequest("messages: tool_calls must be an array")
             for tc in m["tool_calls"]:
+                if not isinstance(tc, dict) or not isinstance(tc.get("function") or {}, dict):
+                    raise BadRequest("messages: each of tool_calls must be an object, with an object as its function")
                 tc = dict(tc)
                 fn = dict(tc.get("function") or {})
                 args = fn.get("arguments")
                 if isinstance(args, str):
                     try:
                         args = json.loads(args) if args.strip() else {}
-                    except json.JSONDecodeError:
+                    except (ValueError, RecursionError):  # (not JSON, an integer past the digit limit, nested too deep)
                         args = {}
                 fn["arguments"] = args if isinstance(args, dict) else {}
                 tc["function"] = fn
@@ -1475,9 +1508,17 @@ def _off(limit, above=False):
             return True
         try:
             return float(v) >= limit if above else float(v) <= limit
-        except (TypeError, ValueError):
+        except (TypeError, ValueError, OverflowError):
             return False
     return ok
+
+
+def finite(x):
+    """the number x is finite as a float (an integer past a float's range is not)"""
+    try:
+        return math.isfinite(x)
+    except OverflowError:
+        return False
 
 
 # llama.cpp sampler fields the engine does not have (it samples with temperature, top_k, top_p, min_p and the presence /
@@ -1562,12 +1603,12 @@ def check_params(body):
     if body.get("n_indent") not in (None, 0):
         bad("n_indent", "not supported (llama-server's infill option: it ends a reply on indentation)")
     t = body.get("t_max_predict_ms")
-    if t is not None and (isinstance(t, bool) or not isinstance(t, (int, float)) or t != t):
+    if t is not None and (isinstance(t, bool) or not isinstance(t, (int, float)) or not finite(t)):
         bad("t_max_predict_ms", "a number of milliseconds (<= 0: no limit)")
     if body.get("samplers") is not None:
         try:
             pen = any(float(body.get(k) or 0) for k in ("presence_penalty", "frequency_penalty"))
-        except (TypeError, ValueError):
+        except (TypeError, ValueError, OverflowError):
             pen = False  # (sampling() refuses it)
         check_samplers(body["samplers"], pen)
     if body.get("logprobs") or body.get("top_logprobs") not in (None, 0):
@@ -3133,9 +3174,11 @@ class Server:
             f"{args.video_max_tokens or args.image_max_tokens or 'the default'} tokens, {MAX_VIDEO_FRAMES} frames per request")
 
     def warn_once(self, key, msg):
-        if key not in self.warned:
+        """a console warning, once per key; bounded, as a request's fields can be in the key and the text"""
+        key = key[:WARN_KEY_LEN]
+        if key not in self.warned and len(self.warned) < WARN_KEYS:
             self.warned.add(key)
-            log("warning:", msg)
+            log("warning:", msg[:WARN_TEXT_LEN])
 
     # ---- reporting: /props, /v1/models, /slots, /metrics ----
     METRICS = ("requests", "requests_bad", "requests_failed", "requests_cancelled", "deferred", "prompt_tokens",
@@ -3204,7 +3247,9 @@ class Server:
                 "mmproj": os.path.basename(str(g(a, "mmproj", ""))), "backend": g(v, "backend"),
                 "threads": g(v, "n_threads"), "image_min_tokens": g(a, "image_min_tokens"),
                 "image_max_tokens": g(a, "image_max_tokens"), "image_cache": g(v, "cache_max")},
-            "limits": {"max_body_mb": MAX_BODY_MB, "max_images": MAX_IMAGES, "max_stop": MAX_STOP,
+            "limits": {"max_body_mb": MAX_BODY_MB, "max_inflight_mb": MAX_INFLIGHT_MB,
+                       "max_connections": MAX_CONNECTIONS, "request_timeout_s": REQUEST_TIMEOUT_S,
+                       "max_images": MAX_IMAGES, "max_stop": MAX_STOP,
                        "image_max_pixels": int(os.environ.get("MK_IMAGE_MAX_PIXELS") or 100_000_000)},
             "env": {k: "(set)" if k == "MK_API_KEY" and val else val  # (not the key: /props ends up in bug reports)
                     for k, val in sorted(os.environ.items()) if k.startswith("MK_")},
@@ -3298,7 +3343,10 @@ class Server:
 
     def render(self, body):
         """(prompt text, thinking, image file bytes in prompt order: one MEDIA_MARKER in the text each)"""
-        kw = dict(body.get("chat_template_kwargs") or {})
+        kw = body.get("chat_template_kwargs") or {}
+        if not isinstance(kw, dict):
+            raise BadRequest("chat_template_kwargs must be an object")
+        kw = dict(kw)
         eff = body.get("reasoning_effort")  # (OpenAI's top-level field; chat_template_kwargs win)
         if isinstance(eff, str) and eff:
             if eff == "none":  # (as llama-server)
@@ -3629,6 +3677,8 @@ class Server:
             seed = random.getrandbits(63) if seed is None or int(seed) < 0 else int(seed)
         except (TypeError, ValueError, OverflowError):
             raise BadRequest("temperature, top_p, top_k, min_p and seed must be numbers")
+        if not all(abs(v) <= FLT_MAX for v in (temp, top_p, min_p)):  # (NaN would run as greedy, inf at its own meaning)
+            raise BadRequest("temperature, top_p and min_p must be finite numbers")
         if top_k <= 0:
             top_k = TOPK_MAX
         elif top_k > TOPK_MAX:
@@ -3639,7 +3689,7 @@ class Server:
         for k in ("presence_penalty", "frequency_penalty"):
             try:
                 v = float(body.get(k) or 0)
-            except (TypeError, ValueError):
+            except (TypeError, ValueError, OverflowError):
                 raise BadRequest(f"{k} must be a number")
             if not -2.0 <= v <= 2.0:
                 raise BadRequest(f"{k} must be in [-2, 2]")
@@ -4142,6 +4192,80 @@ class Gate:
         return auth is not None and p[2] is not None and p[1] == auth[0] and p[2] == (auth[1] or 80)
 
 
+def exposure_warning(host, api_key):
+    """the startup warning for a listener other machines may reach with no API key; None when it is not one"""
+    name = host.lower().rstrip(".").strip("[]")
+    if api_key or name == "localhost":
+        return None
+    try:
+        if ipaddress.ip_address(name).is_loopback:
+            return None
+    except ValueError:
+        pass
+    return (f"listening on {host} with no API key: anyone who can reach this port can use the model and read its "
+            "replies. Set --api-key / MK_API_KEY, or listen on 127.0.0.1 only")
+
+
+class BodyBudget:
+    """the bytes of request bodies in memory, over all connections (MK_MAX_INFLIGHT_MB): a body counts as it arrives, not
+    by the size it declares, until its request ends. It bounds the JSON parsed from them too (24 times the bytes at
+    worst, measured: [[],[],...])"""
+
+    def __init__(self, cap):
+        self.cap, self.used, self.lock = cap, 0, threading.Lock()
+
+    def charge(self, n):
+        """True if n more bytes fit; they count from now"""
+        with self.lock:
+            if self.used + n > self.cap:
+                return False
+            self.used += n
+            return True
+
+    def release(self, n):
+        with self.lock:
+            self.used -= n
+
+
+class RequestReader(io.RawIOBase):
+    """a connection's reads, under the handler's rfile. MK_TIMEOUT_S limits each read, which a client sending a byte at a
+    time never hits; this limits the whole arrival too: from a request's first byte until done(), at most `limit` seconds
+    (0: no limit). Past it a TimeoutError, on which BaseHTTPRequestHandler closes the connection."""
+
+    def __init__(self, sock, limit):
+        self.sock, self.raw, self.limit = sock, sock.makefile("rb", 0), limit
+        self.idle, self.deadline = sock.gettimeout(), None
+
+    def readable(self):
+        return True
+
+    def readinto(self, b):
+        try:
+            if self.deadline is not None:
+                left = self.deadline - time.monotonic()
+                if left <= 0:
+                    raise TimeoutError("the request's deadline")
+                self.sock.settimeout(left if self.idle is None else min(left, self.idle))
+            n = self.raw.readinto(b)
+        except TimeoutError:
+            if self.deadline is not None:  # (not an idle keep-alive connection: that is routine)
+                log("a request stalled or took too long to arrive (MK_TIMEOUT_S, MK_REQUEST_TIMEOUT_S): closing it")
+            raise
+        if n and self.limit and self.deadline is None:
+            self.deadline = time.monotonic() + self.limit
+        return n
+
+    def done(self):
+        """the request has arrived: the answer's writes and the next read have the plain timeout again"""
+        if self.deadline is not None:
+            self.deadline = None
+            self.sock.settimeout(self.idle)
+
+    def close(self):
+        self.raw.close()
+        super().close()
+
+
 class GatedHandler(BaseHTTPRequestHandler):
     """the handlers' base: the server's Gate decides on each request before it is handled (and before a 100 Continue);
     a refused one gets a 403 and the connection closes (its body is not read). An admitted browser origin gets
@@ -4158,10 +4282,17 @@ class GatedHandler(BaseHTTPRequestHandler):
     def log_message(self, *a):
         pass
 
+    def setup(self):
+        super().setup()
+        self.rfile.close()
+        self.reader = RequestReader(self.connection, REQUEST_TIMEOUT_S)
+        self.rfile = io.BufferedReader(self.reader)
+
     def handle_one_request(self):
         self.cors = self.admitted = None
         self.unread = False
         super().handle_one_request()
+        self.reader.done()
 
     def parse_request(self):
         if not (super().parse_request() and self.admit()):
@@ -4169,6 +4300,8 @@ class GatedHandler(BaseHTTPRequestHandler):
         cl = [v.strip() for v in self.headers.get_all("Content-Length") or []]  # (each one: "0" then "80" is a body)
         self.unread = self.command not in self.BODY_METHODS and bool(self.headers.get_all("Transfer-Encoding")
                                                                       or any(v != "0" for v in cl))
+        if self.command not in self.BODY_METHODS:
+            self.reader.done()
         return True
 
     def admit(self):
@@ -4237,12 +4370,14 @@ def make_handler(srv):
             except (OSError, ValueError):
                 return True
 
-        def _json(self, code, obj, close=False):
+        def _json(self, code, obj, close=False, headers=()):
             """close: then close the connection (a request body that was not read must not be taken for the next request)"""
             data = json.dumps(obj).encode()
             self.send_response(code)
             self.send_header("Content-Type", "application/json")
             self.send_header("Content-Length", str(len(data)))
+            for k, v in headers:
+                self.send_header(k, v)
             if close:
                 self.send_header("Connection", "close")
                 self.close_connection = True
@@ -4271,18 +4406,38 @@ def make_handler(srv):
             return n, None
 
         CHUNK_LINE, TRAILER_LINES = 4096, 64  # (a chunk-size line with its extensions; trailer field lines)
+        READ_PIECE = 1 << 20  # (a body is read and charged to the server's budget in pieces of this size)
+
+        def _refuse(self, code, msg, kind="invalid_request_error", headers=()):
+            """answers a request whose body is not read (further) and closes the connection"""
+            log(f"{self.command} {self.path.split('?')[0]} -> {code}: {msg}")
+            self._json(code, {"error": {"code": code, "message": msg, "type": kind}}, close=True, headers=headers)
+
+        def _read_into(self, buf, n):
+            """n more bytes of the request's body into buf, charged to the server's budget as they arrive (do_POST
+            releases them). False: the client left mid-body, or the budget is full (answered with a 503)"""
+            while n > 0:
+                piece = min(n, self.READ_PIECE)
+                data = self.rfile.read(piece)
+                if len(data) < piece:  # (the client closed the connection mid-body)
+                    self.close_connection = True
+                    return False
+                if not self.server.bodies.charge(piece):
+                    self._refuse(503, f"the server holds {self.server.bodies.cap >> 20} MB of request bodies at once "
+                                      "(MK_MAX_INFLIGHT_MB): try again later", "unavailable_error",
+                                 [("Retry-After", "5")])
+                    return False
+                self.charged += piece
+                buf += data
+                n -= piece
+            return True
 
         def _read_chunked(self):
             """a Transfer-Encoding: chunked body (RFC 9112 7.1), decoded into a buffer of at most MK_MAX_BODY_MB (413 as
             soon as a chunk would pass it); a malformed size line (not hex, over 16 digits, no CRLF), data without its
             CRLF or a malformed trailer section is a 400; trailers are read and dropped. Both close the connection (the
             lingering close drains what the client still sends). None: answered, or the client left mid-body"""
-            cap, buf = MAX_BODY_MB << 20, bytearray()
-
-            def refuse(code, msg):
-                log(f"{self.command} {self.path.split('?')[0]} -> {code}: {msg}")
-                self._json(code, {"error": {"code": code, "message": msg, "type": "invalid_request_error"}}, close=True)
-
+            cap, buf, refuse = MAX_BODY_MB << 20, bytearray(), self._refuse
             while True:
                 line = self.rfile.readline(self.CHUNK_LINE + 1)
                 if not line:  # (the client closed the connection mid-body)
@@ -4298,11 +4453,8 @@ def make_handler(srv):
                     break
                 if len(buf) + n > cap:
                     return refuse(413, f"chunked request body over the limit of {MAX_BODY_MB} MB (MK_MAX_BODY_MB)")
-                data = self.rfile.read(n)
-                if len(data) < n:
-                    self.close_connection = True
+                if not self._read_into(buf, n):
                     return None
-                buf += data
                 end = self.rfile.read(2)
                 if end != b"\r\n":
                     if len(end) < 2:
@@ -4312,7 +4464,7 @@ def make_handler(srv):
             for _ in range(self.TRAILER_LINES + 1):  # (trailer fields: dropped)
                 line = self.rfile.readline(self.CHUNK_LINE + 1)
                 if line == b"\r\n":
-                    return bytes(buf)
+                    return buf
                 if not line:
                     self.close_connection = True
                     return None
@@ -4324,9 +4476,7 @@ def make_handler(srv):
             """answers an unacceptable request body (_body_length) without reading it; True if it did"""
             refused = self._body_length()[1]
             if refused:
-                log(f"{self.command} {self.path.split('?')[0]} -> {refused[0]}: {refused[1]}")
-                self._json(refused[0], {"error": {"code": refused[0], "message": refused[1], "type": "invalid_request_error"}},
-                           close=True)
+                self._refuse(*refused)
             return bool(refused)
 
         def handle_expect_100(self):
@@ -4365,6 +4515,13 @@ def make_handler(srv):
                 self._error(404, "not found")
 
         def do_POST(self):
+            self.charged = 0
+            try:
+                self._post()
+            finally:  # (the body and what was parsed from it are gone with the request)
+                self.server.bodies.release(self.charged)
+
+        def _post(self):
             path = self.path.split("?")[0]
             if self._refuse_body():
                 return
@@ -4374,10 +4531,10 @@ def make_handler(srv):
                 if raw is None:  # (refused, or the client left)
                     return
             else:
-                raw = self.rfile.read(n) if n else b""
-                if len(raw) < n:  # (the client closed the connection mid-body)
-                    self.close_connection = True
+                raw = bytearray()
+                if not self._read_into(raw, n):
                     return
+            self.reader.done()
             route = POST_ROUTES.get(path)
             # (errors in Anthropic's shape on /v1/messages, OpenAI's on /v1/responses: _error)
             anth = "responses" if path.startswith(("/v1/responses", "/responses")) else path.startswith("/v1/messages")
@@ -4387,7 +4544,7 @@ def make_handler(srv):
                 return
             try:
                 body = json.loads(raw or b"{}")
-            except (json.JSONDecodeError, UnicodeDecodeError, RecursionError):  # (RecursionError: nested too deep)
+            except (ValueError, RecursionError):  # (not JSON or UTF-8, an integer past the digit limit, nested too deep)
                 body = None
             if not isinstance(body, dict):
                 self._error(400, "the request body must be a JSON object", anth)
@@ -4985,6 +5142,42 @@ class HTTPServer(ThreadingHTTPServer):
     client is not reset in the middle of its upload and gets the answer (the reason) instead of a connection error."""
     daemon_threads = True
     gate = None  # the request Gate (main sets it; None: every request is answered)
+
+    def __init__(self, *a, **kw):
+        self.bodies = BodyBudget(max(MAX_INFLIGHT_MB, MAX_BODY_MB) << 20)
+        self.slots = threading.BoundedSemaphore(MAX_CONNECTIONS)
+        self.full_logged = 0.0
+        super().__init__(*a, **kw)
+
+    def process_request(self, request, client_address):
+        """a thread for the connection, or past MK_MAX_CONNECTIONS a 503 without one (this is the accept loop: nothing
+        here may wait, so no lingering close)"""
+        if self.slots.acquire(blocking=False):
+            try:
+                super().process_request(request, client_address)
+            except BaseException:
+                self.slots.release()
+                raise
+            return
+        if time.monotonic() - self.full_logged >= 60:
+            self.full_logged = time.monotonic()
+            log(f"the limit of {MAX_CONNECTIONS} connections is reached (MK_MAX_CONNECTIONS): new ones get a 503")
+        why = f"more than {MAX_CONNECTIONS} connections (MK_MAX_CONNECTIONS): try again later"
+        data = json.dumps({"error": {"code": 503, "message": why, "type": "unavailable_error"}}).encode()
+        try:
+            request.setblocking(False)
+            request.send(b"HTTP/1.1 503 Service Unavailable\r\nContent-Type: application/json\r\nRetry-After: 5\r\n"
+                         b"Connection: close\r\nContent-Length: %d\r\n\r\n%b" % (len(data), data))
+        except OSError:
+            pass
+        self.close_request(request)
+
+    def process_request_thread(self, request, client_address):
+        try:
+            super().process_request_thread(request, client_address)
+        finally:
+            self.slots.release()
+
     # Windows: SO_REUSEADDR (the base class's allow_reuse_address) lets a second server bind a port that is in use with
     # no error, and requests then reach either one; an exclusive bind makes the second one fail at startup instead.
     # (Linux: SO_REUSEADDR only allows a restart over connections in TIME_WAIT; a port in use still fails to bind.)
@@ -5087,7 +5280,8 @@ def gguf_text_limits(path):
 
 
 def main():
-    global MAX_BODY_MB, MAX_IMAGES, MAX_VIDEO_FRAMES, IMAGE_MAX_PIXELS, REASONING_MAX_BYTES
+    global MAX_BODY_MB, MAX_INFLIGHT_MB, MAX_CONNECTIONS, REQUEST_TIMEOUT_S
+    global MAX_IMAGES, MAX_VIDEO_FRAMES, IMAGE_MAX_PIXELS, REASONING_MAX_BYTES
     ap = argparse.ArgumentParser()
     ap.add_argument("-m", "--model", required=True)
     ap.add_argument("--host", default="127.0.0.1")
@@ -5254,7 +5448,10 @@ def main():
     except ValueError as e:
         ap.error(str(e))
     GatedHandler.timeout = env_int("MK_TIMEOUT_S", TIMEOUT_S, 0) or None  # (StreamRequestHandler applies it)
+    REQUEST_TIMEOUT_S = env_int("MK_REQUEST_TIMEOUT_S", REQUEST_TIMEOUT_S, 0)
     MAX_BODY_MB = env_int("MK_MAX_BODY_MB", MAX_BODY_MB)
+    MAX_INFLIGHT_MB = max(env_int("MK_MAX_INFLIGHT_MB", MAX_INFLIGHT_MB), MAX_BODY_MB)  # (a largest body always fits)
+    MAX_CONNECTIONS = env_int("MK_MAX_CONNECTIONS", MAX_CONNECTIONS)
     MAX_IMAGES = env_int("MK_MAX_IMAGES", MAX_IMAGES)
     MAX_VIDEO_FRAMES = env_int("MK_MAX_VIDEO_FRAMES", MAX_VIDEO_FRAMES)
     n_train, longest = gguf_text_limits(args.model)
@@ -5274,6 +5471,9 @@ def main():
         log(f"CORS: pages of {', '.join(sorted(gate.origins))} may call the server")
     if gate.api_key:
         log("API key: required on every request but /health")
+    exposed = exposure_warning(args.host, gate.api_key)
+    if exposed:
+        log("warning:", exposed)
     box = {}
 
     def load():

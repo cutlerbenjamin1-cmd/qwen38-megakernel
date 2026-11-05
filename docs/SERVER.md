@@ -91,7 +91,7 @@ what they do.
 | conversation cache | `--exact-reuse` (`MK_EXACT=1`), `--ck-every` [4096], `--ck-msgs` [1], `--ck-pin` [1], `--side-max` [8192] (`MK_SIDE_MAX`), `--park-mib` [8192] (`MK_PARK_MIB`), `--park-min` [1024], `--park-cks` [2]: [the conversation cache](#the-conversation-cache) |
 | templates and output | `--chat-template-file PATH`, `--chat-template TEMPLATE`, `--chat-template-kwargs JSON` (`MK_CHAT_TEMPLATE_KWARGS`), `--reasoning-format` [auto] (`MK_REASONING_FORMAT`), `--content-specials` [text] (`MK_CONTENT_SPECIALS`) |
 | images and video | `--mmproj FILE`, `--vision-lib`, `--vision-backend` [auto], `--vision-threads` [0: every logical CPU but two], `--image-min-tokens` / `--image-max-tokens` [0: the mmproj's], `--image-cache` [8], `--video-fps` [4], `--video-max-tokens` [0: the image limit], `--video-cache` [2], `--ffmpeg` (`MK_FFMPEG`) |
-| engine environment | `MK_CK_SLOTS` [8], `MK_KEEP_WARM_S` [120], `MK_STORE_CHUNK_MIB` [32], `MK_TIMEOUT_S` [600], `MK_MAX_BODY_MB` [128], `MK_MAX_IMAGES` [32], `MK_IMAGE_MAX_PIXELS` [100000000], `MK_MAX_VIDEO_FRAMES` [256] |
+| engine environment | `MK_CK_SLOTS` [8], `MK_KEEP_WARM_S` [120], `MK_STORE_CHUNK_MIB` [32], `MK_TIMEOUT_S` [600], `MK_REQUEST_TIMEOUT_S` [300], `MK_MAX_BODY_MB` [128], `MK_MAX_INFLIGHT_MB` [256], `MK_MAX_CONNECTIONS` [256], `MK_MAX_IMAGES` [32], `MK_IMAGE_MAX_PIXELS` [100000000], `MK_MAX_VIDEO_FRAMES` [256] |
 
 ## The conversation cache
 
@@ -890,7 +890,9 @@ is that a web page you happen to open cannot use it.
   carry the key, as `Authorization: Bearer KEY` (the OpenAI clients' `api_key`) or `x-api-key: KEY` (the Anthropic
   clients'); others get a 401 with `WWW-Authenticate: Bearer` (llama-server's error shape; Anthropic's on
   `/v1/messages`) before the body is read. Prefer the environment variable: an option shows in the process list. Over
-  plain HTTP the key crosses the network in clear text: beyond a trusted LAN, put a TLS reverse proxy in front.
+  plain HTTP the key crosses the network in clear text: beyond a trusted LAN, put a TLS reverse proxy in front. A server
+  listening on anything but a loopback address without a key says so in a warning at startup: anyone who can reach the
+  port can use the model and read its replies.
 
 - **Host names (DNS rebinding):** a request whose `Host` is not `localhost`, an IP address, the `--host` name or an
   `--allow-host` name (any port; repeatable or comma-separated, env `MK_ALLOW_HOSTS`) gets a 403 naming the option. A
@@ -942,7 +944,10 @@ Read from the environment at startup ([CONFIGURATION.md](CONFIGURATION.md)):
 | limit | default | answer |
 |---|---|---|
 | request body, `MK_MAX_BODY_MB` | 128 MB | 413, refused before the body is read (also on `Expect: 100-continue`) |
+| request bodies in memory at once, all connections, `MK_MAX_INFLIGHT_MB` | 256 MB (at least `MK_MAX_BODY_MB`) | 503 with `Retry-After`, and the connection closes |
 | a connection's read or write without progress, `MK_TIMEOUT_S` | 600 s (llama-server's `--timeout`; 0: none) | the connection closes: an idle keep-alive one, a stalled request, or a client that stopped reading a reply (a disconnect: the generation stops) |
+| a request's arrival, first byte to the last of its body, `MK_REQUEST_TIMEOUT_S` | 300 s (0: none) | the connection closes. A client sending a byte at a time never hits `MK_TIMEOUT_S`, but hits this; generating the reply does not count |
+| open connections, `MK_MAX_CONNECTIONS` | 256 | 503 with `Retry-After` as the connection is accepted, and it closes |
 | images per request, `MK_MAX_IMAGES` | 32 | 400 |
 | pixels per image or video frame, `MK_IMAGE_MAX_PIXELS` | 100,000,000 | 400, checked from the header before decoding |
 | video frames per request, `MK_MAX_VIDEO_FRAMES` | 256 (64 s at 4 fps) | 400 as soon as the frame past it is decoded |
@@ -954,6 +959,12 @@ Read from the environment at startup ([CONFIGURATION.md](CONFIGURATION.md)):
   dropped; a malformed size line (not hex, over 16 digits, no CRLF within 4,096 bytes), chunk data without its CRLF or
   more than 64 trailer lines is a 400 that closes the connection; another transfer coding is a 501, and a
   `Content-Length` next to it a 400. A refused upload still gets its answer (the server drains the rest, bounded).
+- **Bodies in memory:** a body counts as it arrives, not by the size it declares, until its request ends, queued or
+  running. Parsed JSON takes up to 24 times the bytes (`[[],[],...]`, measured; text about once), so the default keeps
+  all requests together under about 6 GB of Python objects; ten bodies of 128 MB at once would be 30 GB.
+- **What the connection limits are for:** they keep the process alive, they do not keep a port open to strangers usable.
+  The API key is checked once the headers have arrived, so anyone who can reach the port can hold connections up to
+  `MK_MAX_CONNECTIONS` until they time out.
 - **Why the pixel limit:** without it, a 446 KB PNG declaring 12000 x 12000 pixels took 39 s and
   0.9 GB of server memory (decode, then 4,096 tokens encoded); a 20000 x 20000 one asks stb_image for ~2.4 GB. For
   video, ffmpeg does not decode frames past the limit plus 8 Mpx (its `-max_pixels`; the slack covers its decoders' row
