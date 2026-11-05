@@ -348,6 +348,46 @@ int main(int argc, char ** argv) {
                100 * (t[1][t[1].size() / 2] / t[0][t[0].size() / 2] - 1), t[0][0] * 1e3 / tiles, t[1][0] * 1e3 / tiles, tiles, nch);
         return 0;
     }
+    if (!strcmp(argv[1], "stress")) { // stress <F|D|q8> <n> <T> <runs>: the new kernel over and over against one run of the old: races
+        const char * p = argv[2];
+        const int n = atoi(argv[3]), T = atoi(argv[4]), runs = atoi(argv[5]);
+        const int slot = T == 1 ? 16 : 0;
+        setup(n + 16);
+        const Fmt f = !strcmp(p, "F") ? F : !strcmp(p, "D") ? D : Q;
+        set_fmt(f);
+        const bool q8 = f.kb == 8 && f.vb == 8;
+        Out a, b;
+        run_one(false, f, q8, T, slot, n, 0, a);
+        long bad = 0;
+        for (int r = 0; r < runs; r++) {
+            if (getenv("KVB_STRESS_OLD")) run_one(false, f, q8, T, slot, n, 0, b);
+            else run_one(true, f, false, T, slot, n, 0, b);
+            size_t nd = 0, first = 0;
+            for (size_t i = 0; i < a.ap.size(); i++)
+                if (memcmp(&a.ap[i], &b.ap[i], 4)) {
+                    if (!nd) first = i;
+                    nd++;
+                }
+            const bool mlok = !memcmp(a.ml.data(), b.ml.data(), a.ml.size() * 8);
+            if (nd || !mlok) {
+                bad++;
+                if (bad <= 40) {
+                    long ndr = 0;
+                    std::vector<int> dims;
+                    const size_t irow = first / 256;
+                    for (int d = 0; d < 256; d++)
+                        if (memcmp(&a.ap[irow * 256 + d], &b.ap[irow * 256 + d], 4)) { ndr++; if (dims.size() < 8) dims.push_back(d); }
+                    printf("run %d: %zu floats differ, ml %s; first: item %zu row %zu dim %zu (%d dims in that row: %ld;", r, nd, mlok ? "same" : "DIFF", first / 256 / AR, irow % AR, first % 256, (int) dims.size(), ndr);
+                    for (int d : dims) printf(" %d", d);
+                    float x = a.ap[first], y = b.ap[first];
+                    printf(") old %g new %g\n", x, y);
+                    fflush(stdout);
+                }
+            }
+        }
+        printf("STRESS %s n %d T %d: %ld of %d runs differ\n", p, n, T, bad, runs);
+        return bad ? 1 : 0;
+    }
     const bool smoke = argc > 2 && !strcmp(argv[2], "smoke");
     setup(smoke ? 42000 : 258100);
     const std::vector<Fmt> fmts = smoke ? std::vector<Fmt>{F, D} : std::vector<Fmt>{F, D, {4, 4, 0, 2048, "44"}, {7, 6, 0, 0, "76"}, {8, 5, 0, 2048, "85"}, {5, 8, 1, 2048, "58"}, {6, 6, 1, 0, "66"}, {4, 7, 0, 2048, "47"}};

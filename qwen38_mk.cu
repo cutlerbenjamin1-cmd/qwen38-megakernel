@@ -3470,11 +3470,12 @@ __device__ __forceinline__ void attn_core_q8_t(const LayerW & W, int slot, int n
                 for (int k = 0; k < 4; k++) acc[i][j][k] = 0.f;
 
 #if MK_W48X
-        if constexpr (MIX) {
+        if constexpr (MIX) { // (a barrier: interval 0's first copy goes into K(0)'s stage)
             if (warp < 4) {
                 const int kbj = kbt(0);
                 aqx_conv(acc, kring + (8 * warp + g8) * KVQ_ROW, tig, kbj == 8 ? 0x8080u : 0u, aq_sub(kbj));
             }
+            __syncthreads();
         }
         for (int jt = 0; jt < ntl + 2; jt++) {
             // MIX: the two warp groups (one warp of each per SMSP), rC: this interval's converting group
@@ -4097,11 +4098,12 @@ __device__ __forceinline__ void attn_core_w48(const LayerW & W, int slot, int n,
                 for (int k = 0; k < 4; k++) acc[i][j][k] = 0.f;
 
 #if MK_W48X
-        if constexpr (MIX) {
+        if constexpr (MIX) { // (a barrier: interval 0's first copy goes into K(0)'s stage)
             if (warp < 4) {
                 const int kbj = kbt(0);
                 aqx_conv(acc, kring + (8 * warp + g8) * KVQ_ROW, tig, kbj == 8 ? 0x8080u : 0u, aq_sub(kbj));
             }
+            __syncthreads();
         }
         for (int jt = 0; jt < ntl + 2; jt++) {
             // MIX: the two warp groups of attn_core_q8_t, rC: this interval's converting group
