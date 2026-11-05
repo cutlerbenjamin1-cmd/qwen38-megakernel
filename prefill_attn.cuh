@@ -1248,9 +1248,13 @@ __device__ __forceinline__ void a9_cv(const uint8_t * st, __half * sV, int k, in
     }
     *reinterpret_cast<int4 *>(sV + p * A2_LD + 8 * c) = *reinterpret_cast<int4 *>(h);
 }
-// NR rows r0, r0 + 12, .. of a staged low-bit K tile -> int8 in place (kv_rows_expand<BITS> with every row present)
+// on != 0: stores 8 B (no branch)
+__device__ __forceinline__ void a9_st64p(unsigned on, unsigned addr, unsigned a, unsigned b) {
+    asm volatile("{\n.reg .pred p;\nsetp.ne.u32 p, %0, 0;\n@p st.shared.v2.b32 [%1], {%2, %3};\n}" ::"r"(on), "r"(addr), "r"(a), "r"(b) : "memory");
+}
+// NR rows r0, r0 + 12, .. of a staged low-bit K tile -> int8 in place (kv_rows_expand<BITS> with every row present); on = 0: no store
 template <int BITS, int NR>
-__device__ __forceinline__ void a9_k_rows(uint8_t * st, int r0) {
+__device__ __forceinline__ void a9_k_rows(uint8_t * st, int r0, unsigned on) {
     constexpr int HB = BITS - 4;
     const int lane = threadIdx.x & 31;
     unsigned wd[NR], hi[NR];
@@ -1274,7 +1278,7 @@ __device__ __forceinline__ void a9_k_rows(uint8_t * st, int r0) {
         constexpr unsigned bias = (1u << (BITS - 1)) * 0x01010101u;
         lo = ((lo | 0x80808080u) - bias) ^ 0x80808080u;
         hv = ((hv | 0x80808080u) - bias) ^ 0x80808080u;
-        *reinterpret_cast<uint2 *>(st + (r0 + 12 * k) * A8_KLD + 8 * lane) = make_uint2(lo, hv);
+        a9_st64p(on, (unsigned) __cvta_generic_to_shared(st + (r0 + 12 * k) * A8_KLD + 8 * lane), lo, hv);
     }
 }
 
@@ -1619,8 +1623,9 @@ __global__ void __launch_bounds__(A2_NT, 1) pk_attn9(int T, int n0, int slot, in
         // K(it + 1), V(it + 1) in the main format (their stage landed before this tile's barrier; a tile past it1 converts a stale stage
         // nobody reads) run during P V(it): the common part inside the P V loop's basic block, where ptxas overlaps it with the MMAs
         // (no format test: a branch inside it costs ~9%), the warp-specific part just before it. On a tile of another format the K
-        // writes go to the fp16 V buffer of tile it + 1, which the tail overwrites with the real conversion.
-        const unsigned stko = it + 1 < itm ? st_b : A8_NS * A8_STG + ((it + 1) & 1) * A2_K * A2_LD * 2;
+        // stores are predicated off and the V stores (each thread's own slots) are overwritten by the same thread in the tail, with
+        // the real conversion.
+        const unsigned kon = it + 1 < itm;
         const float * ksp = reinterpret_cast<const float *>(st + A8_KB) + 16 * hf + 2 * t4;
         // S for this warp's 16 positions: per 32-dim block two IMMAs (n8 tiles of positions 16 hf + 0..7, 8..15)
         float s[2][4];
@@ -1746,7 +1751,7 @@ __global__ void __launch_bounds__(A2_NT, 1) pk_attn9(int T, int n0, int slot, in
         if constexpr (A9_HK) {
             if (warp < 8) {
                 a9_cv<VB>(stv, sVc, 2, vbs);
-                if constexpr (KB != 0) a9_k_rows<KB, 1>(asm_ + stko, warp + 24);
+                if constexpr (KB != 0) a9_k_rows<KB, 1>(stv, warp + 24, kon);
             } else if (warp == 9 && it + 1 < itf) {
                 a9_ks(stv);
             }
@@ -1759,10 +1764,10 @@ __global__ void __launch_bounds__(A2_NT, 1) pk_attn9(int T, int n0, int slot, in
                 unsigned b[4], h0[2], h1[2];
                 if constexpr (A9_HK) {
                     if constexpr (KB != 0) {
-                        if (j == 0) a9_k_rows<KB, 2>(asm_ + stko, warp);
+                        if (j == 0) a9_k_rows<KB, 2>(stv, warp, kon);
                     }
-                    if (j == 2) a9_cv<VB>(stv, sVc, 0, vbs);
-                    if (j == 5) a9_cv<VB>(stv, sVc, 1, vbs);
+                    if (j == 3) a9_cv<VB>(stv, sVc, 0, vbs);
+                    if (j == 6) a9_cv<VB>(stv, sVc, 1, vbs);
                 }
                 a2_ldsm_t(b, va + 32 * j);
                 pf::hmma16z(h0, A0, b[0], b[1]);
