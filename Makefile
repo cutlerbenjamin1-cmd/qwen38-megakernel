@@ -121,7 +121,11 @@ bench/wvgemm_bench: bench/wvgemm_bench.cu bench/wv_ref.cuh
 bench/dattn_bench: bench/dattn_bench.cu
 	$(NVCC) -O3 -std=c++17 -arch=$(ARCH) -Xptxas -dlcm=cg $< -o $@
 
-# mmq_bench # attn_bench: pk_attn9 (prefill_attn.cuh, the engine's own kernels) bit for bit against pk_attn8 on random data in the engine's KV layouts, past the q8 window
+# mmq_bench check: the prefill GEMM kernels (prefill_gemm.cuh) against a scalar reference on the engine's layouts
+bench/mmq_bench: bench/mmq_bench.cu prefill_gemm.cuh mk_shared.cuh mk_launch.h wv_host.cuh
+	$(NVCC) -O3 -std=c++17 -arch=$(ARCH) -lineinfo -Xptxas=-dlcm=cg -Ibench/stub $(MMQFLAGS) $< -o $@
+
+# attn_bench: pk_attn9 (prefill_attn.cuh, the engine's own kernels) bit for bit against pk_attn8 on random data in the engine's KV layouts, past the q8 window
 bench/attn_bench: bench/attn_bench.cu prefill_attn.cuh mk_shared.cuh
 	$(NVCC) -O3 -std=c++17 -arch=$(ARCH) -lineinfo -Xptxas=-dlcm=cg -Ibench/stub $< -o $@
 
