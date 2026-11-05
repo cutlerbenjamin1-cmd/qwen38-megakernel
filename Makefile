@@ -121,8 +121,13 @@ bench/wvgemm_bench: bench/wvgemm_bench.cu bench/wv_ref.cuh
 bench/dattn_bench: bench/dattn_bench.cu
 	$(NVCC) -O3 -std=c++17 -arch=$(ARCH) -Xptxas -dlcm=cg $< -o $@
 
-check: bench/wvgemm_bench bench/dattn_bench
+# mmq_bench check: the prefill GEMM kernels (prefill_gemm.cuh) against a scalar reference on the engine's layouts
+bench/mmq_bench: bench/mmq_bench.cu prefill_gemm.cuh mk_shared.cuh mk_launch.h wv_host.cuh
+	$(NVCC) -O3 -std=c++17 -arch=$(ARCH) -lineinfo -Xptxas=-dlcm=cg -Ibench/stub $(MMQFLAGS) $< -o $@
+
+check: bench/wvgemm_bench bench/dattn_bench bench/mmq_bench
 	bench/wvgemm_bench check
+	bench/mmq_bench check
 	TINV=1 bench/dattn_bench 4096 4 3 0 1 2
 	TINV=1 bench/dattn_bench 101600 5 3 0 1 2
 
@@ -133,6 +138,6 @@ gate: qwen38_mk libqwen38mk.so
 
 clean:
 	rm -f qwen38_mk libqwen38mk.so qwen38_mk.o $(HOST_OBJ) qwen38_mk.o.d $(HOST_OBJ:=.d) ptxas.log tools/vocab_freq tools/llama_ref libqwen38vision.so tools/mkv_cli tools/vision_ref tools/vit_check vision/vit_cpu.o tests/gguf_fuzz \
-		bench/wvgemm_bench bench/dattn_bench
+		bench/wvgemm_bench bench/dattn_bench bench/mmq_bench
 
 .PHONY: all vision clean exactness check gate FORCE
