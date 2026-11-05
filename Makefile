@@ -121,10 +121,17 @@ bench/wvgemm_bench: bench/wvgemm_bench.cu bench/wv_ref.cuh
 bench/dattn_bench: bench/dattn_bench.cu
 	$(NVCC) -O3 -std=c++17 -arch=$(ARCH) -Xptxas -dlcm=cg $< -o $@
 
-check: bench/wvgemm_bench bench/dattn_bench
+# attn_bench: pk_attn9 (prefill_attn.cuh, the engine's own kernels) bit for bit against pk_attn8 on random data in the engine's KV layouts, past the q8 window
+bench/attn_bench: bench/attn_bench.cu prefill_attn.cuh mk_shared.cuh
+	$(NVCC) -O3 -std=c++17 -arch=$(ARCH) -lineinfo -Xptxas=-dlcm=cg -Ibench/stub $< -o $@
+
+check: bench/wvgemm_bench bench/dattn_bench bench/attn_bench
 	bench/wvgemm_bench check
 	TINV=1 bench/dattn_bench 4096 4 3 0 1 2
 	TINV=1 bench/dattn_bench 101600 5 3 0 1 2
+	for f in F D q8 Vl any45; do bench/attn_bench $$f 16384 0 1024:0 17:2040 777:2047 1024:2600 1024:6000 || exit 1; done
+	EXA=1 bench/attn_bench F 16384 0 1024:6000
+	EXA=2 bench/attn_bench D 16384 0 1024:6000
 
 # every GPU check of a build in one run (scripts/gate.sh; the GPU to itself, ~16 min on an RTX 3090):
 #   make gate MK_MODEL=<gguf> GATE_ARGS="--record DIR"   (a reference)   or   GATE_ARGS="--ref DIR"
@@ -133,6 +140,6 @@ gate: qwen38_mk libqwen38mk.so
 
 clean:
 	rm -f qwen38_mk libqwen38mk.so qwen38_mk.o $(HOST_OBJ) qwen38_mk.o.d $(HOST_OBJ:=.d) ptxas.log tools/vocab_freq tools/llama_ref libqwen38vision.so tools/mkv_cli tools/vision_ref tools/vit_check vision/vit_cpu.o tests/gguf_fuzz \
-		bench/wvgemm_bench bench/dattn_bench
+		bench/wvgemm_bench bench/dattn_bench bench/attn_bench
 
 .PHONY: all vision clean exactness check gate FORCE

@@ -122,8 +122,9 @@ void MKEngine::Impl::pf_init() {
     }
     // MK_PFX (bits; a set bit keeps the old path): 1 pf_fork off, 2 pk_dn_scan (no pk_dn_tri / pk_dn_scan4), 4 pk_ab
     // after the DN in-projection join (not before it), 8 attention k on pf_s2 and v on pf_s3 next to q (not k then q on
-    // stream 0, v on pf_s2), 16 pk_ab (not pk_ab2)
+    // stream 0, v on pf_s2), 16 pk_ab (not pk_ab2), 64 pk_attn8 (not pk_attn9)
     if (const char * e = getenv("MK_PFX")) pfx_bits = atoi(e);
+    mkl::pk_attn_old = pfx_bits & 64 ? 1 : 0;
     pf_fork = !(pfx_bits & 1);
 #if MK_PF_INFCHK
     pf_fork = false; // (chk_set's site / layer are stream-ordered on stream 0)
@@ -221,6 +222,7 @@ void MKEngine::Impl::attn(int T, int n, int slot, int r0) {
             mkl::pk_attn8<false, true, true, 5, 5>(grid, T, n, slot, p.nfull, p.S, pt.first, r0, ex_segt, p.h, pt.second, p.nA);
         else if (hb.kvb[0][slot] != 8)
             mkl::pk_attn8<false, true, true>(grid, T, n, slot, p.nfull, p.S, pt.first, r0, ex_segt, p.h, pt.second, p.nA);
+        else if (hb.kvb[1][slot] == 8) mkl::pk_attn8<false, false, true, 0, 8>(grid, T, n, slot, p.nfull, p.S, pt.first, r0, ex_segt, p.h, pt.second, p.nA);
         else mkl::pk_attn8<false, false, true>(grid, T, n, slot, p.nfull, p.S, pt.first, r0, ex_segt, p.h, pt.second, p.nA);
         if (N > p.nfull) mkl::pk_attn8_combx(N - p.nfull, T, n, p.nfull, p.S, ex_segt, p.h, r0, pt.first, pt.second, p.nA);
         return;
@@ -243,6 +245,7 @@ void MKEngine::Impl::attn(int T, int n, int slot, int r0) {
             if (kv_k6v5(slot)) mkl::pk_attn8<false, true, false, 6, 5>(grid, T, n, slot, nfull, S, hp.y1, r0);
             else if (kv_k5v5(slot)) mkl::pk_attn8<false, true, false, 5, 5>(grid, T, n, slot, nfull, S, hp.y1, r0);
             else if (kl) mkl::pk_attn8<false, true>(grid, T, n, slot, nfull, S, hp.y1, r0);
+            else if (hb.kvb[1][slot] == 8) mkl::pk_attn8<false, false, false, 0, 8>(grid, T, n, slot, nfull, S, hp.y1, r0);
             else mkl::pk_attn8<false, false>(grid, T, n, slot, nfull, S, hp.y1, r0);
         } else if (s8 && attn_s8 == 2) {
             if (kl) mkl::pk_attn8<true, true>(grid, T, n, slot, nfull, S, hp.y1, r0);

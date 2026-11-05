@@ -397,7 +397,7 @@ No gates: `depth=0,drop=0,stop=0,chain=0,h1=0` (adaptive depth, top-1 drafts), t
 | `MK_PF_SYNC` | `0` | `1`: wait for each prefill chunk before queuing the next (the original flow; GPU idle per prefill at 38k 11.8 ms vs 0.19 ms on native Windows, no measurable change in prefill time) | same | earlier path |
 | `MK_K8` | `6` | prefill small kernels, bits: `2` pk_norm_quant reads its input once, `4` pk_dn_prep handles `MK_K8_NT` tokens per block (each -27..-29% in isolation, no measurable prefill change), `1` pk_ab on a second stream (opt-in, not measured) | same | served (`6`) |
 | `MK_K8_NT` | `4` | tokens per block for `MK_K8` bit 4: 4 or 8 (8 was slower) | same | option |
-| `MK_PFX` | `0` | prefill launch order and kernels, bits (a set bit keeps the earlier path): `1` no side streams for a layer's independent GEMMs (the delta-net gate next to qkv, attention k / v next to q), `2` the delta-net scan without the `pk_dn_tri` pre-pass of its state-independent chunk matrices, `4` `pk_ab` after the in-projection join, `8` attention k and v both on side streams, `16` `pk_ab` instead of `pk_ab2` (the same values in fewer shared-memory loads) | same | earlier path |
+| `MK_PFX` | `0` | prefill launch order and kernels, bits (a set bit keeps the earlier path): `1` no side streams for a layer's independent GEMMs (the delta-net gate next to qkv, attention k / v next to q), `2` the delta-net scan without the `pk_dn_tri` pre-pass of its state-independent chunk matrices, `4` `pk_ab` after the in-projection join, `8` attention k and v both on side streams, `16` `pk_ab` instead of `pk_ab2` (the same values in fewer shared-memory loads), `64` `pk_attn8` instead of `pk_attn9` (the same values, more instructions per tile) | same | earlier path |
 
 ### Decode kernels
 
@@ -629,14 +629,13 @@ These are for measuring and checking, not for serving. Each one's usage text is 
 | `bench/suite/score.py` (scores the question runs offline) | the clients' files, `--data DIR`, `--labels L ...`, `--exec-humaneval` (runs the model-written HumanEval code; without it HumanEval is not scored), `--timeout S` (per HumanEval task, default 15), `--out FILE` (default `scores.json` next to the first file) |
 | `bench/suite/summarize.py` (the published tables from the clients' files) | the clients' files (each one a session; a label in several files gets its best session per row), `--scores FILE ...`, `--col LABEL[=TITLE]` (repeatable), `--sub LABEL:KEY[,KEY]=OTHER` (rows of a column from another label), `--out FILE` |
 
-The CUDA microbenchmarks in `bench/` are built by hand (`nvcc ...`, the line is at the top of each file) and take
-these switches (`attn_bench.cu` predates the current prefill attention and no longer builds against
-`prefill_attn.cuh`):
+The CUDA microbenchmarks in `bench/` are built by hand (`nvcc ...`, the line is at the top of each file; `attn_bench.cu`:
+`make bench/attn_bench`) and take these switches:
 
 | Switch | File | What it does |
 |---|---|---|
-| `AB_VARS=<digits>` (env) | `attn_bench.cu` | prefill attention variants to run (0 original, 1 new, 2 split, 3 split + fp16 P V, 4 int8 Q K^T, 5 per-row Q scales; default all) |
-| `TRUEREF=1` (env) | `attn_bench.cu` | also each variant's error against the unquantized fp16 cache |
+| `AB_VARS=<digits>` (env) | `attn_bench.cu` | prefill attention kernels to run, the first is the reference (0 `pk_attn8`, 1 `pk_attn9`; default `01`) |
+| `EXA=1\|2`, `QROW=1`, `QSCALE`, `SPECIAL=1`, `SEED`, `OUT_REPS`, `BETWEEN`, `STRESS=1`, `DIFF_HIST=1`, `WARM_MS`, `NCU_N` (env) | `attn_bench.cu` | MK_EXACT's form (2: split), the per-row Q scales, inputs, repeated comparisons under other launch timing, where outputs differ; the top of the file |
 | `CTX`, `KQ4=1`, `VQ4=1`, `KROT=1`, `TINV=1` (env) | `dattn_bench.cu` | decode attention: cache size, q4 K / V, rotated K, the token-count invariance check |
 | `HINT` (-D) | `ffn_bench.cu` | the load cache hint of the replica (0 none, 1 evict-first L2 policy, 2 256-byte L2 fetch) |
 | `WV_L2PF`, `WV_LD256`, `WV_NOPOL`, `WV_TILEMAJ`, `WV_SBU`, `WV_SPS`, `WV_RH`, `WV_PF`, `WV_Q6FM`, `WV_Q6HP`, `WV2_ROLL`, `WV_V2` (-D) | `wvgemm_bench.cu` | variants of the tensor-core verify GEMM under test: L2 prefetch distance, 256-byte fetch hint, no evict-first policy, tile-major layout, super-blocks per batch, stage / row tiling parameters, prefetch form, Q6_K fragment-ordered forms, rolling prefetch, the v2 kernel |

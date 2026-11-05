@@ -1,16 +1,21 @@
 // Correctness + throughput of the prefill attention kernels (prefill_attn.cuh) on a random KV cache in the engine's layouts
 // (one attention slot, view 0): pk_attn8 (the reference, as the engine runs it with MK_PFX bit 64) against pk_attn9, bit for
 // bit, for every format the engine instantiates.
-//   nvcc -O3 -std=c++17 -arch=sm_86 -lineinfo -Xptxas=-dlcm=cg bench/attn_bench.cu -o bench/attn_bench
-//   ./attn_bench <fmt> <ctx> <reps> <T:n0> ...     e.g. ./attn_bench F 262144 5 1024:39000 1024:100000 1024:257000
+//   make bench/attn_bench
+//   bench/attn_bench <fmt> <ctx> <reps> <T:n0> ...     e.g. bench/attn_bench F 262144 5 1024:39000 1024:100000 1024:257000
+//   bench/attn_bench sustain <fmt> <ctx> <T:n0> [secs] [rounds] [pair]    variants in turns of secs seconds (default 5, 4 rounds, pair 01; 00 or 11:
+//   the same kernel in both turns, the noise): launches / s with the power cap in the loop, nvidia-smi sampled per segment. Interleaved launches share one
+//   clock, so the mode above cannot show a kernel that draws more power and loses clock. A prefill's other kernels draw differently: only its wall time decides.
+// Exit status 1 if any output differs.
 // fmt: q8 (all q8, no ring), Vl (K q8, V q5 at run time), D (K q6, V q5, 2048-position q8 ring), F (K q5, V q5, ring),
 // any<k><v> (run-time KB / VB, ring), e.g. any45. Per config: ms per launch (min, median of reps, the variants alternating), and the number
 // of output floats that differ from the reference.
 // env: AB_VARS (substring of "01": 0 pk_attn8, 1 pk_attn9; default both), EXA=1 (MK_EXACT form, unsplit), EXA=2 (split, + pk_attn8_combx),
 // QROW=1 (QROW form, q8 / low-bit generic), QSCALE (Q multiplier, default 1), SPECIAL=1 (Inf / NaN / zero rows in Q and the
 // K scales), SEED, WARM_MS (default 4000: clocks), NCU_N=<launches> (the first variant of AB_VARS only, for ncu), OUT_REPS (repeat the
-// new kernels' output comparison), DIFF_HIST=1 (where outputs differ: per head, row of a query tile, dim / 8).
-#define MK_SHARED_NS
+// new kernels' output comparison), DIFF_HIST=1 (where outputs differ: per head, row of a query tile, dim / 8), BETWEEN=<n> (n launches of pk_attn8 before each
+// compared launch), STRESS=1 (other kernels on a second stream during the compared launches: other start times and SM shares).
+#define MK_SHARED_NS // (anonymous, as in qwen38_mk.cu)
 #include "../mk_shared.cuh"
 #include <random>
 
@@ -244,7 +249,6 @@ template <> void launch1<0>(Form f, bool klow, bool qrow, bool exa, const Plan &
 #undef Q8EXA
 #undef Q8PLN
 }
-#ifdef AB_NEW
 template <> void launch1<1>(Form f, bool klow, bool qrow, bool exa, const Plan & p) {
 #define Q8EXA L_(pk_attn9, false, false, true, 0, 8)
 #define Q8PLN L_(pk_attn9, false, false, false, 0, 8)
@@ -252,7 +256,6 @@ template <> void launch1<1>(Form f, bool klow, bool qrow, bool exa, const Plan &
 #undef Q8EXA
 #undef Q8PLN
 }
-#endif
 #define ATTR1(K, ...) CK(cudaFuncSetAttribute(K<__VA_ARGS__>, cudaFuncAttributeMaxDynamicSharedMemorySize, A8_SMEM))
 #define ATTR_ALL(K)                  \
     ATTR1(K, false, true, true, 6, 5); \
@@ -332,9 +335,75 @@ Side make_side(std::mt19937 & rng, int bits, size_t rows_per_head) {
     o.s = static_cast<__half *>(d);
     return o;
 }
+__global__ void k_stress(float * __restrict__ a, unsigned n, int iters) { // STRESS: memory and float work on a second stream
+    unsigned h = (blockIdx.x * 97u + threadIdx.x) * 2654435761u;
+    for (int i = 0; i < iters; i++) {
+        h = h * 1664525u + 1013904223u;
+        a[(h >> 8) % n] += 1.f;
+    }
+}
+// nvidia-smi sampled in a thread until it is stopped; take() returns the means since the last take()
+struct Smi {
+    std::atomic<bool> stop{false};
+    std::mutex mu;
+    double clk = 0, mem = 0, pw = 0;
+    int n = 0, capped = 0;
+    std::thread th;
+    Smi() {
+        th = std::thread([this] {
+            while (!stop) {
+                FILE * f = popen("nvidia-smi --query-gpu=clocks.current.sm,clocks.current.memory,power.draw,clocks_throttle_reasons.active --format=csv,noheader,nounits 2>/dev/null", "r");
+                double c = 0, m = 0, w = 0;
+                char r[64] = "";
+                if (f) {
+                    if (fscanf(f, "%lf, %lf, %lf, %63s", &c, &m, &w, r) == 4) {
+                        std::lock_guard<std::mutex> l(mu);
+                        clk += c, mem += m, pw += w, n++;
+                        capped += (strtoull(r, nullptr, 16) & 4) != 0; // sw_power_cap
+                    }
+                    pclose(f);
+                }
+                std::this_thread::sleep_for(std::chrono::milliseconds(250));
+            }
+        });
+    }
+    ~Smi() {
+        stop = true;
+        th.join();
+    }
+    void reset() {
+        std::lock_guard<std::mutex> l(mu);
+        clk = mem = pw = 0;
+        n = capped = 0;
+    }
+    void take(double & c, double & m, double & w, double & cap) {
+        std::lock_guard<std::mutex> l(mu);
+        const double d = n > 0 ? n : 1;
+        c = clk / d, m = mem / d, w = pw / d, cap = 100.0 * capped / d;
+    }
+};
 } // namespace
 
 int main(int argc, char ** argv) {
+    const bool sustain = argc >= 2 && !strcmp(argv[1], "sustain");
+    if (sustain) { // sustain <fmt> <ctx> <T:n0> [secs] [rounds] [pair] -> the common parse below sees <fmt> <ctx> 0 <T:n0>
+        argv++, argc--;
+    }
+    const double sus_secs = sustain && argc >= 5 ? atof(argv[4]) : 5.0;
+    const int sus_rounds = sustain && argc >= 6 ? atoi(argv[5]) : 4;
+    const std::string sus_pair = sustain && argc >= 7 ? argv[6] : "01";
+    char sus_cfg[64] = "";
+    char * sus_argv[5];
+    if (sustain) {
+        if (argc < 4) {
+            fprintf(stderr, "usage: attn_bench sustain <fmt> <ctx> <T:n0> [secs] [rounds] [pair]\n");
+            return 1;
+        }
+        snprintf(sus_cfg, sizeof sus_cfg, "%s", argv[3]);
+        static char zero[] = "0";
+        sus_argv[0] = argv[0], sus_argv[1] = argv[1], sus_argv[2] = argv[2], sus_argv[3] = zero, sus_argv[4] = sus_cfg;
+        argv = sus_argv, argc = 5;
+    }
     if (argc < 5) {
         fprintf(stderr, "usage: attn_bench <q8|Vl|D|F|any<k><v>> <ctx> <reps> <T:n0> ...\n");
         return 1;
@@ -355,12 +424,9 @@ int main(int argc, char ** argv) {
     const bool special = getenv("SPECIAL") && atoi(getenv("SPECIAL")) != 0;
     const int warm_ms = getenv("WARM_MS") ? atoi(getenv("WARM_MS")) : 4000;
     const int ncu_n = getenv("NCU_N") ? atoi(getenv("NCU_N")) : 0;
-    const std::string vsel = getenv("AB_VARS") ? getenv("AB_VARS") :
-#ifdef AB_NEW
-        "01";
-#else
-        "0";
-#endif
+    const std::string vsel = getenv("AB_VARS") ? getenv("AB_VARS") : "01";
+    const int between = getenv("BETWEEN") ? atoi(getenv("BETWEEN")) : 0;
+    int nfail = 0;
     int maxT = 0;
     std::vector<std::pair<int, int>> cfg;
     for (int ai = 4; ai < argc; ai++) {
@@ -370,11 +436,9 @@ int main(int argc, char ** argv) {
         maxT = std::max(maxT, T);
     }
     ATTR_ALL(pk_attn8);
-#ifdef AB_NEW
     ATTR_ALL(pk_attn9);
     ATTR1(pk_attn9, false, false, false, 0, 8);
     ATTR1(pk_attn9, false, false, true, 0, 8);
-#endif
     int nsm = 0, occ = 0;
     CK(cudaDeviceGetAttribute(&nsm, cudaDevAttrMultiProcessorCount, 0));
     CK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&occ, pk_attn8<false, false>, A2_NT, A8_SMEM));
@@ -440,15 +504,31 @@ int main(int argc, char ** argv) {
     CK(cudaEventCreate(&e1));
     auto run = [&](int v, const Plan & pl, int T, int n0) {
         if (v == 0) launch1<0>(f, klow, qrow, exa, pl);
-#ifdef AB_NEW
         else launch1<1>(f, klow, qrow, exa, pl);
-#endif
         const int N = (T + A2_Q - 1) / A2_Q * NKV;
         if (N > pl.nfull) {
             if (exa) pk_attn8_combx<<<N - pl.nfull, 256>>>(T, n0, pl.nfull, pl.S, pl.segt, pl.exh, 0, pl.part, pl.part2, pl.exa);
             else pk_attn2_comb<<<N - pl.nfull, 256>>>(T, pl.nfull, pl.S, pl.part);
         }
     };
+    // STRESS: launches on a second stream all along, sharing the SMs and the memory with the compared launches
+    std::atomic<bool> stress_stop{false};
+    std::thread stress;
+    if (getenv("STRESS") && atoi(getenv("STRESS"))) {
+        stress = std::thread([&] {
+            cudaStream_t st;
+            float * a;
+            const unsigned n = 1u << 24;
+            CK(cudaStreamCreate(&st));
+            CK(cudaMalloc(&a, n * 4));
+            for (unsigned i = 0; !stress_stop; i++) {
+                k_stress<<<dim3(20 + i % 60), 64, 0, st>>>(a, n, 2000 + (i % 7) * 4000);
+                CK(cudaStreamSynchronize(st));
+            }
+            CK(cudaFree(a));
+            CK(cudaStreamDestroy(st));
+        });
+    }
     for (auto [T, n0] : cfg) {
         const int nqt = (T + A2_Q - 1) / A2_Q, N = nqt * NKV;
         Plan pl{};
@@ -469,6 +549,42 @@ int main(int argc, char ** argv) {
         pl.grid = dim3(nfull + (N - nfull) * S);
         printf("T %d n0 %d: items %d, grid %d nfull %d S %d\n", T, n0, N, pl.grid.x, nfull, S);
         fflush(stdout);
+        if (sustain) {
+            Smi smi;
+            double tot[2] = {0, 0}, mhz[2] = {0, 0}, wat[2] = {0, 0}, cp[2] = {0, 0};
+            long cnt[2] = {0, 0};
+            auto seg = [&](int v, int w) {
+                for (int phase = 0; phase < 2; phase++) { // the first third of a segment: the power loop settles
+                    const auto ts = std::chrono::steady_clock::now();
+                    const double dur = phase ? sus_secs : sus_secs / 3;
+                    long n = 0;
+                    smi.reset();
+                    while (std::chrono::duration<double>(std::chrono::steady_clock::now() - ts).count() < dur) {
+                        run(v, pl, T, n0);
+                        n++;
+                        if (n % 4 == 0) CK(cudaDeviceSynchronize());
+                    }
+                    CK(cudaDeviceSynchronize());
+                    const double el = std::chrono::duration<double>(std::chrono::steady_clock::now() - ts).count();
+                    if (phase) {
+                        double c, m, pw, cap;
+                        smi.take(c, m, pw, cap);
+                        tot[w] += el, cnt[w] += n, mhz[w] += c, wat[w] += pw, cp[w] += cap;
+                        printf("  slot %d v%d: %7.3f ms/launch  %6.2f launches/s  SM %5.0f MHz  mem %5.0f MHz  %5.0f W  power cap %3.0f%%\n", w, v, 1e3 * el / n, n / el, c, m, pw, cap);
+                        fflush(stdout);
+                    }
+                }
+            };
+            for (int rr = 0; rr < sus_rounds; rr++) {
+                seg(sus_pair[0] - '0', 0);
+                seg(sus_pair[1] - '0', 1);
+            }
+            printf("SUSTAINED %s T %d n0 %d pair %s: slot 0 %.3f ms (%.0f MHz, %.0f W, cap %.0f%%), slot 1 %.3f ms (%.0f MHz, %.0f W, cap %.0f%%): %+.2f%% time\n", fs.c_str(), T, n0, sus_pair.c_str(),
+                   1e3 * tot[0] / cnt[0], mhz[0] / sus_rounds, wat[0] / sus_rounds, cp[0] / sus_rounds, 1e3 * tot[1] / cnt[1], mhz[1] / sus_rounds, wat[1] / sus_rounds, cp[1] / sus_rounds,
+                   100.0 * ((tot[1] / cnt[1]) / (tot[0] / cnt[0]) - 1.0));
+            fflush(stdout);
+            continue;
+        }
         std::vector<float> ref((size_t) T * VD), out((size_t) T * VD);
         std::vector<int> vs;
         for (char c : vsel) vs.push_back(c - '0');
@@ -484,6 +600,7 @@ int main(int argc, char ** argv) {
         for (int orep = 0; orep < oreps; orep++)
         for (int v : vs) { // outputs (non-final launches may start at cold clocks: not timed)
             if (orep > 0 && v == vs[0]) continue;
+            for (int bb = 0; bb < between; bb++) run(0, pl, T, n0);
             CK(cudaMemset(y2, 0xff, (size_t) T * VD * 4));
             run(v, pl, T, n0);
             CK(cudaDeviceSynchronize());
@@ -508,6 +625,7 @@ int main(int argc, char ** argv) {
                     nnan += std::isnan(out[i]);
                 }
                 printf("  v%d vs ref: differing %zu / %zu (first %zd, max|d| %.3g), NaN %zu%s\n", v, nbits, out.size(), (ssize_t) first, md, nnan, nbits ? "  <<< NOT EXACT" : "");
+                nfail += nbits != 0;
                 if (nbits && getenv("DIFF_HIST")) { // where: per output head, per row of a query tile, per dim / 8
                     size_t hh[NH] = {}, hr[A2_Q] = {}, hd[HD / 8] = {};
                     for (size_t i = 0; i < out.size(); i++)
@@ -549,6 +667,8 @@ int main(int argc, char ** argv) {
         }
         fflush(stdout);
     }
-    printf("DONE\n");
-    return 0;
+    stress_stop = true;
+    if (stress.joinable()) stress.join();
+    printf(nfail ? "FAILED: %d comparisons differ\n" : "DONE\n", nfail);
+    return nfail ? 1 : 0;
 }

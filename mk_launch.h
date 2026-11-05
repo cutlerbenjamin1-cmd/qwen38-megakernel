@@ -71,6 +71,7 @@ void pk_glu(dim3 grid, const float * g, const float * u, __half * out, int ld);
 template <bool Q8> void pk_attn(int T, int n0, int slot);
 template <bool Q8, bool PV16> void pk_attn2(dim3 grid, int T, int n0, int slot, int nfull, int S, float * part, int r0 = 0);
 void pk_attn2_comb(dim3 grid, int T, int nfull, int S, const float * part);
+extern int pk_attn_old; // MK_PFX bit 64
 template <bool QROW, bool KLOW, bool EXA = false, int KB = 0, int VB = 0>
 void pk_attn8(dim3 grid, int T, int n0, int slot, int nfull, int S, float * part, int r0 = 0, int segt = 0, int exh = 0,
               float * part2 = nullptr, int exa = 0);
