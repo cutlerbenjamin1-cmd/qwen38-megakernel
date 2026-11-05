@@ -59,7 +59,8 @@ rates, the no-draft table and the method are in [docs/BENCHMARKS.md](docs/BENCHM
   cache only for now; low-bit KV presets with it are on the list), int8 decode attention
   ([`-DMK_ATT_I8=1`](docs/CONFIGURATION.md#engine--d-flags), q8_0 KV cache) and
   [L2 prefetch budgets](docs/EXPERIMENTAL.md#l2-prefetch-budgets) you can set at run time, to tune a GPU other than the
-  RTX 3090. All are opt-in source builds, not in the packages yet.
+  RTX 3090. All are opt-in source builds, not in the regular packages; the L2 build also has a
+  [Windows pre-release](https://github.com/cutlerbenjamin1-cmd/qwen38-megakernel/releases/tag/v2026.11.04-l2tune).
 
 ## Quick start
 

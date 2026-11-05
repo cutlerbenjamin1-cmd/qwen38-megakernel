@@ -2,8 +2,9 @@
 
 Two opt-in source builds are in active development and on the list for the served build: the deep pass (up to 15 drafts
 per step) and int8 decode attention. A third, the L2 prefetch budgets, is a tool for tuning on other GPUs. None is in
-the release packages; each builds from source with one flag ([BUILDING.md](BUILDING.md) has the rest of the build). The
-default build stays the served one: 7 drafts, every KV preset, the full 262,144-token context.
+the regular release packages; each builds from source with one flag ([BUILDING.md](BUILDING.md) has the rest of the
+build), and the L2 budgets also have a [Windows pre-release](https://github.com/cutlerbenjamin1-cmd/qwen38-megakernel/releases/tag/v2026.11.04-l2tune).
+The default build stays the served one: 7 drafts, every KV preset, the full 262,144-token context.
 
 Contents: [the deep pass](#the-deep-pass) - [int8 decode attention](#int8-decode-attention) - [both
 together](#both-together) - [speed](#speed) - [how it was measured](#how-it-was-measured) - [L2 prefetch
@@ -192,7 +193,8 @@ question.
 
 ### Trying it on another GPU
 
-`scripts/l2_sweep.py` needs Python and the build's CLI, no compiler, and the GPU to itself. On an RTX 40 card an sm_86
+The [v2026.11.04-l2tune pre-release](https://github.com/cutlerbenjamin1-cmd/qwen38-megakernel/releases/tag/v2026.11.04-l2tune) is this build for Windows, so
+this takes no compiler: `scripts/l2_sweep.py` needs Python, the build's CLI and the GPU to itself. On an RTX 40 card an sm_86
 build runs the same code as an sm_89 one: with CUDA 13.2.2 all 157 code sections of this build came out byte-identical
 for the two architectures (2026-11-04), and only the ELF header's architecture differs.
 
