@@ -2,10 +2,13 @@
 import importlib.util
 import json
 import os
+import socket
 import stat
 import subprocess
 import sys
 import tempfile
+import threading
+import types
 import unittest
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -77,6 +80,26 @@ class BuildInfoBom(unittest.TestCase):
             line = ex.build_info()
         self.assertEqual(line, "qwen38-megakernel v1, Windows x64")
         line.encode("cp1252")
+
+
+class ServerStop(unittest.TestCase):
+    def test_stop_waits_for_the_port(self):
+        # a Windows venv's python.exe is a launcher: the process we wait for is gone while the server still holds the port
+        spec2 = importlib.util.spec_from_file_location("exactness", os.path.join(ROOT, "scripts", "exactness.py"))
+        ex = importlib.util.module_from_spec(spec2)
+        spec2.loader.exec_module(ex)
+        listener = socket.socket()
+        listener.bind(("127.0.0.1", 0))
+        listener.listen()
+        port = listener.getsockname()[1]
+        threading.Timer(1.0, listener.close).start()
+        srv = ex.Server.__new__(ex.Server)
+        srv.chk = types.SimpleNamespace(a=types.SimpleNamespace(port=port))
+        srv.p = types.SimpleNamespace(poll=lambda: 0)
+        srv.logf = tempfile.TemporaryFile()
+        self.assertTrue(ex.port_open(port))
+        srv.stop()
+        self.assertFalse(ex.port_open(port))
 
 
 @unittest.skipIf(os.name == "nt", "the stub is a POSIX script")
