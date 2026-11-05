@@ -3119,25 +3119,30 @@ __device__ __forceinline__ void aqx_conv(float (&acc)[MTA][4][4], const uint8_t 
         a[2 * (ks & 1) + 1] = __uint_as_float(aq_q8x2(*reinterpret_cast<const unsigned short *>(krow + 16 * ks + 2 * tig + 8), dd, kxm, ksub));
     }
 }
-// S = Q K^T from the fragments above (the same MMAs in the same order: k-step ks, then row tile i)
+// S = Q K^T from the fragments above (the same MMAs in the same order: k-step ks, then row tile i). The Q loads go out AQX_LA MMAs
+// ahead in the program text: right in front of its MMA (ptxas's order in the engine, not in a small bench) each load's latency
+// was a stall of that MMA, ~30% of the S warps' samples at 101k.
+constexpr int AQX_LA = 4;
 template <int MT, int MTA, int LDH>
 __device__ __forceinline__ void aqx_mma(float (&s)[MT][4], const float (&acc)[MTA][4][4], unsigned qaddr) {
 #pragma unroll
     for (int i = 0; i < MT; i++)
 #pragma unroll
         for (int k = 0; k < 4; k++) s[i][k] = 0.f;
+    auto ldq = [&](int q, unsigned (&a)[4]) { // the Q fragment of MMA q = ks MT + i
+        asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0,%1,%2,%3}, [%4];"
+                     : "=r"(a[0]), "=r"(a[1]), "=r"(a[2]), "=r"(a[3])
+                     : "r"(qaddr + 2 * (16 * (q % MT) * LDH + 16 * (q / MT))));
+    };
+    unsigned a[AQX_LA][4];
 #pragma unroll
-    for (int ks = 0; ks < HD / 16; ks++) {
+    for (int q = 0; q < AQX_LA; q++) ldq(q, a[q]);
+#pragma unroll
+    for (int q = 0; q < (HD / 16) * MT; q++) {
+        const int ks = q / MT, w = q % AQX_LA;
         const float (&b)[4] = acc[ks >> 3][(ks >> 1) & 3];
-        const unsigned b0 = __float_as_uint(b[2 * (ks & 1)]), b1 = __float_as_uint(b[2 * (ks & 1) + 1]);
-#pragma unroll
-        for (int i = 0; i < MT; i++) {
-            unsigned a[4];
-            asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0,%1,%2,%3}, [%4];"
-                         : "=r"(a[0]), "=r"(a[1]), "=r"(a[2]), "=r"(a[3])
-                         : "r"(qaddr + 2 * (16 * i * LDH + 16 * ks)));
-            mma16816(s[i], a[0], a[1], a[2], a[3], b0, b1);
-        }
+        mma16816(s[q % MT], a[w][0], a[w][1], a[w][2], a[w][3], __float_as_uint(b[2 * (ks & 1)]), __float_as_uint(b[2 * (ks & 1) + 1]));
+        if (q + AQX_LA < (HD / 16) * MT) ldq(q + AQX_LA, a[w]);
     }
 }
 // rows r0 .. r0 + N - 1 of a staged tile -> biased bytes: kv_rows_expand<BITS, false>'s bytes without a branch per row; all loads
@@ -4421,7 +4426,7 @@ __device__ __noinline__ void attn_core(const LayerW & W, int slot, int n, uint8_
         else if (cB.att_i8) attn_core_w48i<T>(W, slot, n, -1, b0);
 #endif
         else
-#if MK_W48X // (all-q8 slots too: the same partials, and its schedule is the faster one)
+#if MK_W48X_Q8 // (all-q8 slots through the MIX form: the same partials)
         attn_core_w48m<T>(W, slot, n, b0);
 #else
         attn_core_w48q<T>(W, slot, n, -1, b0);
@@ -4443,7 +4448,7 @@ __device__ __noinline__ void attn_core(const LayerW & W, int slot, int n, uint8_
         if (cB.dattn && n + T > ATT_BUCKET) {
             if (!q8) attn_core_q8m<T>(W, slot, n, b0);
             else
-#if MK_W48X
+#if MK_W48X_Q8
             attn_core_q8m<T>(W, slot, n, b0);
 #else
             attn_core_q8<T>(W, slot, n, b0);

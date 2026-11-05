@@ -93,6 +93,10 @@ extern char ** environ; // (state files: the MK_* settings in the key)
 #ifndef MK_W48X
 #define MK_W48X 0
 #endif
+// MK_W48X_Q8 1 (with MK_W48X 1): all-q8 slots run those MIX kernels too (no q8 instances in the build). 0: their own kernels
+#ifndef MK_W48X_Q8
+#define MK_W48X_Q8 0
+#endif
 // MK_L2_TUNE 1: the L2 prefetch budgets (L2Tune below) are read from the environment (MK_L2_*, docs/EXPERIMENTAL.md), to
 // tune them on a GPU with another L2 size. 0: the constants, none of this code (the default)
 #ifndef MK_L2_TUNE
