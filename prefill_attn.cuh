@@ -1196,3 +1196,630 @@ __global__ void __launch_bounds__(256) pk_attn8_combx(int T, int n0, int nfull, 
         for (int k = 0; k < 8; k++) dst[k] = acc[k] * il;
     }
 }
+
+// >>> pk_attn9
+// ------------------------------------------------------------------------------------------
+// pk_attn9: pk_attn8 (same units, same stages, every output element the same floating-point chain: bit-identical) with the
+// per-tile data movement rewritten for instruction count, the kernel being compute-limited. Each thread's copies are a fixed
+// plan set up once (running source pointers, stage offsets; warp-uniform kinds; idle chunks predicated, not branched
+// around), for the main-format tiles with all rows; the rest (ring tiles, the last partial tile) keep pk_attn8's a8_issue.
+__device__ __forceinline__ void cp_async16_to(unsigned d, const void * gsrc) {
+    asm volatile("cp.async.cg.shared.global [%0], [%1], 16;" ::"r"(d), "l"(gsrc) : "memory");
+}
+__device__ __forceinline__ void a9_cp16p(unsigned p, unsigned d, const void * gsrc) { // p != 0: copy (no branch: no divergence)
+    asm volatile("{\n.reg .pred p;\nsetp.ne.u32 p, %0, 0;\n@p cp.async.cg.shared.global [%1], [%2], 16;\n}" ::"r"(p), "r"(d), "l"(gsrc) : "memory");
+}
+// raw K scales of the tile (row p's in its padding) -> the stage's fp32 table [8 blocks][32 positions] (lane = position: warp 9)
+__device__ __forceinline__ void a9_ks(uint8_t * st) {
+    const int p = threadIdx.x & 31;
+    const uint4 r = *reinterpret_cast<const uint4 *>(st + p * A8_KLD + HD);
+    const float2 f0 = __half22float2(pf::u2h(r.x)), f1 = __half22float2(pf::u2h(r.y));
+    const float2 f2 = __half22float2(pf::u2h(r.z)), f3 = __half22float2(pf::u2h(r.w));
+    float * ks = reinterpret_cast<float *>(st + A8_KB) + p;
+    ks[0] = f0.x, ks[A2_K] = f0.y, ks[2 * A2_K] = f1.x, ks[3 * A2_K] = f1.y;
+    ks[4 * A2_K] = f2.x, ks[5 * A2_K] = f2.y, ks[6 * A2_K] = f3.x, ks[7 * A2_K] = f3.y;
+}
+// chunk k (of 3; warps 8 - 11 have two) of this thread: 8 V values of ring stage st -> fp16 in sV: a8_cv_v without its per-thread
+// test; compile-time VB: kv_spread4 for kv_hi4 (the same bits)
+template <int VB = 0>
+__device__ __forceinline__ void a9_cv(const uint8_t * st, __half * sV, int k, int vbits) {
+    const int p = (threadIdx.x >> 5) + 12 * k, c = threadIdx.x & 31;
+    const uint8_t * row = st + A8_KB + A8_KSB + p * HD;
+    const __half d = reinterpret_cast<const __half *>(st + A8_KB + A8_KSB + A8_VB)[p * (HD / 32) + (c >> 2)];
+    __half2 h[4];
+    if (vbits == 8) {
+        a2_q8h(*reinterpret_cast<const uint2 *>(row + 8 * c), d, h);
+    } else if constexpr (VB > 4) {
+        constexpr int HB = VB - 4;
+        const unsigned w = *reinterpret_cast<const unsigned *>(row + 4 * c);
+        unsigned hi = row[128 + c * HB];
+        if constexpr (HB > 1) hi |= (unsigned) row[129 + c * HB] << 8;
+        if constexpr (HB > 2) hi |= (unsigned) row[130 + c * HB] << 16;
+        const unsigned lo = (w & 0x0F0F0F0Fu) | kv_spread4<HB>(hi), hv = ((w >> 4) & 0x0F0F0F0Fu) | kv_spread4<HB>(hi >> (4 * HB));
+        const __half2 off = __half2half2(__ushort_as_half((unsigned short) (0x6400 + (1 << (VB - 1))))), dd = __half2half2(d);
+        h[0] = __hmul2(__hsub2(pf::u2h(__byte_perm(lo, 0x64646464u, 0x4140)), off), dd);
+        h[1] = __hmul2(__hsub2(pf::u2h(__byte_perm(lo, 0x64646464u, 0x4342)), off), dd);
+        h[2] = __hmul2(__hsub2(pf::u2h(__byte_perm(hv, 0x64646464u, 0x4140)), off), dd);
+        h[3] = __hmul2(__hsub2(pf::u2h(__byte_perm(hv, 0x64646464u, 0x4342)), off), dd);
+    } else if (vbits == 4) {
+        a2_q4h(*reinterpret_cast<const unsigned *>(row + 4 * c), d, h);
+    } else {
+        a2_qnh(*reinterpret_cast<const unsigned *>(row + 4 * c), kv_hi(row + 128 + c * (vbits - 4), vbits - 4), d, vbits, h);
+    }
+    *reinterpret_cast<int4 *>(sV + p * A2_LD + 8 * c) = *reinterpret_cast<int4 *>(h);
+}
+// NR rows r0, r0 + 12, .. of a staged low-bit K tile -> int8 in place (kv_rows_expand<BITS> with every row present)
+template <int BITS, int NR>
+__device__ __forceinline__ void a9_k_rows(uint8_t * st, int r0) {
+    constexpr int HB = BITS - 4;
+    const int lane = threadIdx.x & 31;
+    unsigned wd[NR], hi[NR];
+#pragma unroll
+    for (int k = 0; k < NR; k++) {
+        const uint8_t * row = st + (r0 + 12 * k) * A8_KLD;
+        wd[k] = *reinterpret_cast<const unsigned *>(row + 4 * lane);
+        hi[k] = 0u;
+        if constexpr (HB == 1) hi[k] = row[128 + lane];
+        if constexpr (HB == 2) hi[k] = *reinterpret_cast<const unsigned short *>(row + 128 + 2 * lane);
+        if constexpr (HB == 3) hi[k] = (unsigned) row[128 + 3 * lane] | ((unsigned) row[129 + 3 * lane] << 8) | ((unsigned) row[130 + 3 * lane] << 16);
+    }
+    __syncwarp();
+#pragma unroll
+    for (int k = 0; k < NR; k++) {
+        unsigned lo = wd[k] & 0x0f0f0f0fu, hv = (wd[k] >> 4) & 0x0f0f0f0fu;
+        if constexpr (HB > 0) {
+            lo |= kv_spread4<HB>(hi[k]);
+            hv |= kv_spread4<HB>(hi[k] >> (4 * HB));
+        }
+        constexpr unsigned bias = (1u << (BITS - 1)) * 0x01010101u;
+        lo = ((lo | 0x80808080u) - bias) ^ 0x80808080u;
+        hv = ((hv | 0x80808080u) - bias) ^ 0x80808080u;
+        *reinterpret_cast<uint2 *>(st + (r0 + 12 * k) * A8_KLD + 8 * lane) = make_uint2(lo, hv);
+    }
+}
+
+template <bool QROW, bool KLOW, bool EXA = false, int KB = 0, int VB = 0>
+__global__ void __launch_bounds__(A2_NT, 1) pk_attn9(int T, int n0, int slot, int nfull, int S, float * __restrict__ part, int r0 = 0,
+                                                     int segt = 0, int exh = 0, float * __restrict__ part2 = nullptr, int exa = 0) { MK_VIEW_INIT();
+    static_assert(KB == 0 || (KLOW && KB >= 4 && KB <= 7), "pk_attn9 KB");
+    static_assert(VB == 0 || (VB >= 4 && VB <= 7), "pk_attn9 VB");
+    extern __shared__ __align__(16) uint8_t asm_[];
+    __half * sV0 = reinterpret_cast<__half *>(asm_ + A8_NS * A8_STG); // [2][32][A2_LD] fp16 V(it) / V(it + 1)
+    float2 * xmax = reinterpret_cast<float2 *>(sV0 + 2 * A2_K * A2_LD); // [6][2][32] row maxima (finally: l)
+    uint4 * xp = reinterpret_cast<uint4 *>(xmax + 6 * 2 * 32);       // [6][2][32] P fragments
+    float2 * xsum = reinterpret_cast<float2 *>(xp + 6 * 2 * 32);     // [6][32] half 0's partial row sums
+    const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5, g8 = lane >> 2, t4 = lane & 3;
+    const int hq = warp >> 1, hf = warp & 1;
+    const int nqt = (T + A2_Q - 1) / A2_Q;
+    int item = blockIdx.x, seg = 0, nseg = 1;
+    if (item >= nfull) {
+        const int v = item - nfull;
+        if (EXA) { // units interleaved over the split items: every head, then every item's first single segment, ..
+            const int nsplit = nqt * NKV - nfull;
+            item = nfull + v % nsplit;
+            seg = v / nsplit;
+        } else {
+            item = nfull + v / S;
+            seg = v % S;
+        }
+        nseg = S;
+    }
+    const int qt = item % nqt, g = item / nqt;
+    const int t0 = qt * A2_Q, nq = min(A2_Q, T - t0);
+    const int qpos0 = n0 + t0, pmax = qpos0 + nq - 1;
+    const int ntile = pmax / A2_K + 1;
+    int it0 = ntile * seg / nseg, it1 = ntile * (seg + 1) / nseg;
+    // EXA: 0 whole item (final output); split item (S units, S partial slots): unit 0 = the head, segments 0 .. exh - 1
+    // (folds, R -> slot 0), role 1; unit u >= 1 = segment exh + u - 1 alone (-> slot u), role 2. (Role 2 code also
+    // handles a unit of several segments, each to slot 1 + k - ex_h.) Split item j's S slots: in part for j < exa, else
+    // in part2 (two idle scratch buffers, see MKEngine's ex_part).
+    int ex_role = 0, ex_h = 0;
+    float * ex_base = nullptr;
+    if (EXA) {
+        const int nsg = (ntile + segt - 1) / segt;
+        it0 = 0;
+        it1 = ntile;
+        if (nseg > 1) {
+            const int k0 = seg == 0 ? 0 : exh + seg - 1, k1 = seg == 0 ? exh : k0 + 1;
+            if (k0 >= nsg) return; // (idle unit: this item has fewer segments than the plan's longest)
+            it0 = k0 * segt;
+            it1 = min(ntile, k1 * segt);
+            ex_h = exh;
+            ex_role = seg == 0 ? 1 : 2;
+            const int j = item - nfull;
+            ex_base = j < exa ? part + (size_t) j * S * A2_PART : part2 + (size_t) (j - exa) * S * A2_PART;
+        }
+    }
+    // this slot's q8_0 K / V through the MK_KV slot pointers (as pk_attn2): slots are packed in kc / vc, so with a q4
+    // slot before this one the uniform [slot][head][ctx][HD] offset lands in another slot's rows; for an all-q8
+    // cache kvp / kvs give exactly the [slot][head][ctx][HD] addresses
+    // Per tile (kv_src): the slot's main buffer (K q8 or q4..q7, expanded to int8 in its stage by kv_tile_expand during the
+    // previous tile; V q8 or q4..q7, converted to fp16 by a8_cv_v) or, with MK_KV_WIN, the q8 ring for tiles at positions
+    // >= wsr. kbt(it) / vbt(it) = the K / V format of tile it.
+    const int wsr = kv_ws(cP.wsrow ? pmax + 1 : n0 + T), wsm = kv_wsm(wsr); // (MK_EXACT: per query tile, see PBufs)
+    const KvFmt kf = kv_fmt(slot); // per-slot formats once; per tile one compare of the tile index (kv_ring_tile)
+    const int itr_k = kv_ring_tile(kf.kr, wsr, 0, A2_K), itr_v = kv_ring_tile(kf.vr, wsr, 0, A2_K);
+    const int kbs = KB ? KB : kf.kb, vbs = VB ? VB : kf.vb; // the main buffer's K / V bits
+    auto kbt = [&](int it) { return it >= itr_k ? 8 : kbs; };
+    auto vbt = [&](int it) { return it >= itr_v ? 8 : vbs; };
+    auto issue_tile = [&](uint8_t * st, int it, int np) { // K, V, V scales of tile it -> stage st; returns this thread's K scales (raw)
+        const int8_t *tk, *tv;
+        const __half *tks, *tvs;
+        kv_tile_src(0, slot, g, it * A2_K, wsr, wsm, kbs, it >= itr_k, tk, tks);
+        kv_tile_src(1, slot, g, it * A2_K, wsr, wsm, vbs, it >= itr_v, tv, tvs);
+        a8_issue(st, tk, tv, tvs, 0, np, KLOW ? kbt(it) : 8, vbt(it));
+        return a8_ld_ks(tks, 0, np);
+    };
+    auto expand_k = [&](int it, int r0, int rs) { // low-bit K rows r0, r0 + rs, .. of tile it (landed) -> int8 in place
+        if constexpr (KLOW) {
+            // all A2_K rows: rows >= np were zeroed by a8_issue_k (finite values, masked by the causal test)
+            const int kb_ = kbt(it);
+            if constexpr (KB != 0) {
+                if (kb_ != 8)
+                    for (int r = r0; r < A2_K; r += 3 * rs) kv_rows_expand<KB, true>(asm_ + (it % A8_NS) * A8_STG, A2_K, r, rs, A8_KLD);
+            } else if (kb_ != 8) kv_tile_expand<true>(asm_ + (it % A8_NS) * A8_STG, kb_, A2_K, r0, rs, A8_KLD);
+        }
+    };
+    (void) kbt;
+
+    // Tiles it < itf (main format, all rows): this thread's fixed share of the copies. Chunk j = tid + A2_NT k of the tile:
+    // K rows, V rows, V scales, K scales (raw, in the K rows' padding), then none: warp-uniform kinds, no branch.
+    const unsigned smem0 = (unsigned) __cvta_generic_to_shared(asm_);
+    const int itf = min(min(itr_k, itr_v), (pmax + 1) / A2_K);
+    constexpr int A9_NSL = (KB && VB) ? 2 : 3;
+    const char * cps[A9_NSL];
+    int cpi[A9_NSL];
+    unsigned cpd[A9_NSL];
+    const int kbm = KLOW ? kbs : 8, nkc = 2 * kbm, nvc = 2 * vbs;
+    const int cpn = A2_K * (nkc + nvc + 2); // chunks of a tile
+    {
+        const int8_t *tk, *tv;
+        const __half *tks, *tvs;
+        kv_tile_src(0, slot, g, it0 * A2_K, wsr, wsm, kbs, false, tk, tks);
+        kv_tile_src(1, slot, g, it0 * A2_K, wsr, wsm, vbs, false, tv, tvs);
+#pragma unroll
+        for (int k = 0; k < A9_NSL; k++) {
+            int j = tid + A2_NT * k, p;
+            const int nk = A2_K * nkc, nv = A2_K * nvc;
+            if (j < nk) {
+                p = j / nkc;
+                j -= p * nkc;
+                cps[k] = reinterpret_cast<const char *>(tk) + p * (HD * kbm / 8) + 16 * j;
+                cpi[k] = A2_K * (HD * kbm / 8);
+                cpd[k] = p * A8_KLD + 16 * j;
+            } else if (j < nk + nv) {
+                j -= nk;
+                p = j / nvc;
+                j -= p * nvc;
+                cps[k] = reinterpret_cast<const char *>(tv) + p * (HD * vbs / 8) + 16 * j;
+                cpi[k] = A2_K * (HD * vbs / 8);
+                cpd[k] = A8_KB + A8_KSB + p * HD + 16 * j;
+            } else if (j < nk + nv + A2_K) {
+                p = j - nk - nv;
+                cps[k] = reinterpret_cast<const char *>(tvs + p * (HD / 32));
+                cpi[k] = A2_K * (HD / 32) * 2;
+                cpd[k] = A8_KB + A8_KSB + A8_VB + 16 * p;
+            } else { // K scales; none: never issued
+                p = (j - nk - nv - A2_K) & 31;
+                cps[k] = reinterpret_cast<const char *>(tks + p * (HD / 32));
+                cpi[k] = A2_K * (HD / 32) * 2;
+                cpd[k] = p * A8_KLD + HD;
+            }
+        }
+    }
+    auto issue_fast = [&](unsigned sto) {
+        cp_async16_to(smem0 + sto + cpd[0], cps[0]);
+        cps[0] += cpi[0];
+#pragma unroll
+        for (int k = 1; k < A9_NSL; k++) {
+            a9_cp16p(tid + A2_NT * k < cpn, smem0 + sto + cpd[k], cps[k]);
+            cps[k] += cpi[k];
+        }
+        pf::cpa_commit();
+    };
+
+    // ring prologue: tiles it0 .. it0 + A8_NS - 2
+#pragma unroll
+    for (int j = 0; j < A8_NS - 1; j++) {
+        const int it = it0 + j;
+        uint8_t * st = asm_ + (it % A8_NS) * A8_STG;
+        if (it < it1) {
+            if (it < itf) {
+                issue_fast((it % A8_NS) * A8_STG);
+            } else {
+                const int kb = it * A2_K, np = min(A2_K, pmax + 1 - kb);
+                a8_st_ks(st, issue_tile(st, it, np));
+            }
+        } else {
+            pf::cpa_commit();
+        }
+    }
+
+    // Q of head g * 6 + hq, rows g8 and g8 + 8 -> int8 A fragments qf[block] (m16n8k32: a0 / a1 = dims 4 t4 ..
+    // of rows g8 / g8 + 8, a2 / a3 = dims 16 + 4 t4 ..), scales qs (QROW: per row)
+    unsigned qf[8][4];
+    float qs[QROW ? 1 : 8][2];
+    {
+        const __half * qg = cP.qh + ((size_t) (r0 + t0) * NH + g * 6 + hq) * HD + 4 * t4;
+        auto ldq = [&](int b, int rr, float (&v)[8]) {
+            const int t = g8 + 8 * rr;
+            uint2 lo = make_uint2(0, 0), hi = make_uint2(0, 0);
+            if (t < nq) {
+                const __half * src = qg + (size_t) t * NH * HD + 32 * b;
+                lo = __ldg(reinterpret_cast<const uint2 *>(src));
+                hi = __ldg(reinterpret_cast<const uint2 *>(src + 16));
+            }
+            float2 f = __half22float2(pf::u2h(lo.x));
+            v[0] = f.x; v[1] = f.y;
+            f = __half22float2(pf::u2h(lo.y));
+            v[2] = f.x; v[3] = f.y;
+            f = __half22float2(pf::u2h(hi.x));
+            v[4] = f.x; v[5] = f.y;
+            f = __half22float2(pf::u2h(hi.y));
+            v[6] = f.x; v[7] = f.y;
+        };
+        auto qmax = [&](const float (&v)[8], float a) {
+#pragma unroll
+            for (int k = 0; k < 8; k++) a = fmaxf(a, fabsf(v[k]));
+            a = fmaxf(a, __shfl_xor_sync(0xffffffffu, a, 1));
+            return fmaxf(a, __shfl_xor_sync(0xffffffffu, a, 2));
+        };
+        float am[2] = {0.f, 0.f};
+        if constexpr (QROW) {
+#pragma unroll
+            for (int b = 0; b < 8; b++)
+#pragma unroll
+                for (int rr = 0; rr < 2; rr++) {
+                    float v[8];
+                    ldq(b, rr, v);
+                    am[rr] = qmax(v, am[rr]);
+                }
+            qs[0][0] = am[0] * (A8_L2E / 127.f);
+            qs[0][1] = am[1] * (A8_L2E / 127.f);
+        }
+#pragma unroll
+        for (int b = 0; b < 8; b++)
+#pragma unroll
+            for (int rr = 0; rr < 2; rr++) {
+                float v[8];
+                ldq(b, rr, v);
+                float a = am[rr];
+                if constexpr (!QROW) {
+                    a = qmax(v, 0.f);
+                    qs[b][rr] = a * (A8_L2E / 127.f);
+                }
+                const float inv = a > 0.f ? 127.f / a : 0.f;
+                int w[8]; // low byte of 1.5 * 2^23 + round(v / scale) = the int8 value
+#pragma unroll
+                for (int k = 0; k < 8; k++) w[k] = __float_as_int(fmaf(v[k], inv, 12582912.f));
+                qf[b][rr] = __byte_perm(__byte_perm(w[0], w[1], 0x0040), __byte_perm(w[2], w[3], 0x0040), 0x5410);
+                qf[b][2 + rr] = __byte_perm(__byte_perm(w[4], w[5], 0x0040), __byte_perm(w[6], w[7], 0x0040), 0x5410);
+            }
+    }
+
+    if (it0 < it1) { // K(it0) -> int8, V(it0) -> fp16 (later tiles: K(it + 1), V(it + 1) during tile it)
+        pf::cpa_wait<A8_NS - 2>();
+        __syncthreads();
+        expand_k(it0, warp, A2_NT / 32);
+        a9_cv<VB>(asm_ + (it0 % A8_NS) * A8_STG, sV0 + (it0 & 1) * A2_K * A2_LD, 0, vbt(it0));
+        a9_cv<VB>(asm_ + (it0 % A8_NS) * A8_STG, sV0 + (it0 & 1) * A2_K * A2_LD, 1, vbt(it0));
+        if (warp < 8) a9_cv<VB>(asm_ + (it0 % A8_NS) * A8_STG, sV0 + (it0 & 1) * A2_K * A2_LD, 2, vbt(it0));
+        else if (warp == 9 && it0 < itf) a9_ks(asm_ + (it0 % A8_NS) * A8_STG);
+    }
+    float o[16][4];
+#pragma unroll
+    for (int j = 0; j < 16; j++) o[j][0] = o[j][1] = o[j][2] = o[j][3] = 0.f;
+    float m0 = -INFINITY, m1 = -INFINITY, l0 = 0.f, l1 = 0.f; // rows g8, g8 + 8 (l: kept by half 1)
+    const int qr0 = qpos0 + g8, qr1 = qpos0 + g8 + 8;
+    const unsigned kofs = (16 * hf + 8 * (lane >> 4) + (lane & 7)) * A8_KLD + ((lane >> 3) & 1) * 16;
+    const unsigned va0 = (unsigned) __cvta_generic_to_shared(sV0 + (lane & 15) * A2_LD + 128 * hf + (lane >> 4) * 8);
+    float2 * mx_own = xmax + (2 * hq + hf) * 32 + lane;
+    const float2 * mx_oth = xmax + (2 * hq + (hf ^ 1)) * 32 + lane;
+    uint4 * p_own = xp + (2 * hq + hf) * 32 + lane;
+    const uint4 * p_oth = xp + (2 * hq + (hf ^ 1)) * 32 + lane;
+    float2 * xs = xsum + hq * 32 + lane;
+    // EXA: the fold R of the finished segments: M / L (L: half 1) in registers, R.o in global memory at this thread's own
+    // elements (whole item: its y2 rows; head of a split item: its partial slot)
+    float M0 = -INFINITY, M1 = -INFINITY, L0 = 0.f, L1 = 0.f;
+    bool have_r = false, rv0 = true, rv1 = true;
+    float *rb0 = nullptr, *rb1 = nullptr;
+    if (EXA) {
+        if (ex_role == 0) {
+            rb0 = cP.y2 + (size_t) (r0 + t0 + g8) * VD + (g * 6 + hq) * HD + 128 * hf + 2 * t4;
+            rb1 = rb0 + (size_t) 8 * VD;
+            rv0 = g8 < nq;
+            rv1 = g8 + 8 < nq;
+        } else {
+            rb0 = ex_base + (size_t) (hq * A2_Q + g8) * HD + 128 * hf + 2 * t4; // (slot 0)
+            rb1 = rb0 + (size_t) 8 * HD;
+        }
+    }
+    // R <- fold(R, this segment); reset: store R.o and start the next segment, else (the last one) R stays in o / m / l
+    auto ex_fold = [&](bool reset) {
+        float Mn0, a0, b0, Mn1, a1, b1;
+        ex_ab(M0, m0, Mn0, a0, b0);
+        ex_ab(M1, m1, Mn1, a1, b1);
+#pragma unroll
+        for (int j = 0; j < 16; j++) {
+            float2 *p0 = reinterpret_cast<float2 *>(rb0 + 8 * j), *p1 = reinterpret_cast<float2 *>(rb1 + 8 * j);
+            float2 v0 = make_float2(o[j][0], o[j][1]), v1 = make_float2(o[j][2], o[j][3]);
+            if (have_r && rv0) {
+                const float2 r = *p0;
+                v0 = make_float2(ex_f(a0, r.x, b0, v0.x), ex_f(a0, r.y, b0, v0.y));
+            }
+            if (have_r && rv1) {
+                const float2 r = *p1;
+                v1 = make_float2(ex_f(a1, r.x, b1, v1.x), ex_f(a1, r.y, b1, v1.y));
+            }
+            if (reset) {
+                if (rv0) *p0 = v0;
+                if (rv1) *p1 = v1;
+                o[j][0] = o[j][1] = o[j][2] = o[j][3] = 0.f;
+            } else {
+                o[j][0] = v0.x, o[j][1] = v0.y, o[j][2] = v1.x, o[j][3] = v1.y;
+            }
+        }
+        if (have_r) {
+            L0 = ex_f(a0, L0, b0, l0), L1 = ex_f(a1, L1, b1, l1), M0 = Mn0, M1 = Mn1;
+        } else {
+            L0 = l0, L1 = l1, M0 = m0, M1 = m1;
+        }
+        have_r = true;
+        if (reset) m0 = m1 = -INFINITY, l0 = l1 = 0.f;
+        else m0 = M0, m1 = M1, l0 = L0, l1 = L1;
+    };
+
+    unsigned st_a = (it0 % A8_NS) * A8_STG, st_b = ((it0 + 1) % A8_NS) * A8_STG, st_c = ((it0 + 2) % A8_NS) * A8_STG; // tiles it, it + 1, it + 2
+    // EXA: tiles in segments (it0 is a boundary: 0 or k0 segt), the fold between two segments' tile loops: it touches only
+    // this thread's registers and global memory, so it is the same as folding after tile sb's barrier
+    for (int sb = it0, se; sb < it1; sb = se) {
+        se = EXA ? min(it1, sb + segt) : it1;
+        if (EXA && sb > it0) { // a segment boundary: tiles < sb are done
+            if (ex_role != 2) {
+                ex_fold(true);
+            } else { // segment sb / segt - 1 -> its slot, then a fresh online softmax
+                float * q = ex_base + (size_t) (1 + sb / segt - 1 - ex_h) * A2_PART;
+#pragma unroll
+                for (int j = 0; j < 16; j++) {
+                    float * e = q + (size_t) (hq * A2_Q + g8) * HD + 128 * hf + 8 * j + 2 * t4;
+                    *reinterpret_cast<float2 *>(e) = make_float2(o[j][0], o[j][1]);
+                    *reinterpret_cast<float2 *>(e + 8 * HD) = make_float2(o[j][2], o[j][3]);
+                    o[j][0] = o[j][1] = o[j][2] = o[j][3] = 0.f;
+                }
+                if (hf && t4 == 0) {
+                    float2 * ml = reinterpret_cast<float2 *>(q + 6 * A2_Q * HD);
+                    ml[hq * A2_Q + g8] = make_float2(m0, l0);
+                    ml[hq * A2_Q + g8 + 8] = make_float2(m1, l1);
+                }
+                m0 = m1 = -INFINITY, l0 = l1 = 0.f;
+            }
+        }
+    for (int it = sb; it < se; it++) { // (the tile loop: one pass over it0 .. it1 - 1 unless EXA)
+        const int kb = it * A2_K;
+        pf::cpa_wait<0>(); // own copies of tiles it and it + 1
+        __syncthreads();   // everyone's copies landed; every warp is done with tile it - 1 (P V read sV[(it - 1) & 1])
+        __half * sVc = sV0 + ((it + 1) & 1) * A2_K * A2_LD; // V(it + 1) is converted into it during this tile
+        const unsigned va = va0 + (it & 1) * A2_K * A2_LD * 2;
+        uint8_t * stv = asm_ + st_b;
+        const bool cvn = it + 1 < it1;
+        const int vbn = vbt(it + 1); // V(it + 1)'s format
+        const int ia = it + A8_NS - 1; // refill the stage of tile it - 1 with tile ia
+        uint8_t * sta = asm_ + st_c;
+        unsigned ksn = 0u;
+        if (ia < it1) {
+            if (ia < itf) {
+                issue_fast(st_c);
+            } else {
+                const int kba = ia * A2_K, npa = min(A2_K, pmax + 1 - kba);
+                ksn = issue_tile(sta, ia, npa);
+            }
+        } else {
+            pf::cpa_commit();
+        }
+        const uint8_t * st = asm_ + st_a;
+        const unsigned ka = smem0 + st_a + kofs;
+        const float * ksp = reinterpret_cast<const float *>(st + A8_KB) + 16 * hf + 2 * t4;
+        // S for this warp's 16 positions: per 32-dim block two IMMAs (n8 tiles of positions 16 hf + 0..7, 8..15)
+        float s[2][4];
+#pragma unroll
+        for (int ni = 0; ni < 2; ni++) s[ni][0] = s[ni][1] = s[ni][2] = s[ni][3] = 0.f;
+#pragma unroll
+        for (int b = 0; b < 8; b++) {
+            // K(it + 1) -> int8 (its stage landed before this tile's barrier; first read by tile it + 1's S MMAs): rows warp,
+            // warp + 12 at b = 0, the third row with warps 0 - 7's third V chunk at b = 5
+            if (b == 0 && cvn) {
+                if constexpr (KB != 0) {
+                    if (kbt(it + 1) != 8) a9_k_rows<KB, 2>(stv, warp);
+                } else {
+                    expand_k(it + 1, warp, A2_NT / 32);
+                }
+            }
+            unsigned kf[4];
+            pf::ldsm_x4(kf, ka + 32 * b);
+            int d0[4], d1[4];
+            a8_imma(d0, qf[b], kf[0], kf[1]);
+            a8_imma(d1, qf[b], kf[2], kf[3]);
+            const float2 k0 = *reinterpret_cast<const float2 *>(ksp + A2_K * b);
+            const float2 k1 = *reinterpret_cast<const float2 *>(ksp + A2_K * b + 8);
+            if constexpr (QROW) {
+                s[0][0] = fmaf(a8_i2f(d0[0]), k0.x, s[0][0]);
+                s[0][1] = fmaf(a8_i2f(d0[1]), k0.y, s[0][1]);
+                s[0][2] = fmaf(a8_i2f(d0[2]), k0.x, s[0][2]);
+                s[0][3] = fmaf(a8_i2f(d0[3]), k0.y, s[0][3]);
+                s[1][0] = fmaf(a8_i2f(d1[0]), k1.x, s[1][0]);
+                s[1][1] = fmaf(a8_i2f(d1[1]), k1.y, s[1][1]);
+                s[1][2] = fmaf(a8_i2f(d1[2]), k1.x, s[1][2]);
+                s[1][3] = fmaf(a8_i2f(d1[3]), k1.y, s[1][3]);
+            } else {
+                const float q0 = qs[b][0], q1 = qs[b][1];
+                s[0][0] = fmaf(a8_i2f(d0[0]), q0 * k0.x, s[0][0]);
+                s[0][1] = fmaf(a8_i2f(d0[1]), q0 * k0.y, s[0][1]);
+                s[0][2] = fmaf(a8_i2f(d0[2]), q1 * k0.x, s[0][2]);
+                s[0][3] = fmaf(a8_i2f(d0[3]), q1 * k0.y, s[0][3]);
+                s[1][0] = fmaf(a8_i2f(d1[0]), q0 * k1.x, s[1][0]);
+                s[1][1] = fmaf(a8_i2f(d1[1]), q0 * k1.y, s[1][1]);
+                s[1][2] = fmaf(a8_i2f(d1[2]), q1 * k1.x, s[1][2]);
+                s[1][3] = fmaf(a8_i2f(d1[3]), q1 * k1.y, s[1][3]);
+            }
+            // V(it + 1) -> fp16 (its buffer was last read by P V of tile it - 1) between the MMAs
+            if ((b == 1 || b == 3) && cvn) a9_cv<VB>(stv, sVc, b >> 1, vbn);
+            if (b == 5 && cvn) {
+                if (warp < 8) {
+                    a9_cv<VB>(stv, sVc, 2, vbn);
+                    if constexpr (KB != 0) {
+                        if (kbt(it + 1) != 8) a9_k_rows<KB, 1>(stv, warp + 24);
+                    }
+                } else if (warp == 9 && it + 1 < itf) {
+                    a9_ks(stv);
+                }
+            }
+        }
+        if constexpr (QROW) {
+#pragma unroll
+            for (int ni = 0; ni < 2; ni++) {
+                s[ni][0] *= qs[0][0];
+                s[ni][1] *= qs[0][0];
+                s[ni][2] *= qs[0][1];
+                s[ni][3] *= qs[0][1];
+            }
+        }
+        // causal mask, row maxima over the pair, P, row sums: as pk_attn2
+        if (kb + A2_K - 1 > qpos0) { // (else every position of the tile is <= qpos0 <= the rows: nothing masked)
+#pragma unroll
+            for (int ni = 0; ni < 2; ni++) {
+                const int p = kb + 16 * hf + 8 * ni + 2 * t4;
+                if (p > qr0) s[ni][0] = -INFINITY;
+                if (p + 1 > qr0) s[ni][1] = -INFINITY;
+                if (p > qr1) s[ni][2] = -INFINITY;
+                if (p + 1 > qr1) s[ni][3] = -INFINITY;
+            }
+        }
+        float mx0 = -INFINITY, mx1 = -INFINITY;
+#pragma unroll
+        for (int ni = 0; ni < 2; ni++) {
+            mx0 = fmaxf(mx0, fmaxf(s[ni][0], s[ni][1]));
+            mx1 = fmaxf(mx1, fmaxf(s[ni][2], s[ni][3]));
+        }
+        mx0 = fmaxf(mx0, __shfl_xor_sync(0xffffffffu, mx0, 1));
+        mx0 = fmaxf(mx0, __shfl_xor_sync(0xffffffffu, mx0, 2));
+        mx1 = fmaxf(mx1, __shfl_xor_sync(0xffffffffu, mx1, 1));
+        mx1 = fmaxf(mx1, __shfl_xor_sync(0xffffffffu, mx1, 2));
+        *mx_own = make_float2(mx0, mx1);
+        a2_pair_sync(hq);
+        {
+            const float2 t = *mx_oth;
+            mx0 = fmaxf(mx0, t.x);
+            mx1 = fmaxf(mx1, t.y);
+        }
+        const float mn0 = fmaxf(m0, mx0), mn1 = fmaxf(m1, mx1);
+        const float al0 = a8_ex2(m0 - mn0, mn0, 1.f), al1 = a8_ex2(m1 - mn1, mn1, 1.f);
+        float x0[2], x1[2];
+        unsigned pa[2][2];
+#pragma unroll
+        for (int ni = 0; ni < 2; ni++) {
+            const float p0 = a8_ex2(s[ni][0] - mn0, mn0, 0.f);
+            const float p1 = a8_ex2(s[ni][1] - mn0, mn0, 0.f);
+            const float p2 = a8_ex2(s[ni][2] - mn1, mn1, 0.f);
+            const float p3 = a8_ex2(s[ni][3] - mn1, mn1, 0.f);
+            x0[ni] = p0 + p1;
+            x1[ni] = p2 + p3;
+            __half2 h01 = __floats2half2_rn(p0, p1), h23 = __floats2half2_rn(p2, p3);
+            pa[ni][0] = *reinterpret_cast<unsigned *>(&h01);
+            pa[ni][1] = *reinterpret_cast<unsigned *>(&h23);
+        }
+        const uint4 pown = make_uint4(pa[0][0], pa[0][1], pa[1][0], pa[1][1]);
+        *p_own = pown;
+        if (hf == 0) {
+            float ps0 = 0.f, ps1 = 0.f;
+            ps0 += x0[0];
+            ps0 += x0[1];
+            ps1 += x1[0];
+            ps1 += x1[1];
+            *xs = make_float2(ps0, ps1);
+        }
+        a2_pair_sync(hq);
+        const uint4 poth = *p_oth;
+        if (hf == 1) {
+            const float2 t = *xs;
+            float ps0 = t.x, ps1 = t.y;
+            ps0 += x0[0];
+            ps0 += x0[1];
+            ps1 += x1[0];
+            ps1 += x1[1];
+            ps0 += __shfl_xor_sync(0xffffffffu, ps0, 1);
+            ps0 += __shfl_xor_sync(0xffffffffu, ps0, 2);
+            ps1 += __shfl_xor_sync(0xffffffffu, ps1, 1);
+            ps1 += __shfl_xor_sync(0xffffffffu, ps1, 2);
+            l0 = l0 * al0 + ps0;
+            l1 = l1 * al1 + ps1;
+        }
+        m0 = mn0;
+        m1 = mn1;
+        const uint4 P0 = hf ? poth : pown, P1 = hf ? pown : poth;
+        // O += P V for this warp's 128 dims (fp16-accumulated per tile, as pk_attn2's PV16)
+        {
+            const unsigned A0[4] = {P0.x, P0.y, P0.z, P0.w}, A1[4] = {P1.x, P1.y, P1.z, P1.w};
+#pragma unroll
+            for (int j = 0; j < 8; j++) {
+                unsigned b[4], h0[2], h1[2];
+                a2_ldsm_t(b, va + 32 * j);
+                pf::hmma16z(h0, A0, b[0], b[1]);
+                pf::hmma16z(h1, A0, b[2], b[3]);
+                a2_ldsm_t(b, va + 16 * A2_LD * 2 + 32 * j);
+                pf::hmma16(h0, A1, b[0], b[1]);
+                pf::hmma16(h1, A1, b[2], b[3]);
+                const float2 u0 = __half22float2(pf::u2h(h0[0])), u1 = __half22float2(pf::u2h(h0[1]));
+                const float2 w0 = __half22float2(pf::u2h(h1[0])), w1 = __half22float2(pf::u2h(h1[1]));
+                o[2 * j][0] = o[2 * j][0] * al0 + u0.x;
+                o[2 * j][1] = o[2 * j][1] * al0 + u0.y;
+                o[2 * j][2] = o[2 * j][2] * al1 + u1.x;
+                o[2 * j][3] = o[2 * j][3] * al1 + u1.y;
+                o[2 * j + 1][0] = o[2 * j + 1][0] * al0 + w0.x;
+                o[2 * j + 1][1] = o[2 * j + 1][1] * al0 + w0.y;
+                o[2 * j + 1][2] = o[2 * j + 1][2] * al1 + w1.x;
+                o[2 * j + 1][3] = o[2 * j + 1][3] * al1 + w1.y;
+            }
+        }
+        if (ia < it1 && ia >= itf) a8_st_ks(sta, ksn); // K scales of a tile not on the copy plan
+        const unsigned st_t = st_a;
+        st_a = st_b;
+        st_b = st_c;
+        st_c = st_t;
+    }
+    }
+    pf::cpa_wait<0>();
+    if (EXA && ex_role != 2) ex_fold(false); // R of all segments of this unit -> o / m / l
+    // row sums: half 1 -> half 0 (the maxima slot is no longer read)
+    if (hf) *mx_own = make_float2(l0, l1);
+    a2_pair_sync(hq);
+    if (!hf) {
+        const float2 t = *mx_oth;
+        l0 = t.x;
+        l1 = t.y;
+    }
+    const int head = g * 6 + hq;
+    if (nseg == 1) {
+        const float il0 = l0 > 0.f ? 1.f / l0 : 0.f, il1 = l1 > 0.f ? 1.f / l1 : 0.f;
+#pragma unroll
+        for (int j = 0; j < 16; j++) {
+            const int d = 128 * hf + 8 * j + 2 * t4;
+            if (g8 < nq) *reinterpret_cast<float2 *>(cP.y2 + (size_t) (r0 + t0 + g8) * VD + head * HD + d) = make_float2(o[j][0] * il0, o[j][1] * il0);
+            if (g8 + 8 < nq) *reinterpret_cast<float2 *>(cP.y2 + (size_t) (r0 + t0 + g8 + 8) * VD + head * HD + d) = make_float2(o[j][2] * il1, o[j][3] * il1);
+        }
+    } else {
+        float * pp = !EXA ? part + (size_t) (blockIdx.x - nfull) * A2_PART
+                          : ex_base + (size_t) (ex_role == 1 ? 0 : 1 + (it1 - 1) / segt - ex_h) * A2_PART;
+        const int r0 = hq * A2_Q + g8;
+#pragma unroll
+        for (int j = 0; j < 16; j++) {
+            const int d = 128 * hf + 8 * j + 2 * t4;
+            *reinterpret_cast<float2 *>(pp + (size_t) r0 * HD + d) = make_float2(o[j][0], o[j][1]);
+            *reinterpret_cast<float2 *>(pp + (size_t) (r0 + 8) * HD + d) = make_float2(o[j][2], o[j][3]);
+        }
+        if (hf && t4 == 0) {
+            float2 * ml = reinterpret_cast<float2 *>(pp + 6 * A2_Q * HD);
+            ml[r0] = make_float2(EXA ? m0 : m0 * (1.f / A8_L2E), l0); // natural-log units for pk_attn2_comb (EXA: log2)
+            ml[r0 + 8] = make_float2(EXA ? m1 : m1 * (1.f / A8_L2E), l1);
+        }
+    }
+}
