@@ -14,7 +14,7 @@
 // QROW=1 (QROW form, q8 / low-bit generic), QSCALE (Q multiplier, default 1), SPECIAL=1 (Inf / NaN / zero rows in Q and the
 // K scales), SEED, WARM_MS (default 4000: clocks), NCU_N=<launches> (the first variant of AB_VARS only, for ncu), OUT_REPS (repeat the
 // new kernels' output comparison), DIFF_HIST=1 (where outputs differ: per head, row of a query tile, dim / 8), BETWEEN=<n> (n launches of pk_attn8 before each
-// compared launch), STRESS=1 (other kernels on a second stream during the compared launches: other start times and SM shares).
+// compared launch).
 #define MK_SHARED_NS // (anonymous, as in qwen38_mk.cu)
 #include "../mk_shared.cuh"
 #include <random>
@@ -335,13 +335,6 @@ Side make_side(std::mt19937 & rng, int bits, size_t rows_per_head) {
     o.s = static_cast<__half *>(d);
     return o;
 }
-__global__ void k_stress(float * __restrict__ a, unsigned n, int iters) { // STRESS: memory and float work on a second stream
-    unsigned h = (blockIdx.x * 97u + threadIdx.x) * 2654435761u;
-    for (int i = 0; i < iters; i++) {
-        h = h * 1664525u + 1013904223u;
-        a[(h >> 8) % n] += 1.f;
-    }
-}
 // nvidia-smi sampled in a thread until it is stopped; take() returns the means since the last take()
 struct Smi {
     std::atomic<bool> stop{false};
@@ -511,24 +504,6 @@ int main(int argc, char ** argv) {
             else pk_attn2_comb<<<N - pl.nfull, 256>>>(T, pl.nfull, pl.S, pl.part);
         }
     };
-    // STRESS: launches on a second stream all along, sharing the SMs and the memory with the compared launches
-    std::atomic<bool> stress_stop{false};
-    std::thread stress;
-    if (getenv("STRESS") && atoi(getenv("STRESS"))) {
-        stress = std::thread([&] {
-            cudaStream_t st;
-            float * a;
-            const unsigned n = 1u << 24;
-            CK(cudaStreamCreate(&st));
-            CK(cudaMalloc(&a, n * 4));
-            for (unsigned i = 0; !stress_stop; i++) {
-                k_stress<<<dim3(20 + i % 60), 64, 0, st>>>(a, n, 2000 + (i % 7) * 4000);
-                CK(cudaStreamSynchronize(st));
-            }
-            CK(cudaFree(a));
-            CK(cudaStreamDestroy(st));
-        });
-    }
     for (auto [T, n0] : cfg) {
         const int nqt = (T + A2_Q - 1) / A2_Q, N = nqt * NKV;
         Plan pl{};
@@ -667,8 +642,6 @@ int main(int argc, char ** argv) {
         }
         fflush(stdout);
     }
-    stress_stop = true;
-    if (stress.joinable()) stress.join();
     printf(nfail ? "FAILED: %d comparisons differ\n" : "DONE\n", nfail);
     return nfail ? 1 : 0;
 }

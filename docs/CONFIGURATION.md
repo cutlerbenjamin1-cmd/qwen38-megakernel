@@ -635,7 +635,7 @@ The CUDA microbenchmarks in `bench/` are built by hand (`nvcc ...`, the line is 
 | Switch | File | What it does |
 |---|---|---|
 | `AB_VARS=<digits>` (env) | `attn_bench.cu` | prefill attention kernels to run, the first is the reference (0 `pk_attn8`, 1 `pk_attn9`; default `01`) |
-| `EXA=1\|2`, `QROW=1`, `QSCALE`, `SPECIAL=1`, `SEED`, `OUT_REPS`, `BETWEEN`, `STRESS=1`, `DIFF_HIST=1`, `WARM_MS`, `NCU_N` (env) | `attn_bench.cu` | MK_EXACT's form (2: split), the per-row Q scales, inputs, repeated comparisons under other launch timing, where outputs differ; the top of the file |
+| `EXA=1\|2`, `QROW=1`, `QSCALE`, `SPECIAL=1`, `SEED`, `OUT_REPS`, `BETWEEN`, `DIFF_HIST=1`, `WARM_MS`, `NCU_N` (env) | `attn_bench.cu` | MK_EXACT's form (2: split), the per-row Q scales, inputs, repeated comparisons under other launch timing, where outputs differ; the top of the file |
 | `CTX`, `KQ4=1`, `VQ4=1`, `KROT=1`, `TINV=1` (env) | `dattn_bench.cu` | decode attention: cache size, q4 K / V, rotated K, the token-count invariance check |
 | `HINT` (-D) | `ffn_bench.cu` | the load cache hint of the replica (0 none, 1 evict-first L2 policy, 2 256-byte L2 fetch) |
 | `WV_L2PF`, `WV_LD256`, `WV_NOPOL`, `WV_TILEMAJ`, `WV_SBU`, `WV_SPS`, `WV_RH`, `WV_PF`, `WV_Q6FM`, `WV_Q6HP`, `WV2_ROLL`, `WV_V2` (-D) | `wvgemm_bench.cu` | variants of the tensor-core verify GEMM under test: L2 prefetch distance, 256-byte fetch hint, no evict-first policy, tile-major layout, super-blocks per batch, stage / row tiling parameters, prefetch form, Q6_K fragment-ordered forms, rolling prefetch, the v2 kernel |
