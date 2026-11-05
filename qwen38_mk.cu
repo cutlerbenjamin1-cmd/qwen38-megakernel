@@ -3120,8 +3120,8 @@ __device__ __forceinline__ void aqx_conv(float (&acc)[MTA][4][4], const uint8_t 
     }
 }
 // S = Q K^T from the fragments above (the same MMAs in the same order: k-step ks, then row tile i). The Q loads go out AQX_LA MMAs
-// ahead in the program text: right in front of its MMA (ptxas's order in the engine, not in a small bench) each load's latency
-// was a stall of that MMA, ~30% of the S warps' samples at 101k.
+// ahead in the program text: a small module keeps that, in the engine ptxas moves each load back in front of its MMA (no effect
+// measured there; the stall is ~30% of the S warps' samples at 101k).
 constexpr int AQX_LA = 4;
 template <int MT, int MTA, int LDH>
 __device__ __forceinline__ void aqx_mma(float (&s)[MT][4], const float (&acc)[MTA][4][4], unsigned qaddr) {

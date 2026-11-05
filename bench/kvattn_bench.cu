@@ -4,7 +4,9 @@
 //   python3 kvattn_gen.py <repo> fbb8efb <gen>/kvattn_old.inc; python3 kvattn_gen.py <repo> WORK <gen>/kvattn_new.inc
 //   nvcc -O3 -std=c++17 -arch=sm_86 -Xptxas=-dlcm=cg,-v -I.. -I<gen> kvattn_bench.cu -o kvattn_bench
 //   ./kvattn_bench check [smoke]                               exactness matrix (formats x n x T), exit 1 on any difference
-//   ./kvattn_bench time <F|D|q8> <n> <T> <rounds> <reps>       interleaved old / new, ms per call
+//   ./kvattn_bench time <F|D|q8> <n> <T> <rounds> <reps>       interleaved old / new, ms per call (KVB_Q8M=1: q8 data through new's MIX kernel)
+//   ./kvattn_bench stress <F|D|q8> <n> <T> <runs>              new many times against one run of old: races one-shot check cannot see
+// Good for exactness and coarse checks; ptxas schedules the same functions differently in the engine: decide role splits on engine stamps.
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
 
