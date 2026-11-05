@@ -3087,36 +3087,69 @@ __device__ __forceinline__ void aq_issue(int t, uint8_t * dk, const int8_t * Kq,
 __device__ __forceinline__ void aqx_cp16(unsigned d, const void * s, unsigned c, unsigned lim) {
     asm volatile("{ .reg .pred p; setp.lt.u32 p, %2, %3; @p cp.async.cg.shared.global [%0], [%1], 16; }" ::"r"(d), "l"(s), "r"(c), "r"(lim) : "memory");
 }
-// aq_issue for a warp of warps 4 .. 15 (wn = warp - 4) and one full tile of a slot's main buffer (MIX; the caller decides,
-// aq_issue serves every other tile): wn even copies K, wn odd V, so a warp needs one side's pointers. A warp's lanes copy a
-// pair of rows per step, chunk c = lane & 15 of row rp = lane >> 4: 12 + 12 + 8 rows over 3 steps, and one warp per side
-// copies the scales in place of its third pair. q / s: the side's first row, row: the tile's first row (< 2^20 rows of at
+// aq_issue for one side of one full tile (MIX; the caller decides, aq_issue serves the partial last tile of a chunk),
+// issued by WG warps (wi: this one): a warp's lanes copy a pair of rows per step, chunk c = lane & 15 of row rp = lane >> 4,
+// and warp 0 of them the scales. q / s: the side's buffers (main or ring), row: the tile's first row in them (< 2^20 rows of at
 // most 256 bytes: 32 bits hold the offset). Same chunks and destinations as aq_issue for such a tile.
-__device__ __forceinline__ void aqx_issue(int wn, int lane, const int8_t * q, const __half * s, unsigned row, int bits, uint8_t * st) {
-    const int pr = wn >> 1;
+template <int WG>
+__device__ __forceinline__ void aqx_side(int wi, int lane, const int8_t * q, const __half * s, unsigned row, int bits, uint8_t * st) {
     const unsigned rb = 32u * bits, c = lane & 15, rp = lane >> 4, lim = 2u * bits, st0 = (unsigned) __cvta_generic_to_shared(st);
-    const int8_t * const p = q + (size_t) ((row + 2 * pr + rp) * rb + 16u * c);
-    const unsigned d = st0 + (2 * pr + rp) * KVQ_ROW + 16u * c;
-    aqx_cp16(d, p, c, lim);
-    aqx_cp16(d + 12 * KVQ_ROW, p + 12 * rb, c, lim);
-    if (pr < 4) {
-        aqx_cp16(d + 24 * KVQ_ROW, p + 24 * rb, c, lim);
-    } else if (pr == 4) {
+    const int8_t * const p = q + (size_t) ((row + 2 * wi + rp) * rb + 16u * c);
+    const unsigned d = st0 + (2 * wi + rp) * KVQ_ROW + 16u * c;
+#pragma unroll
+    for (int k = 0; k < 16 / WG; k++) aqx_cp16(d + 2 * WG * k * KVQ_ROW, p + 2 * WG * k * rb, c, lim);
+    if (wi == 0) {
         const unsigned ds = st0 + lane * KVQ_ROW + 256;
         const __half * const ps = s + (size_t) (row + lane) * (HD / 32);
         asm volatile("cp.async.cg.shared.global [%0], [%1], 16;" ::"r"(ds), "l"(ps) : "memory");
     }
 }
-// rows r0, r0 + rs, .. (N rows) of a staged tile -> biased bytes: kv_rows_expand<BITS, false>'s bytes without a branch per row;
-// all loads first, then every lane has read before any lane writes (the output overlaps the input)
+// the S warps' B fragments of one K tile row (attn_core_q8_t's conversion, the same words and operations), kept in acc's
+// registers across the interval barrier: a warp of the S / softmax groups converts in the interval before it multiplies
+template <int MTA>
+__device__ __forceinline__ void aqx_conv(float (&acc)[MTA][4][4], const uint8_t * krow, int tig, unsigned kxm, unsigned ksub) {
+    const uint4 scv = *reinterpret_cast<const uint4 *>(krow + 256);
+    const unsigned scw[4] = {scv.x, scv.y, scv.z, scv.w};
+#pragma unroll
+    for (int ks = 0; ks < HD / 16; ks++) {
+        const unsigned sw = __byte_perm(scw[ks >> 2], 0, (ks & 2) ? 0x3232 : 0x1010);
+        const __half2 dd = *reinterpret_cast<const __half2 *>(&sw);
+        float (&a)[4] = acc[ks >> 3][(ks >> 1) & 3];
+        a[2 * (ks & 1)] = __uint_as_float(aq_q8x2(*reinterpret_cast<const unsigned short *>(krow + 16 * ks + 2 * tig), dd, kxm, ksub));
+        a[2 * (ks & 1) + 1] = __uint_as_float(aq_q8x2(*reinterpret_cast<const unsigned short *>(krow + 16 * ks + 2 * tig + 8), dd, kxm, ksub));
+    }
+}
+// S = Q K^T from the fragments above (the same MMAs in the same order: k-step ks, then row tile i)
+template <int MT, int MTA, int LDH>
+__device__ __forceinline__ void aqx_mma(float (&s)[MT][4], const float (&acc)[MTA][4][4], unsigned qaddr) {
+#pragma unroll
+    for (int i = 0; i < MT; i++)
+#pragma unroll
+        for (int k = 0; k < 4; k++) s[i][k] = 0.f;
+#pragma unroll
+    for (int ks = 0; ks < HD / 16; ks++) {
+        const float (&b)[4] = acc[ks >> 3][(ks >> 1) & 3];
+        const unsigned b0 = __float_as_uint(b[2 * (ks & 1)]), b1 = __float_as_uint(b[2 * (ks & 1) + 1]);
+#pragma unroll
+        for (int i = 0; i < MT; i++) {
+            unsigned a[4];
+            asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0,%1,%2,%3}, [%4];"
+                         : "=r"(a[0]), "=r"(a[1]), "=r"(a[2]), "=r"(a[3])
+                         : "r"(qaddr + 2 * (16 * i * LDH + 16 * ks)));
+            mma16816(s[i], a[0], a[1], a[2], a[3], b0, b1);
+        }
+    }
+}
+// rows r0 .. r0 + N - 1 of a staged tile -> biased bytes: kv_rows_expand<BITS, false>'s bytes without a branch per row; all loads
+// first, then every lane has read before any lane writes (the output overlaps the input)
 template <int BITS, int N>
-__device__ __forceinline__ void kvx_rows(uint8_t * st, int r0, int rs) {
+__device__ __forceinline__ void kvx_rows(uint8_t * st, int r0) {
     constexpr int HB = BITS - 4;
     const int lane = threadIdx.x & 31;
     unsigned wd[N], hi[N];
 #pragma unroll
     for (int k = 0; k < N; k++) {
-        const uint8_t * row = st + (r0 + k * rs) * KVQ_ROW;
+        const uint8_t * row = st + (r0 + k) * KVQ_ROW;
         wd[k] = *reinterpret_cast<const unsigned *>(row + 4 * lane);
         hi[k] = 0u;
         if constexpr (HB == 1) hi[k] = row[128 + lane];
@@ -3131,17 +3164,18 @@ __device__ __forceinline__ void kvx_rows(uint8_t * st, int r0, int rs) {
             lo |= kv_spread4<HB>(hi[k]);
             hv |= kv_spread4<HB>(hi[k] >> (4 * HB));
         }
-        *reinterpret_cast<uint2 *>(st + (r0 + k * rs) * KVQ_ROW + 8 * lane) = make_uint2(lo, hv);
+        *reinterpret_cast<uint2 *>(st + (r0 + k) * KVQ_ROW + 8 * lane) = make_uint2(lo, hv);
     }
 }
 // the most common formats first: compare and branch, no jump table (LDC + BRX per tile and warp); bits != 8
 template <int N>
-__device__ __forceinline__ void kvx_tile(uint8_t * st, int bits, int r0, int rs) {
-    if (bits == 5) kvx_rows<5, N>(st, r0, rs);
-    else if (bits == 6) kvx_rows<6, N>(st, r0, rs);
-    else if (bits == 4) kvx_rows<4, N>(st, r0, rs);
-    else kvx_rows<7, N>(st, r0, rs);
+__device__ __forceinline__ void kvx_tile(uint8_t * st, int bits, int r0) {
+    if (bits == 5) kvx_rows<5, N>(st, r0);
+    else if (bits == 6) kvx_rows<6, N>(st, r0);
+    else if (bits == 4) kvx_rows<4, N>(st, r0);
+    else kvx_rows<7, N>(st, r0);
 }
+constexpr int AQX_KP = 2; // attn_core_q8_t, T up to this: K -> bytes on the P V warps (few MMAs), not on the multiplying group
 #endif
 
 // MIX = false: all-q8 slots (attn_core_q8). MIX = true (attn_core_q8m): K and V of the slot each q8 or q4 .. q7 (MK_KV), the
@@ -3228,10 +3262,36 @@ __device__ __forceinline__ void attn_core_q8_t(const LayerW & W, int slot, int n
             else aq_issue<NT - 128, MIX>(t_, dk, kq, ks, tnp(tk), dv, vq, vs, tv < 0 ? -1 : tnp(tv), kb_, vb_);
         };
 #if MK_W48X
-        // MIX: intervals jt < jfx issue K(jt + 3) and V(jt + 1) as full main-buffer tiles (aqx_issue); the first row of this
-        // (kv head, chunk) in 32 bits
-        const int jfx = MIX ? min(ntl - 1, min(jtr_k, jtr_v)) - 3 : 0;
+        // MIX: tiles below jff are full (aqx_side; the partial last tile of a chunk: aq_issue); the first row of this (kv head, chunk) in 32 bits
+        const int jff = MIX ? (c1 - c0) / TP : 0;
         const unsigned rowb = (unsigned) g * (unsigned) ctx + (unsigned) c0;
+        auto rrow = [&](int t) { // (kv_tile_src's ring row)
+            int r0 = wsm + (c0 + t * TP - wsr);
+            if (r0 >= cB.kvrc) r0 -= cB.kvrc;
+            return (unsigned) g * cB.kvrc + r0;
+        };
+        auto issue_kx = [&](int tk, uint8_t * dk) { // by the 4 warps of a group (warp & 3)
+            if (tk < jff) {
+                if (tk < jtr_k) aqx_side<4>(warp & 3, lane, cB.kvp[0][slot], cB.kvs[0][slot], rowb + tk * TP, kf.kb, dk);
+                else aqx_side<4>(warp & 3, lane, cB.kvrp[0][slot], cB.kvrs[0][slot], rrow(tk), 8, dk);
+            } else {
+                const int8_t * kq;
+                const __half * ks;
+                kv_tile_src(0, slot, g, c0 + tk * TP, wsr, wsm, kf.kb, tk >= jtr_k, kq, ks);
+                aq_issue<128, true>((warp & 3) * 32 + lane, dk, kq, ks, tnp(tk), vring, kq, ks, -1, kbt(tk), 8);
+            }
+        };
+        auto issue_vx = [&](int tv, uint8_t * dv) { // likewise
+            if (tv < jff) {
+                if (tv < jtr_v) aqx_side<4>(warp & 3, lane, cB.kvp[1][slot], cB.kvs[1][slot], rowb + tv * TP, kf.vb, dv);
+                else aqx_side<4>(warp & 3, lane, cB.kvrp[1][slot], cB.kvrs[1][slot], rrow(tv), 8, dv);
+            } else {
+                const int8_t * vq;
+                const __half * vs;
+                kv_tile_src(1, slot, g, c0 + tv * TP, wsr, wsm, kf.vb, tv >= jtr_v, vq, vs);
+                aq_issue<128, true>((warp & 3) * 32 + lane, kring, vq, vs, -1, dv, vq, vs, tnp(tv), 8, vbt(tv));
+            }
+        };
 #endif
         auto issue012 = [&]() { // all-q8: commit groups {K(0)}, {K(1)}, {K(2), V(0)}
             issue(tid, kring, 0, vring, -1, NT);
@@ -3355,12 +3415,24 @@ __device__ __forceinline__ void attn_core_q8_t(const LayerW & W, int slot, int n
         // (MIX: {K(0), K(1)}, {K(2), V(0)}; per interval {K(jt + 3), V(jt + 1)}, waiting for {K(jt + 2), V(jt)}, and the
         // low-bit tiles that landed at the end of interval jt - 1, K(jt + 1) and V(jt - 1), are expanded to int8 in interval jt)
         if constexpr (MIX) {
+#if MK_W48X
+            // Everything but the MMAs runs on the group that is not multiplying. K(t): issued at the start of interval t - 3, landed
+            // by its end, to bytes in t - 2, converted to fp16 fragments in t - 1 by the group that multiplies S(t) in t, its stage
+            // free from then on. V(t): issued at the start of t, to bytes in t + 1, read in t + 2. So S's conversion runs under the
+            // other group's MMAs, and the tensor pipe is the only thing left on the S and P V warps. {K(0), K(1)} landed, K(0) ->
+            // bytes by all warps; interval -1: K(2), K(0) converted, K(1) -> bytes.
+            issue(tid, kring, 0, vring, -1, NT);
+            issue(tid, kring + AQ_STG, 1, vring, -1, NT);
+            asm volatile("cp.async.commit_group;" ::: "memory");
+            asm volatile("cp.async.wait_group 0;" ::: "memory");
+#else
             issue(tid, kring, 0, vring, -1, NT);
             issue(tid, kring + AQ_STG, 1, vring, -1, NT);
             asm volatile("cp.async.commit_group;" ::: "memory");
             issue(tid, kring + 2 * AQ_STG, 2, vring, 0, NT);
             asm volatile("cp.async.commit_group;" ::: "memory");
             asm volatile("cp.async.wait_group 1;" ::: "memory");
+#endif
             __syncthreads();
             const int kb0 = kbt(0); // K(0) -> bytes now (all warps); K(1) in interval 0
             if (kb0 != 8) {
@@ -3373,16 +3445,65 @@ __device__ __forceinline__ void attn_core_q8_t(const LayerW & W, int slot, int n
             __syncthreads();
         }
 
-        float acc[MT][4][4]; // P V warps: O rows 16 i + {g8, g8 + 8}, dims 32 wn + 8 tig + jj and + 4
+#if MK_W48X
+        constexpr int MTA = MIX ? (MT > 2 ? MT : 2) : MT; // MIX: the S / softmax groups keep their 32 B fragments here
+#else
+        constexpr int MTA = MT;
+#endif
+        float acc[MTA][4][4]; // P V warps: O rows 16 i + {g8, g8 + 8}, dims 32 wn + 8 tig + jj and + 4
 #pragma unroll
-        for (int i = 0; i < MT; i++)
+        for (int i = 0; i < MTA; i++)
 #pragma unroll
             for (int j = 0; j < 4; j++)
 #pragma unroll
                 for (int k = 0; k < 4; k++) acc[i][j][k] = 0.f;
 
+#if MK_W48X
+        for (int jt = MIX ? -1 : 0; jt < ntl + 2; jt++) {
+            // MIX: warps 0 - 3 and 12 - 15 are two groups: S(t) on the group of t's parity, in interval t + 1 the same group
+            // runs softmax(t), issues K(t + 4) and converts K(t + 2) (one warp of each group per SMSP)
+            const int sg = warp < 4 ? 0 : warp >= 12 ? 1 : -1;
+            const bool rC = sg >= 0 && sg != (jt & 1);
+            if constexpr (MIX) {
+                if (rC) {
+                    if (jt + 3 < ntl) issue_kx(jt + 3, kring + ((jt + 3) % NSK) * AQ_STG);
+                    if (jt >= 0 && jt < ntl) issue_vx(jt, vring + (jt % NSV) * AQ_STG);
+                    if (jt + 1 < ntl) {
+                        const int kbj = kbt(jt + 1);
+                        aqx_conv(acc, kring + ((jt + 1) % NSK) * AQ_STG + (8 * (warp & 3) + g8) * KVQ_ROW, tig, kbj == 8 ? 0x8080u : 0u, aq_sub(kbj));
+                    }
+                } else if (sg >= 0) {
+                    if (jt >= 0 && jt < ntl) {
+                        float s[MT][4];
+                        aqx_mma<MT, MTA, LDH>(s, acc, (unsigned) __cvta_generic_to_shared(sQ + (lane & 15) * LDH + (lane >> 4) * 8));
+#pragma unroll
+                        for (int i = 0; i < MT; i++) {
+                            float * so = sS + (jt & 1) * 32 * LDS + (16 * i + g8) * LDS + 8 * (warp & 3) + 2 * tig;
+                            so[0] = s[i][0];
+                            so[1] = s[i][1];
+                            so[8 * LDS] = s[i][2];
+                            so[8 * LDS + 1] = s[i][3];
+                        }
+                    }
+                    // K(jt + 2) and V(jt - 1) -> bytes after the MMAs (both landed by the end of jt - 1; all TP rows: stale ones past np
+                    // stay finite under zero scales)
+                    if constexpr (T > AQX_KP) {
+                        if (jt + 2 < ntl) {
+                            const int kbx = kbt(jt + 2);
+                            if (kbx != 8) kvx_tile<8>(kring + ((jt + 2) % NSK) * AQ_STG, kbx, 8 * (warp & 3));
+                        }
+                    }
+                    if (jt >= 1 && jt - 1 < ntl) {
+                        const int vbx = vbt(jt - 1);
+                        if (vbx != 8) kvx_tile<8>(vring + ((jt - 1) % NSV) * AQ_STG, vbx, 8 * (warp & 3));
+                    }
+                }
+            }
+            if (!MIX && warp < 4) {
+#else
         for (int jt = 0; jt < ntl + 2; jt++) {
             if (warp < 4) {
+#endif
                 // ---- S(jt) = Q K(jt)^T: B = positions 8 wn + g8 (all 16 k-steps converted first), all row tiles
                 if (jt < ntl) {
                     const int wn = warp;
@@ -3440,7 +3561,11 @@ __device__ __forceinline__ void attn_core_q8_t(const LayerW & W, int slot, int n
                     }
                     }
                 }
+#if MK_W48X
+            } else if (warp >= 4 && warp < 12) {
+#else
             } else if (warp < 12) {
+#endif
                 // ---- O = O * alpha + P(jt - 2) V(jt - 2): B = dims 32 wn + 4 g8 + jj of n8 tile jj, all row tiles
                 if (jt >= 2) {
                     const int wn = warp - 4, jp = jt - 2, b = jp & 1;
@@ -3489,11 +3614,17 @@ __device__ __forceinline__ void attn_core_q8_t(const LayerW & W, int slot, int n
                         }
                     }
                 }
+#if MK_W48X
+            } else if (!MIX || rC) {
+                const int sn_ = MIX ? warp & 3 : warp - 12;
+#else
             } else {
+                const int sn_ = warp - 12;
+#endif
                 // ---- online softmax of tile jt - 1 (causal mask: row token t sees positions <= n + t); lane l4 of the
                 // row's quad holds positions l4 + 4 k
-                if (jt >= 1 && jt <= ntl && 8 * (warp - 12) < R) {
-                    const int r = 8 * (warp - 12) + (lane >> 2), l4 = lane & 3; // rows >= R (zero S) are not stored
+                if (jt >= 1 && jt <= ntl && 8 * sn_ < R) {
+                    const int r = 8 * sn_ + (lane >> 2), l4 = lane & 3; // rows >= R (zero S) are not stored
                     const int jp = jt - 1, b = jp & 1;
                     const int tb = c0 + jp * TP, np_ = min(TP, c1 - tb);
                     const int lim = n + (r % T);
@@ -3544,21 +3675,11 @@ __device__ __forceinline__ void attn_core_q8_t(const LayerW & W, int slot, int n
             if (warp >= 4) {
                 if constexpr (MIX) {
 #if MK_W48X
-                    if (jt < jfx) {
-                        const int wn_ = warp - 4, sd = wn_ & 1;
-                        aqx_issue(wn_, lane, cB.kvp[sd][slot], cB.kvs[sd][slot], rowb + (sd ? jt + 1 : jt + 3) * TP, sd ? kf.vb : kf.kb,
-                                  sd ? vring + ((jt + 1) % NSV) * AQ_STG : kring + ((jt + 3) % NSK) * AQ_STG);
-                    } else if (jt + 1 < ntl) {
-                        issue(tid - 128, kring + ((jt + 3) % NSK) * AQ_STG, jt + 3, vring + ((jt + 1) % NSV) * AQ_STG, jt + 1, NT - 128);
-                    }
-                    // K(jt + 1) and V(jt - 1) -> bytes (all TP rows, as below): rows 0 .. 15 on the P V warps, 16 .. 31 on the softmax warps
-                    const int kbx = jt + 1 < ntl ? kbt(jt + 1) : 8, vbx = jt >= 1 && jt - 1 < ntl ? vbt(jt - 1) : 8;
-                    if (warp < 12) {
-                        if (kbx != 8) kvx_tile<2>(kring + ((jt + 1) % NSK) * AQ_STG, kbx, 2 * (warp - 4), 1);
-                        if (vbx != 8) kvx_tile<2>(vring + ((jt - 1) % NSV) * AQ_STG, vbx, 2 * (warp - 4), 1);
-                    } else {
-                        if (kbx != 8) kvx_tile<4>(kring + ((jt + 1) % NSK) * AQ_STG, kbx, 16 + warp - 12, 4);
-                        if (vbx != 8) kvx_tile<4>(vring + ((jt - 1) % NSV) * AQ_STG, vbx, 16 + warp - 12, 4);
+                    if constexpr (T <= AQX_KP) {
+                        if (warp < 12 && jt + 2 < ntl) {
+                            const int kbx = kbt(jt + 2);
+                            if (kbx != 8) kvx_tile<4>(kring + ((jt + 2) % NSK) * AQ_STG, kbx, 4 * (warp - 4));
+                        }
                     }
 #else
                     // K(jt + 3) into the stage of K(jt - 1); then the
@@ -3582,6 +3703,11 @@ __device__ __forceinline__ void attn_core_q8_t(const LayerW & W, int slot, int n
                 }
             }
             asm volatile("cp.async.commit_group;" ::: "memory");
+#if MK_W48X
+            if constexpr (MIX) { // (the copies a group issued in this interval: the other group expands them in the next)
+                if (sg >= 0) asm volatile("cp.async.wait_group 0;" ::: "memory");
+            } else
+#endif
             if constexpr (MIX) asm volatile("cp.async.wait_group 1;" ::: "memory");
             else asm volatile("cp.async.wait_group 2;" ::: "memory");
             __syncthreads();
@@ -3896,9 +4022,8 @@ __device__ __forceinline__ void attn_core_w48(const LayerW & W, int slot, int n,
         issue(tid, kring + AQ_STG, 1, vring, -1, NT);
         asm volatile("cp.async.commit_group;" ::: "memory");
 #if MK_W48X
-        // MIX: the copies of interval jt go out at its start, into stages whose readers finished in jt - 1, and land by its end,
-        // so a tile is expanded by other warps one interval before it is read and the S warps only read K. {K(0), K(1)}
-        // landed; K(0) -> bytes now by all warps, K(1) in interval 0. Same stages, same staged bytes.
+        // MIX: attn_core_q8_t's schedule, in the same three K and three V stages: K(t + 3) goes into K(t)'s stage at the start of
+        // interval t (K(t) was converted in t - 1), V(t) into V(t - 3)'s (read in t - 1). {K(0), K(1)} landed, K(0) -> bytes.
         if constexpr (MIX) {
             asm volatile("cp.async.wait_group 0;" ::: "memory");
             __syncthreads();
@@ -3911,8 +4036,35 @@ __device__ __forceinline__ void attn_core_w48(const LayerW & W, int slot, int n,
             asm volatile("cp.async.wait_group 1;" ::: "memory");
             __syncthreads();
         }
-        const int jfx = MIX ? min(ntl - 1, min(jtr_k, jtr_v)) - 2 : 0;
+        const int jff = MIX ? (c1 - c0) / TP : 0;
         const unsigned rowb = (unsigned) g * (unsigned) ctx + (unsigned) c0;
+        auto rrow = [&](int t) { // (kv_tile_src's ring row)
+            int r0 = wsm + (c0 + t * TP - wsr);
+            if (r0 >= cB.kvrc) r0 -= cB.kvrc;
+            return (unsigned) g * cB.kvrc + r0;
+        };
+        auto issue_kx = [&](int tk, uint8_t * dk) { // by the 4 warps of a group (warp & 3)
+            if (tk < jff) {
+                if (tk < jtr_k) aqx_side<4>(warp & 3, lane, cB.kvp[0][slot], cB.kvs[0][slot], rowb + tk * TP, kf.kb, dk);
+                else aqx_side<4>(warp & 3, lane, cB.kvrp[0][slot], cB.kvrs[0][slot], rrow(tk), 8, dk);
+            } else {
+                const int8_t * kq;
+                const __half * ks;
+                kv_tile_src(0, slot, g, c0 + tk * TP, wsr, wsm, kf.kb, tk >= jtr_k, kq, ks);
+                aq_issue<128, true>((warp & 3) * 32 + lane, dk, kq, ks, tnp(tk), vring, kq, ks, -1, kbt(tk), 8);
+            }
+        };
+        auto issue_vx = [&](int tv, uint8_t * dv) { // likewise
+            if (tv < jff) {
+                if (tv < jtr_v) aqx_side<4>(warp & 3, lane, cB.kvp[1][slot], cB.kvs[1][slot], rowb + tv * TP, kf.vb, dv);
+                else aqx_side<4>(warp & 3, lane, cB.kvrp[1][slot], cB.kvrs[1][slot], rrow(tv), 8, dv);
+            } else {
+                const int8_t * vq;
+                const __half * vs;
+                kv_tile_src(1, slot, g, c0 + tv * TP, wsr, wsm, kf.vb, tv >= jtr_v, vq, vs);
+                aq_issue<128, true>((warp & 3) * 32 + lane, kring, vq, vs, -1, dv, vq, vs, tnp(tv), 8, vbt(tv));
+            }
+        };
 #else
         asm volatile("cp.async.wait_group 1;" ::: "memory");
         __syncthreads();
@@ -3926,43 +4078,58 @@ __device__ __forceinline__ void attn_core_w48(const LayerW & W, int slot, int n,
 #pragma unroll
                 for (int k = 0; k < 4; k++) acc[i][j][k] = 0.f;
 
-        for (int jt = 0; jt < ntl + 2; jt++) {
 #if MK_W48X
+        for (int jt = MIX ? -1 : 0; jt < ntl + 2; jt++) {
+            // MIX: the two warp groups of attn_core_q8_t (S(t) in t; softmax(t), K(t + 4) copies, K(t + 2) conversion in t + 1)
+            const int sg = warp < 4 ? 0 : warp >= 12 ? 1 : -1;
+            const bool rC = sg >= 0 && sg != (jt & 1);
             if constexpr (MIX) {
-                if (warp >= 4) {
-                    if (jt < jfx) {
-                        const int wn_ = warp - 4, sd = wn_ & 1;
-                        aqx_issue(wn_, lane, cB.kvp[sd][slot], cB.kvs[sd][slot], rowb + (sd ? jt : jt + 2) * TP, sd ? kf.vb : kf.kb,
-                                  sd ? vring + (jt % NSV) * AQ_STG : kring + ((jt + 2) % NSK) * AQ_STG);
-                    } else if (jt < ntl) {
-                        issue(tid - 128, kring + ((jt + 2) % NSK) * AQ_STG, jt + 2, vring + (jt % NSV) * AQ_STG, jt, NT - 128);
+                if (rC) {
+                    if (jt + 3 < ntl) issue_kx(jt + 3, kring + ((jt + 3) % NSK) * AQ_STG);
+                    if (jt >= 0 && jt < ntl) issue_vx(jt, vring + (jt % NSV) * AQ_STG);
+                    if (jt + 1 < ntl) {
+                        const int kbj = kbt(jt + 1);
+                        aqx_conv(acc, kring + ((jt + 1) % NSK) * AQ_STG + (8 * (warp & 3) + g8) * KVQ_ROW, tig, kbj == 8 ? 0x8080u : 0u, aq_sub(kbj));
                     }
-                    asm volatile("cp.async.commit_group;" ::: "memory");
-                    // K(jt + 1) -> bytes on the softmax warps, V(jt - 1) on the P V warps (all TP rows: stale rows past np stay finite)
-                    if (warp >= 12) {
-                        const int kbx = jt + 1 < ntl ? kbt(jt + 1) : 8;
-                        if (kbx != 8) kvx_tile<8>(kring + ((jt + 1) % NSK) * AQ_STG, kbx, 8 * (warp - 12), 1);
-                    } else {
-                        const int vbx = jt >= 1 && jt - 1 < ntl ? vbt(jt - 1) : 8;
-                        if (vbx != 8) kvx_tile<4>(vring + ((jt - 1) % NSV) * AQ_STG, vbx, 4 * (warp - 4), 1);
+                    if (jt + 2 < ntl) {
+                        const int kbx = kbt(jt + 2);
+                        if (kbx != 8) kvx_tile<8>(kring + ((jt + 2) % NSK) * AQ_STG, kbx, 8 * (warp & 3));
+                    }
+                    if (jt >= 1 && jt - 1 < ntl) {
+                        const int vbx = vbt(jt - 1);
+                        if (vbx != 8) kvx_tile<8>(vring + ((jt - 1) % NSV) * AQ_STG, vbx, 8 * (warp & 3));
+                    }
+                } else if (sg >= 0) {
+                    if (jt >= 0 && jt < ntl) {
+                        float s[MT][4];
+                        aqx_mma<MT, MT, LDH>(s, acc, (unsigned) __cvta_generic_to_shared(sQ + (lane & 15) * LDH + (lane >> 4) * 8));
+#pragma unroll
+                        for (int i = 0; i < MT; i++) {
+                            float * so = sS + (jt & 1) * RP * LDS + (16 * i + g8) * LDS + 8 * (warp & 3) + 2 * tig;
+                            so[0] = s[i][0];
+                            so[1] = s[i][1];
+                            so[8 * LDS] = s[i][2];
+                            so[8 * LDS + 1] = s[i][3];
+                        }
                     }
                 }
             }
-#endif
+            if (!MIX && warp < 4) {
+#else
+        for (int jt = 0; jt < ntl + 2; jt++) {
             if (warp < 4) {
+#endif
                 // ---- S(jt) = Q K(jt)^T: B = positions 8 wn + g8 (all 16 k-steps converted first), all row tiles
                 if (jt < ntl) {
                     const int wn = warp;
                     uint8_t * kst = kring + (jt % NSK) * AQ_STG;
                     const int kbj = kbt(jt);
-#if !MK_W48X
                     if constexpr (MIX) { // this warp's rows of a low-bit tile -> biased bytes (row-local: no other warp reads them)
                         if (kbj != 8) {
                             kv_tile_expand<false>(kst, kbj, 8 * wn + 8, 8 * wn, 1, KVQ_ROW);
                             __syncwarp();
                         }
                     }
-#endif
                     if constexpr (I8) { // int8 Q.K^T (aq_i8_s: the S of every I8 kernel)
                         float s[MT][4];
                         aq_i8_s<MT, RP>(s, sQ8, sQs, kst, wn);
@@ -4014,7 +4181,11 @@ __device__ __forceinline__ void attn_core_w48(const LayerW & W, int slot, int n,
                     }
                     }
                 }
+#if MK_W48X
+            } else if (warp >= 4 && warp < 12) {
+#else
             } else if (warp < 12) {
+#endif
                 // ---- O = O * alpha + P(jt - 2) V(jt - 2): B = dims 32 wn + 4 g8 + jj of n8 tile jj, all row tiles
                 if (jt >= 2) {
                     const int wn = warp - 4, jp = jt - 2, b = jp & 1;
@@ -4075,7 +4246,13 @@ __device__ __forceinline__ void attn_core_w48(const LayerW & W, int slot, int n,
                         }
                     }
                 }
+#if MK_W48X
+            } else if (!MIX || rC) {
+                const int sn_ = MIX ? warp & 3 : warp - 12;
+#else
             } else {
+                const int sn_ = warp - 12;
+#endif
                 // ---- online softmax of tile jt - 1 (causal mask: row token t sees positions <= n + t); lane l4 of the
                 // row's quad holds positions l4 + 4 k. Rows 8 (warp - 12) + q, then 32 + 8 (warp - 12) + q.
                 if (jt >= 1 && jt <= ntl) {
@@ -4083,8 +4260,8 @@ __device__ __forceinline__ void attn_core_w48(const LayerW & W, int slot, int n,
                     const int tb = c0 + jp * TP, np_ = min(TP, c1 - tb);
 #pragma unroll
                     for (int sub = 0; sub < 2; sub++) {
-                        if (32 * sub + 8 * (warp - 12) >= R) continue; // (warp-uniform)
-                        const int r = 32 * sub + 8 * (warp - 12) + (lane >> 2), l4 = lane & 3; // rows >= R (zero S) are not stored
+                        if (32 * sub + 8 * sn_ >= R) continue; // (warp-uniform)
+                        const int r = 32 * sub + 8 * sn_ + (lane >> 2), l4 = lane & 3; // rows >= R (zero S) are not stored
                         const int lim = W48_N + (r % T);
                         const float * srow = sS + b * RP * LDS + r * LDS;
                         float sv[8];
@@ -4131,8 +4308,9 @@ __device__ __forceinline__ void attn_core_w48(const LayerW & W, int slot, int n,
             // ---- copies: K(jt + 2) into the stage of K(jt - 1), V(jt) into the stage of V(jt - 3) (both read in interval
             // jt - 1), issued by warps 4-15; then wait for K(jt + 1) and V(jt - 1)
 #if MK_W48X
-            if constexpr (MIX) {
-                asm volatile("cp.async.wait_group 0;" ::: "memory");
+            if constexpr (MIX) { // attn_core_q8_t's
+                asm volatile("cp.async.commit_group;" ::: "memory");
+                if (sg >= 0) asm volatile("cp.async.wait_group 0;" ::: "memory");
                 __syncthreads();
                 continue;
             }

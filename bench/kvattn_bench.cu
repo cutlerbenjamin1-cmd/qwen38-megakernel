@@ -69,6 +69,9 @@ __device__ __forceinline__ void attn_idle_pf(const Mat &, int, int) {}
             if (q8) {                                                                                               \
                 switch (T) {                                                                                        \
                 case 1: NS::attn_core_q8<1>(W, slot, n, b0); break;                                                 \
+                case 2: NS::attn_core_q8<2>(W, slot, n, b0); break;                                                 \
+                case 3: NS::attn_core_q8<3>(W, slot, n, b0); break;                                                 \
+                case 4: NS::attn_core_q8<4>(W, slot, n, b0); break;                                                 \
                 case 5: NS::attn_core_q8<5>(W, slot, n, b0); break;                                                 \
                 default: NS::attn_core_w48q<8>(W, slot, n, -1, b0); break;                                          \
                 }                                                                                                   \
@@ -216,7 +219,7 @@ void fetch_rows(std::vector<int8_t> & o, const Fmt & f, int T, int n) {
     }
 }
 
-void run_one(bool nw, const Fmt & f, bool q8, int T, int slot, int n, int b0, Out & o) {
+void run_one(bool nw, const Fmt & f, bool q8, int T, int slot, int n, int b0, Out & o) { // q8: the all-q8 kernel, else MIX
     CK(cudaMemset(hb.apart, 0xA5, APART_ITEMS * AR * 256 * 4));
     CK(cudaMemset(hb.aml, 0xA5, APART_ITEMS * AR * 8));
     launch(nw, q8, T, slot, n, b0, 1);
@@ -227,10 +230,10 @@ void run_one(bool nw, const Fmt & f, bool q8, int T, int slot, int n, int b0, Ou
     fetch_rows(o.rows, f, T, n);
 }
 
-int check_case(const Fmt & f, bool q8, int T, int slot, int n, int b0) {
+int check_case(const Fmt & f, bool q8, int T, int slot, int n, int b0, bool q8n) { // q8 / q8n: old / new kernel's form
     Out a, b;
     run_one(false, f, q8, T, slot, n, b0, a);
-    run_one(true, f, q8, T, slot, n, b0, b);
+    run_one(true, f, q8n, T, slot, n, b0, b);
     const bool ok_ap = !memcmp(a.ap.data(), b.ap.data(), a.ap.size() * 4), ok_ml = !memcmp(a.ml.data(), b.ml.data(), a.ml.size() * 8);
     const bool ok_rows = a.rows == b.rows;
     size_t nd = 0, wr = 0;
@@ -240,7 +243,7 @@ int check_case(const Fmt & f, bool q8, int T, int slot, int n, int b0) {
         wr += u != 0xA5A5A5A5u;
         nd += memcmp(&a.ap[i], &b.ap[i], 4) != 0;
     }
-    printf("%-6s K%d V%d r%d w%d T%d slot %2d n %6d b0 %2d: %s (%zu of %zu written partial floats differ, ml %s, rows %s)\n", q8 ? "q8" : "mix", f.kb, f.vb,
+    printf("%-3s>%-3s K%d V%d r%d w%d T%d slot %2d n %6d b0 %2d: %s (%zu of %zu written partial floats differ, ml %s, rows %s)\n", q8 ? "q8" : "mix", q8n ? "q8" : "mix", f.kb, f.vb,
            f.kr, f.win, T, slot, n, b0, ok_ap && ok_ml && ok_rows ? "OK" : "DIFF", nd, wr, ok_ml ? "same" : "DIFF", ok_rows ? "same" : "DIFF");
     fflush(stdout);
     return !(ok_ap && ok_ml && ok_rows);
@@ -319,19 +322,20 @@ int main(int argc, char ** argv) {
         setup(n + 16);
         const Fmt f = !strcmp(p, "F") ? F : !strcmp(p, "D") ? D : Q;
         set_fmt(f);
-        const bool q8 = f.kb == 8 && f.vb == 8;
+        const bool q8 = f.kb == 8 && f.vb == 8, q8n = q8 && !getenv("KVB_Q8M"); // KVB_Q8M: new = the MIX kernel on all-q8 data
         // warm up past the memory clock's ~2-3 s ramp (P3 until sustained load), then old / new interleaved
         const auto tw = std::chrono::steady_clock::now();
-        while (std::chrono::duration<double>(std::chrono::steady_clock::now() - tw).count() < 4.5) {
+        const double warm_s = getenv("KVB_WARM") ? atof(getenv("KVB_WARM")) : 4.5; // (0 under ncu: every pass re-runs the program)
+        while (std::chrono::duration<double>(std::chrono::steady_clock::now() - tw).count() < warm_s) {
             launch(false, q8, T, slot, n, 0, reps);
-            launch(true, q8, T, slot, n, 0, reps);
+            launch(true, q8n, T, slot, n, 0, reps);
         }
         std::vector<double> t[2];
         for (int r = 0; r < rounds; r++)
             for (int v = 0; v < 2; v++) {
                 const bool nw = (r & 1) ? v == 0 : v == 1;
                 const auto t0 = std::chrono::steady_clock::now();
-                launch(nw, q8, T, slot, n, 0, reps);
+                launch(nw, nw ? q8n : q8, T, slot, n, 0, reps);
                 const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count() / reps;
                 t[nw].push_back(ms);
             }
@@ -356,14 +360,15 @@ int main(int argc, char ** argv) {
             for (int T : Ts) {
                 if (T <= 5 && n + T <= ATT_BUCKET) continue; // short chunks: attn_core_t, not these kernels
                 const int b0 = n % 7 == 0 ? 3 : 0;
-                bad += check_case(f, false, T, T == 1 ? 16 : 0, n, b0);
+                bad += check_case(f, false, T, T == 1 ? 16 : 0, n, b0, false);
             }
     }
     set_fmt(Q);
     for (int n : ns)
-        for (int T : {1, 5, 8}) {
+        for (int T : Ts) {
             if (T <= 5 && n + T <= ATT_BUCKET) continue;
-            bad += check_case(Q, true, T, T == 1 ? 16 : 0, n, 0);
+            bad += check_case(Q, true, T, T == 1 ? 16 : 0, n, 0, true);
+            bad += check_case(Q, true, T, T == 1 ? 16 : 0, n, 0, false); // the MIX kernel on all-q8 slots
         }
     printf(bad ? "CHECK FAILED: %ld cases differ\n" : "CHECK OK (%ld differ)\n", bad);
     return bad ? 1 : 0;

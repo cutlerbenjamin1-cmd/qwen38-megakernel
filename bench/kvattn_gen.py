@@ -36,9 +36,18 @@ while i < len(lines):
     seen.add(m.group(1))
     s = i - 1 if i > 0 and lines[i - 1].startswith('template') else i
     depth, j, opened = 0, i, False
+    pp = [] # #else branches do not count: both branches of an #if may open the same block
     while j < len(lines):
-        depth += lines[j].count('{') - lines[j].count('}')
-        opened = opened or '{' in lines[j]
+        d = lines[j].lstrip()
+        if d.startswith('#if'):
+            pp.append(False)
+        elif d.startswith('#else'):
+            pp[-1] = True
+        elif d.startswith('#endif'):
+            pp.pop()
+        elif not any(pp):
+            depth += lines[j].count('{') - lines[j].count('}')
+            opened = opened or '{' in lines[j]
         if opened and depth == 0:
             break
         if not opened and lines[j].rstrip().endswith(';'):
