@@ -306,10 +306,10 @@ class Check:
         """a result's key; q8_0's keep their names, so a reference recorded before the presets still compares"""
         return key if preset == "q8" else f"{preset}/{key}"
 
-    def long_file(self):
-        prompt = self.path("chunks_prompt", "txt")
+    def long_file(self, ask=""):
+        prompt = self.path("long_ask" if ask else "chunks_prompt", "txt")
         with open(prompt, "w", encoding="utf-8", newline="\n") as f:
-            f.write(long_prompt())
+            f.write(long_prompt() + (f"\n\nSkip those functions. {ask}" if ask else ""))
         return prompt
 
     def ids(self, name):
@@ -397,7 +397,8 @@ class Check:
                 self.same(what, got)
 
     def long(self):
-        top, sources = max(self.a.depths), {"code": ["-f", self.long_file()], "essay": ["-p", ESSAY]}
+        # ("code": past a preset's window, and with an essay to write: asked about the functions, the model stops near 600 tokens)
+        top, sources = max(self.a.depths), {"code": ["-f", self.long_file(ESSAY)], "essay": ["-p", ESSAY]}
         for preset in self.a.presets:
             for p, src in sources.items():
                 if p == "essay" and preset != "q8":  # (a short prompt: its first ~2k tokens never leave the 8-bit window)
