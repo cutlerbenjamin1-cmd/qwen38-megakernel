@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
-"""GPU checks of the C API: engine errors and their roll-backs, penalties, policies (scripts/gate.sh runs them).
+"""GPU checks of the C API: engine errors and their roll-backs, penalties, policies, the state digest after a reuse
+(scripts/gate.sh runs them).
 usage: capi_checks.py <libqwen38mk.so> <model.gguf> <draft_vocab> [case ...]
 
 It runs the given cases (default: every case), each in its own process, and prints one verdict each: PASS, FAIL, or
@@ -24,7 +25,8 @@ import sys
 import tempfile
 
 LIB, MODEL, DV = sys.argv[1:4]
-CASES = ("penalty", "slots_dup", "slots_oom", "slots_fit", "ctor_oom", "slots_devoom", "ctor_devoom", "policy", "model_values")
+CASES = ("penalty", "slots_dup", "slots_oom", "slots_fit", "ctor_oom", "slots_devoom", "ctor_devoom", "policy", "model_values",
+         "digest_q8", "digest_D", "digest_F")
 PROMPT = b"<|im_start|>user\nWrite a short poem about a lighthouse.<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"
 vp, ip = ctypes.c_void_p, ctypes.POINTER(ctypes.c_int)
 SKIP_RC = 77  # a case's exit code for SKIP (automake's convention)
@@ -560,6 +562,139 @@ def case_policy(L):
     if h:
         L.mk_free(h)
     return ok
+
+
+def reuse_text(functions):
+    lines = ["Explain what each of these functions computes.", "", "```python"]
+    for i in range(1, functions + 1):
+        lines += [f"def step_{i}(x, y):", f"    return (x * {i} + y) % {997 + i}", ""]
+    return "\n".join(lines + ["```"]).encode()
+
+
+def digest_reuse(L, env):
+    """Exact reuse in the sequence state itself: every K / V row, window-ring row and DeltaNet / conv state after a resume at
+    a checkpoint, a resume after a branch, a park and restore and a side request, bitwise against a fresh prefill of the
+    same tokens, and the next 64 greedy ids."""
+    os.environ.update({"MK_EXACT": "1", "MK_CK_SLOTS": "8", **env})
+    L.mk_prefill_cks.argtypes = [vp, ip, ctypes.c_int, ip, ctypes.c_int, ctypes.c_int]
+    L.mk_state_digest.argtypes = [vp, ctypes.POINTER(ctypes.c_ulonglong), ctypes.c_int]
+    L.mk_checkpoints.argtypes = [vp, ip, ctypes.c_int]
+    L.mk_rewind_to.argtypes = [vp, ctypes.c_int]
+    L.mk_reset.argtypes = [vp]
+    L.mk_set_sampling.argtypes = [vp, ctypes.c_float, ctypes.c_float, ctypes.c_int, ctypes.c_float, ctypes.c_ulonglong]
+    L.mk_store_budget.argtypes = [vp, ctypes.c_longlong]
+    L.mk_park.argtypes = [vp, ctypes.c_int]
+    L.mk_unpark.argtypes = [vp, ctypes.c_int]
+    L.mk_side_begin.argtypes = [vp]
+    L.mk_side_end.argtypes = [vp]
+    L.mk_kv_sizes.argtypes = [vp] + [ctypes.POINTER(ctypes.c_longlong)] * 4
+    h = new(L, 32768)
+    if not check(bool(h), "the engine starts", L):
+        return False
+    sizes = [ctypes.c_longlong() for _ in range(4)]
+    L.mk_kv_sizes(h, *[ctypes.byref(x) for x in sizes])
+    if env and not check(sizes[1].value > 0, "the preset took effect: the window rings exist"):
+        return False
+    L.mk_store_budget(h, 8 * GiB)
+    L.mk_set_sampling(h, 0.0, 1.0, 0, 0.0, 0)
+
+    def tok(text):
+        buf = (ctypes.c_int * (len(text) + 16))()
+        n = L.mk_tokenize(h, text, len(text), buf, len(text) + 16)
+        assert n > 0, err(L)
+        return list(buf[:n])
+
+    def feed(toks, cks=()):
+        arr = (ctypes.c_int * len(toks))(*toks)
+        ca = (ctypes.c_int * max(len(cks), 1))(*cks)
+        first = L.mk_prefill_cks(h, arr, len(toks), ca, len(cks), -1)
+        assert first >= 0, err(L)
+        return first
+
+    def digest():
+        n = L.mk_state_digest(h, None, 0)
+        assert n > 0, err(L)
+        a = (ctypes.c_ulonglong * n)()
+        L.mk_state_digest(h, a, n)
+        return list(a)
+
+    def decode(first, n=64):
+        out, got = (ctypes.c_int * 16)(), [first]
+        for _ in range(n):
+            if len(got) >= n:
+                break
+            k = L.mk_step(h, out, 16)
+            assert k >= 0, err(L)
+            got += list(out[:k])
+        return got[:n]
+
+    def resume(toks, at_most):
+        """back to the last checkpoint at or before at_most, the rest of toks again: the position"""
+        n = L.mk_checkpoints(h, None, 0)
+        a = (ctypes.c_int * max(n, 1))()
+        L.mk_checkpoints(h, a, n)
+        ck = max([c for c in a[:n] if 0 < c <= at_most], default=0)
+        assert ck and L.mk_rewind_to(h, ck) == 0, f"no checkpoint at or before {at_most}: {list(a[:n])} ({err(L)})"
+        return ck, feed(toks[ck:])
+
+    toks = tok(reuse_text(400))
+    N = len(toks)
+    grid = list(range(1024, N, 1024))
+    note(f"{N} tokens, checkpoints asked at every 1024, rings {sizes[1].value / MiB:.0f} MiB")
+    ok = check(N > 4096, "the prompt is past the window")
+    first = feed(toks, grid)
+    fresh, ids0 = digest(), decode(first)
+    ck, first = resume(toks, N - 1)
+    ok &= check(digest() == fresh, f"after decoding, a resume at {ck} and the rest again: state bitwise equal to the fresh prefill")
+    ok &= check(decode(first) == ids0, "and the next 64 greedy ids equal")
+    M = N - 900  # a branch: the same prompt up to M, then other tokens
+    other = toks[:M] + tok(reuse_text(40))[:900]
+    ck, first = resume(other, M)
+    branched = digest()
+    decode(first)
+    ck2, first = resume(toks, M)
+    ok &= check(digest() == fresh, f"back from a branch at {M} by the checkpoint at {ck2}: state bitwise equal to the fresh prefill")
+    ok &= check(decode(first) == ids0, "and the next 64 greedy ids equal")
+    L.mk_reset(h)
+    feed(other, grid)
+    ok &= check(digest() == branched, f"the branch resumed at {ck}: state bitwise equal to its own fresh prefill")
+    L.mk_reset(h)
+    first = feed(toks, grid)
+    ok &= check(digest() == fresh, "a second fresh prefill: state bitwise equal to the first")
+    pid = L.mk_park(h, 2)
+    if not check(pid > 0, f"parked (id {pid})", L):
+        L.mk_free(h)
+        return False
+    L.mk_reset(h)
+    decode(feed(tok(reuse_text(60))))
+    if not check(L.mk_unpark(h, pid) >= 0, "restored", L):
+        L.mk_free(h)
+        return False
+    ok &= check(digest() == fresh, "parked, another conversation run, restored: state bitwise equal to the fresh prefill")
+    ok &= check(decode(first) == ids0, "and the next 64 greedy ids equal")
+    L.mk_reset(h)
+    first = feed(toks, grid)
+    if not check(L.mk_side_begin(h) == 0, "the conversation is kept aside", L):
+        L.mk_free(h)
+        return False
+    decode(feed(tok(reuse_text(60))))
+    ok &= check(L.mk_side_end(h) == 1, "a side request ran and the conversation is back", L)
+    ok &= check(digest() == fresh, "after the side request: state bitwise equal to the fresh prefill")
+    ok &= check(decode(first) == ids0, "and the next 64 greedy ids equal")
+    L.mk_free(h)
+    return ok
+
+
+def case_digest_q8(L):
+    return digest_reuse(L, {})
+
+
+def case_digest_D(L):
+    return digest_reuse(L, {"MK_KV": "K*=6,V*=5", "MK_KV_WIN": "2048"})
+
+
+def case_digest_F(L):
+    return digest_reuse(L, {"MK_KV": "K*=5r,V*=5", "MK_KV_WIN": "2048"})
 
 
 def win_commit_free_gb():

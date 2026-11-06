@@ -138,7 +138,7 @@ check: bench/wvgemm_bench bench/dattn_bench bench/mmq_bench bench/attn_bench
 	EXA=1 bench/attn_bench F 16384 0 1024:6000
 	EXA=2 bench/attn_bench D 16384 0 1024:6000
 
-# every GPU check of a build in one run (scripts/gate.sh; the GPU to itself, ~16 min on an RTX 3090):
+# every GPU check of a build in one run (scripts/gate.sh; the GPU to itself, ~95 min on an RTX 3090):
 #   make gate MK_MODEL=<gguf> GATE_ARGS="--record DIR"   (a reference)   or   GATE_ARGS="--ref DIR"
 gate: qwen38_mk libqwen38mk.so
 	scripts/gate.sh $(if $(MK_MODEL),-m $(MK_MODEL)) $(GATE_ARGS)

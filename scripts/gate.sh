@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# The GPU checks of a build in one command (Linux / WSL2; the GPU to itself, ~16 min on an RTX 3090):
+# The GPU checks of a build in one command (Linux / WSL2; the GPU to itself, ~95 min on an RTX 3090, most of it exactness):
 #   scripts/gate.sh -m <gguf> --record DIR   run every check, keep the outputs in DIR as a reference
 #   scripts/gate.sh -m <gguf> --ref DIR      run every check, and every output must equal DIR's
 #   scripts/gate.sh -m <gguf>                run every check against the build itself only
@@ -134,23 +134,31 @@ leg_exactness() {
     [ $rc = 0 ] && ok "exactness: $(grep -c '^PASS' "$O/exactness/exactness.log") checks" || fail "exactness: exit $rc (exactness/exactness.log)"
 }
 
-# MK_EXACT=1 with a prefill cap below two staging slots (256) against the default cap: the same state digest and ids
+# MK_EXACT=1 with a prefill cap below two staging slots (256) against the default cap: the same state digest and ids, on
+# each cache (--kv q8: left to auto, this small a context picks fp16 and never reaches the q8 exact branch)
 leg_pfcap() {
-    local d=$O/pfcap c
+    local d=$O/pfcap c k kv
     head -c 9000 "$REPO/bench/suite/prompts/pf38k.txt" | head -n -1 > "$d/prompt.txt" # (whole lines)
-    for c in default 256; do
-        if [ $c = default ]; then e=(); else e=(MK_PF_CAP=$c); fi
-        env "${e[@]}" MK_EXACT=1 timeout -s KILL "$TO" "$BIN" -m "$MODEL" -c 8192 -f "$d/prompt.txt" --raw -n 32 --ids --digest \
-            > "$d/cap_$c.out" 2> "$d/cap_$c.err" < /dev/null || { fail "pfcap: cap $c exit $? (pfcap/cap_$c.err)"; return; }
-        grep -h 'state digest' "$d/cap_$c.err" > "$d/cap_$c.digest"
+    for k in q8 D F; do
+        case $k in
+            q8) kv=() ;;
+            D) kv=("MK_KV=K*=6,V*=5" MK_KV_WIN=2048) ;;
+            F) kv=("MK_KV=K*=5r,V*=5" MK_KV_WIN=2048) ;;
+        esac
+        for c in default 256; do
+            if [ $c = default ]; then e=(); else e=(MK_PF_CAP=$c); fi
+            env "${e[@]}" ${kv[@]+"${kv[@]}"} MK_EXACT=1 timeout -s KILL "$TO" "$BIN" -m "$MODEL" -c 8192 --kv q8 -f "$d/prompt.txt" --raw -n 32 --ids --digest \
+                > "$d/${k}_cap_$c.out" 2> "$d/${k}_cap_$c.err" < /dev/null || { fail "pfcap $k: cap $c exit $? (pfcap/${k}_cap_$c.err)"; return; }
+            grep -h 'state digest' "$d/${k}_cap_$c.err" > "$d/${k}_cap_$c.digest"
+        done
+        if [ -s "$d/${k}_cap_default.digest" ] && cmp -s "$d/${k}_cap_default.digest" "$d/${k}_cap_256.digest" && cmp -s "$d/${k}_cap_default.out" "$d/${k}_cap_256.out"; then
+            ok "pfcap $k: MK_EXACT state digest and ids at prefill cap 256 == the default cap ($(grep -o '[0-9a-f]\{16\}' "$d/${k}_cap_default.digest"))"
+        else
+            fail "pfcap $k: cap 256 differs from the default cap (or no digest)"
+        fi
+        ref "pfcap $k ids" "$d/${k}_cap_default.out"
+        ref "pfcap $k digest" "$d/${k}_cap_default.digest"
     done
-    if [ -s "$d/cap_default.digest" ] && cmp -s "$d/cap_default.digest" "$d/cap_256.digest" && cmp -s "$d/cap_default.out" "$d/cap_256.out"; then
-        ok "pfcap: MK_EXACT state digest and ids at prefill cap 256 == the default cap ($(grep -o '[0-9a-f]\{16\}' "$d/cap_default.digest"))"
-    else
-        fail "pfcap: cap 256 differs from the default cap (or no digest)"
-    fi
-    ref "pfcap ids" "$d/cap_default.out"
-    ref "pfcap digest" "$d/cap_default.digest"
 }
 
 # the CLI: sampled runs at 0 / 7 drafts, presence penalty, a draft-chain policy, greedy on --model2 (reference checks),
@@ -254,6 +262,14 @@ leg_kld() {
     run "$BIN" -m "$MODEL" --kld "$KLD_REF" --score-path mixed --kv q8 > "$d/kld.out" 2> "$d/kld.err" || { fail "kld: exit $? (kld/kld.err)"; return; }
     ok "kld: $(grep -h 'top token agrees' "$d/kld.out" | tr -s ' ') / $(grep -h 'KL(ref' "$d/kld.out" | grep -o 'mean [0-9.]*' | head -1)"
     ref "kld report" "$d/kld.out"
+    local k
+    for k in "D K*=6,V*=5" "F K*=5r,V*=5"; do
+        set -- $k
+        env "MK_KV=$2" MK_KV_WIN=2048 timeout -s KILL "$TO" "$BIN" -m "$MODEL" --kld "$KLD_REF" --score-path mixed --kv q8 > "$d/kld_$1.out" 2> "$d/kld_$1.err" < /dev/null \
+            || { fail "kld $1: exit $? (kld/kld_$1.err)"; return; }
+        ok "kld $1: $(grep -h 'top token agrees' "$d/kld_$1.out" | tr -s ' ') / $(grep -h 'KL(ref' "$d/kld_$1.out" | grep -o 'mean [0-9.]*' | head -1)"
+        ref "kld report $1" "$d/kld_$1.out"
+    done
 }
 
 T0=$(date +%s)
