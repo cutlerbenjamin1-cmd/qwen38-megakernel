@@ -112,11 +112,11 @@ moves that state around (to host memory and back) without touching its bits.
 
 | situation | reply is identical, bit for bit, to | checked by |
 |---|---|---|
-| follow-up turn; edited message or system prompt | the same request on a fresh server | a state-digest probe after each reuse (every K / V row, window-ring row and DeltaNet / conv state compared): 10 / 10 scenarios bitwise equal in every release gate; server replies compared |
-| new session resumed at a pinned checkpoint | the same request on a fresh server (greedy, and temperature 1.0 with fixed seeds; q8_0 and preset D) | a new session after a live, a parked and a 63k-token conversation |
-| parked conversation brought back | each conversation alone on a fresh server | 8 interleaved requests of 3 conversations, greedy and sampled, q8_0 and preset D: every release gate |
-| side request, and the conversation kept beside it | each of them alone on a fresh server | 5 side-request scenarios, q8_0 and preset D, every release gate; 40 titles beside two conversations |
-| a prefill stopped because the client left | a server that never saw that request | the requests after a stopped prefill, compared in every release gate |
+| follow-up turn; edited message or system prompt | the same request on a fresh server | `scripts/exactness.py` (q8_0, D, F: at 32k, and at ~100k with the launchers' settings, F also at ~255k) and the state digest of `scripts/capi_checks.py` (every K / V row, window-ring row and DeltaNet / conv state, bitwise against a fresh prefill) |
+| new session resumed at a pinned checkpoint | the same request on a fresh server (greedy, and temperature 1.0 with fixed seeds) | `scripts/exactness.py`, q8_0, D and F: a new session after a live and after a parked conversation; by hand, after a 63k-token one |
+| parked conversation brought back | each conversation alone on a fresh server | `scripts/exactness.py`, q8_0, D and F: three conversations, greedy and sampled; the state digest; 8 interleaved requests on each release |
+| side request, and the conversation kept beside it | each of them alone on a fresh server | `scripts/exactness.py`, q8_0, D and F; the state digest; 5 side-request scenarios and 40 titles beside two conversations on each release |
+| a prefill stopped because the client left | a server that never saw that request | the requests after a stopped prefill, compared on each release |
 
 Sampled replies are identical too when the request sets a `seed`: the draft vocabulary the MTP head uses is rebuilt
 after a rewind exactly as a fresh prefill builds it. Without a `seed`, each request draws a random one. The gates run on

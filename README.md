@@ -115,19 +115,22 @@ environment variables (`MK_HOST=0.0.0.0` for the LAN, `MK_KV` / `MK_KV_WIN` for 
 ## Exact output
 
 Speculative decoding is lossless on paper, but verifying several tokens in one pass rounds differently from verifying
-one, so in practice greedy output drifts with the draft count: on 9 of the 282 benchmark questions, llama.cpp b12024
-gives a different greedy answer at 4 drafts than at 7 (8 of them reproducibly from the depth). A reused cache or another
-compiler can drift the same way. This engine is built so none of them change the output:
+one, so in practice greedy output moves with drafting: on the 282 benchmark questions, llama.cpp b12024's greedy answer
+differs from its own without drafts on 113 at 4 drafts and on 113 at 7, and between 4 and 7 on 9 (8 of them reproducibly
+from the depth). A reused cache or another compiler can drift the same way. This engine is built so none of them change
+the output. All 282 of its answers are the same at 7 drafts as with none:
 
-- **Drafting never changes the answer.** Greedy token ids are identical at 0, 4 and 7 drafts. Sampled output keeps the
-  distribution of sampling without drafts (chi-square and PIT tests).
+- **Drafting never changes the answer.** Greedy token ids are identical at 0, 4 and 7 drafts, over about 2,000 tokens of
+  output and under every draft policy. Sampled output keeps the distribution of sampling without drafts (chi-square and PIT
+  tests).
 - **A cached conversation answers like a fresh one.** With exact reuse (the launchers' default), follow-ups, edits,
   resumed sessions and conversations restored from host memory all continue bit for bit like the same request sent
   fresh, greedy or sampled with the same seed.
 - **Windows and Linux agree bit for bit.** The MSVC and g++ builds give the same token ids, server replies and
   image-encoder rows.
 
-So an agent's run can be reproduced, and an odd reply is never the speculation's or the cache's doing. Every release
+So an agent's run can be reproduced, and an odd reply is never the speculation's or the cache's doing. These hold on q8_0
+and on the presets, each against itself. Every release
 is gated on these checks, and you can run them on your own build: `scripts/exactness.py` for the core checks,
 `scripts/gate.sh` for all of them ([checking a build](docs/BUILDING.md#checking-a-build)).
 
@@ -139,6 +142,8 @@ Not bit-identical, by design:
   `scripts\serve.bat` uses preset F above 240k context unless `MK_KV` is set.
 - **`MK_EXACT_REUSE=0`**, which makes follow-up turns faster by appending to the previous reply instead of reading it
   again.
+- **Sampled replies beside other requests with `--agents`**: they keep their distribution but not their tokens. Greedy
+  replies are the same beside others as alone.
 
 Evidence and the tests behind each line: [docs/BENCHMARKS.md](docs/BENCHMARKS.md#exactness).
 

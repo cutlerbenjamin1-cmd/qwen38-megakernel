@@ -187,17 +187,18 @@ hf download unsloth/Qwen3.8-27B-GGUF Qwen3.8-27B-UD-Q4_K_XL.gguf mmproj-BF16.ggu
 - **Every GPU check in one run:** `scripts/gate.sh -m <gguf> --record <dir>` on a build you trust keeps its outputs in
   `<dir>` as a reference; `scripts/gate.sh -m <gguf> --ref <dir>` on the next build runs the same checks and requires
   every output to equal the reference's (`make gate MK_MODEL=<gguf> GATE_ARGS="--ref <dir>"` builds first). It runs
-  `make check`, the exactness checks below, MK_EXACT=1 with a prefill cap below two staging slots, sampled CLI runs at
+  `make check`, the exactness checks below, MK_EXACT=1 with a prefill cap below two staging slots on q8_0, D and F, sampled CLI runs at
   0 and 7 drafts (with a presence penalty and a draft-chain policy), the four bench prompts' greedy ids at 0, 4 and 7
   drafts, parallel slots against solo runs (`bench/slots_bench.py`: 4 and 2 slots, the MTP window, a slot prefilled
-  between the others' steps) and their sampled outputs, the C API checks (`scripts/capi_checks.py`: errors, roll-backs
-  and out-of-memory kept inside the free VRAM), and with `--kld-ref <file>` the KL report against llama.cpp;
+  between the others' steps) and their sampled outputs, the C API checks (`scripts/capi_checks.py`: errors, roll-backs,
+  out-of-memory kept inside the free VRAM, and the state after a resume, a branch, a park and a side request, bitwise
+  against a fresh prefill on q8_0, D and F), and with `--kld-ref <file>` the KL report against llama.cpp, q8_0, D and F;
   `--model2 <gguf>` adds a second model. Each check prints ok / FAIL / skip (the C API leg skips when none of its cases
   can run); the exit status is 1 if one failed, 2 for bad arguments, a stale build or an `--out` that holds a recorded
   reference. A reference is kept only if all its own checks passed, and holds for the GPU, driver, model files and
   `MK_*` environment it was recorded with (the manifest names them, `MK_MODEL` and `MK_API_KEY` aside): another model
   is refused, another environment is a FAIL, and a check the reference did not run is a skip with a NOTE. Linux or
-  WSL2, the GPU to itself, about 16 minutes on an RTX 3090.
+  WSL2, the GPU to itself, about 75 minutes on an RTX 3090, most of it the exactness checks.
 - **Kernels without a model:** `make check` builds and runs the benches' self-checks. `bench/wvgemm_bench check` tests
   its own tensor-core verify kernel (a counterpart of `wv.cuh`, not the engine's code) for bit-identical output at
   every token count, and it and the engine's dp4a GEMVs (copied from `mk_shared.cuh` and `qwen38_mk.cu` by
@@ -215,10 +216,13 @@ hf download unsloth/Qwen3.8-27B-GGUF Qwen3.8-27B-UD-Q4_K_XL.gguf mmproj-BF16.ggu
 - **Exactness:** `python3 scripts/exactness.py -m <gguf>` (or `make exactness MK_MODEL=<gguf>`; Windows:
   `python scripts\exactness.py -m <gguf>`) checks the README's [exact output](../README.md#exact-output) claims on the
   GPU: greedy ids identical at 0, 4 and 7 drafts and without the MTP
-  layer, the exact-reuse state digest and ids independent of the prefill chunk size, and a warm server's follow-up,
-  edited and sampled replies equal to a fresh server's (a check whose runs drafted nothing or reused nothing fails: it
-  would prove nothing). It needs the GPU to itself (11 model loads), prints PASS / FAIL per check, exits 1 on a failure
-  and writes every result to `exactness-out/exactness.json`.
+  layer, over up to 2,048 tokens at no drafts and 7, and under five draft policies; the exact-reuse state digest and ids
+  independent of the prefill chunk size; a warm server's follow-up, edited and sampled replies equal to a fresh server's,
+  at 32k and at ~100k with the launchers' settings; parked conversations, a side request and resumed sessions equal to a
+  fresh server's; and a follow-up at ~255k on preset F. Each runs on q8_0 and on presets D and F (`--presets`), past their
+  8-bit window. A check whose runs drafted nothing, reused nothing, stopped short of 1,000 tokens or never parked fails:
+  it would prove nothing. It needs the GPU to itself (about 55 minutes on an RTX 3090; `--legs` narrows it), prints
+  PASS / FAIL per check, exits 1 on a failure and writes every result to `exactness-out/exactness.json`.
 - **Accuracy against llama.cpp:** `tools/llama_ref` writes a reference file, and
   `./qwen38_mk -m <gguf> --kld <ref> --score-path mixed --kv q8` scores the engine against it
   ([BENCHMARKS.md](BENCHMARKS.md#against-llamacpp) has the full recipe and the expected numbers).

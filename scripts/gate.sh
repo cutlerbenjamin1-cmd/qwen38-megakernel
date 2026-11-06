@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# The GPU checks of a build in one command (Linux / WSL2; the GPU to itself, ~95 min on an RTX 3090, most of it exactness):
+# The GPU checks of a build in one command (Linux / WSL2; the GPU to itself, ~75 min on an RTX 3090, most of it exactness):
 #   scripts/gate.sh -m <gguf> --record DIR   run every check, keep the outputs in DIR as a reference
 #   scripts/gate.sh -m <gguf> --ref DIR      run every check, and every output must equal DIR's
 #   scripts/gate.sh -m <gguf>                run every check against the build itself only

@@ -62,15 +62,16 @@ and 28.0 against 40.7 at 101.6k context ([without drafts](#without-drafts)).
 | | result | measured | details |
 |---|---|---|---|
 | 4 parallel agents (`--agents 4`, Q4_K_M, q8_0 KV, sampled) | 423.7 tok/s in total on short prompts, 360.0 with a ~23k-token context each; llama.cpp b12024's `llama-server --parallel 4` on 2026-11-02: 137.2 and 96.8 | 2026-11-06 | [parallel agents](#parallel-agents) |
-| q8_0 at a 250 W limit | greedy 126.0 tok/s on short prompts, decode at 38k 92.1, the 282 questions 230 right in 2,286 s; 2.37 J per token on short prompts against 3.46 at 480 W | 2026-11-03 | [at a 250 W limit](#at-a-250-w-limit) |
+| q8_0 at a 250 W limit | greedy 130.3 tok/s on short prompts, decode at 38k 94.5, the 282 questions 230 right in 2,237 s; 2.33 J per token on short prompts against 3.47 at 480 W and llama.cpp's 6.96 | 2026-11-06 | [at a 250 W limit](#at-a-250-w-limit) |
 | upstream open-jet 72ba4a7, its own scripts (Q4_K_M, 4 drafts each) | writing code 163.8 against 132.6 tok/s; with 30k tokens of code in context 118.1 against 86.9; prefill 1,878 against 1,528 tok/s | 2026-10-25 | [Q4_K_M and upstream's scripts](#q4_k_m-and-upstreams-scripts) |
 | accuracy against llama.cpp generating token by token | top token agrees on 98.737% of positions, mean KL 0.00119 nats (llama.cpp's own batched run: 98.489%, 0.00166) | 2026-10-17, unchanged through v2026.11.05 | [against llama.cpp](#against-llamacpp) |
 | KV presets D / F: KL at 100k context | 0.00226 / 0.00218, against q8_0's 0.00217 | 2026-10-25 | [KV cache presets](#kv-cache-presets) |
 | the same formats without the 8-bit ring: KL at 100k context | 0.00254 / 0.00281 (4-bit K and V: 0.00469) | 2026-11-02 | [without the ring](#without-the-ring) |
 | the full 262,144-token context, preset F | a 260,896-token prompt in 279 s, decode at that depth 77.8 tok/s, 23,589 MiB on the card | 2026-11-06 | [the full context](#the-full-context) |
-| greedy token ids at 0, 4 and 7 drafts | identical (llama.cpp b12024's greedy answers at 4 and 7 drafts: 9 of 282 differ) | each release (llama.cpp: 2026-10-31) | [speculation](#speculation) |
+| greedy token ids at 0, 4 and 7 drafts, and under every draft policy | identical | each release | [speculation](#speculation) |
+| the 282 questions at no drafts against drafted | this engine at 7 drafts: 0 differ. llama.cpp b12024 at 4 drafts: 113 differ, at 7: 113 (4 against 7: 9) | 2026-11-06 | [speculation](#speculation) |
 | Windows build against Linux build | identical output | each release | [Windows and Linux](#windows-and-linux) |
-| reused, parked and restored requests (exact reuse) | bit for bit equal to the same request sent fresh | 2026-10-14 to 10-21 | [exact reuse](#exact-reuse) |
+| reused, parked and restored requests (exact reuse) | bit for bit equal to the same request sent fresh, q8_0, D and F, up to ~255k. Second turns on 20 conversations against a fresh server: 0 differ; llama.cpp b12024: 20 | 2026-11-06 | [exact reuse](#exact-reuse) |
 
 ## Against llama.cpp, 2026-11-06
 
@@ -254,51 +255,58 @@ ids or the accuracy report.
 
 ### At a 250 W limit
 
-Measured on 2026-11-03 and not re-run since: the release v2026.11.03 (605f82a) with the settings and client of
-[that day's full run](#2026-11-03-605f82a), in the same session, with the card's power limit set to 250 W
-(`nvidia-smi -pl 250`, as Windows admin; this card allows 100 to 480 W, default 350 W). The 480 W column is that run's
-q8_0 column; llama.cpp ran only at 480 W.
+The release v2026.11.05 (3ed5ce5) with the settings and client of the full run, one session on 2026-11-06, with the card's
+power limit set to 250 W (`nvidia-smi -pl 250`, as Windows admin; this card allows 100 to 480 W, default 350 W). The 480 W
+column is a speed and from-scratch pass at the end of the same session, with the question time from the full run.
+llama.cpp b12024 ran in the same session at 480 W only.
 
 | | q8_0, 250 W | q8_0, 480 W | 250 W against 480 W | llama.cpp, 4 drafts, 480 W |
 |---|---|---|---|---|
-| greedy decode, short prompts (4 x 512 tokens), mean of request rates | 126.0 tok/s | 165.3 | -24% | 86.5 |
-| the same, token-weighted | 107.2 | 140.6 | -24% | 79.9 |
-| sampled decode, thinking on (8 runs), mean of request rates | 111.3 tok/s | 145.9 | -24% | 72.4 |
-| the same, token-weighted | 106.4 | 139.4 | -24% | 67.4 |
-| decode at 11.6k context (200 tokens) | 110.2 tok/s | 147.5 | -25% | 71.9 |
-| decode at 38k context (256 tokens) | 92.1 tok/s | 126.9 | -27% | 65.7 |
-| decode at 101.6k context (256 tokens) | 79.6 tok/s | 115.4 | -31% | 54.5 |
-| read an 11.6k-token prompt | 9.29 s | 5.87 s | +58% | 7.59 s |
-| read a 38k-token prompt | 34.8 s | 22.7 s | +54% | 28.0 s |
-| read a 101.6k-token prompt from scratch | 110.9 s | 72.5 s | +53% | 96.7 s |
-| first token, short prompt | 77 ms | 61 ms | +26% | 118 ms |
-| follow-up turn in an 11.8k-token chat, prompt time | 240 ms | 174 ms | +38% | 239 ms |
-| edit an earlier message in an 11.7k-token chat, prompt time | 90 ms | 71 ms | +26% | 247 ms |
-| edit the end of a 9.1k-token system prompt, prompt time | 106 ms | 84 ms | +26% | 883 ms |
+| greedy decode, short prompts (4 x 512 tokens), mean of request rates | 130.3 tok/s | 165.7 | -21% | 84.8 |
+| the same, token-weighted | 110.8 | 140.9 | -21% | 78.5 |
+| sampled decode, thinking on (8 runs), mean of request rates | 113.7 tok/s | 146.4 | -22% | 71.4 |
+| the same, token-weighted | 108.7 | 139.8 | -22% | 66.7 |
+| decode at 11.6k context (200 tokens) | 113.1 tok/s | 148.2 | -24% | 71.3 |
+| decode at 38k context (256 tokens) | 94.5 tok/s | 127.6 | -26% | 65.3 |
+| decode at 101.6k context (256 tokens) | 81.9 tok/s | 115.7 | -29% | 54.2 |
+| read an 11.6k-token prompt | 9.04 s | 5.77 s | +57% | 7.99 s |
+| read a 38k-token prompt | 33.8 s | 22.1 s | +52% | 27.9 s |
+| read a 101.6k-token prompt from scratch | 105.8 s | 68.6 s | +54% | 96.6 s |
+| first token, short prompt | 77 ms | 61 ms | +25% | 142 ms |
+| follow-up turn in an 11.8k-token chat, prompt time | 233 ms | 170 ms | +37% | 279 ms |
+| edit an earlier message in an 11.7k-token chat, prompt time | 85 ms | 70 ms | +21% | 340 ms |
+| edit the end of a 9.1k-token system prompt, prompt time | 105 ms | 85 ms | +24% | 882 ms |
 | VRAM, whole card, server idle | 21.1 GiB | 21.1 GiB | | 22.8 GiB |
-| 282 benchmark questions: right, total time | 230, 2,286 s | 230, 1,607 s | +42% | 229, 2,570 s |
+| 282 benchmark questions: right, total time | 230, 2,237 s | 230, 1,563 s | +43% | 229, 2,554 s |
 
-Power and energy (`nvidia-smi` once a second, whole card, the desktop's idle draw included; energy = mean power x time).
-The 480 W column here is a speed and from-scratch pass run right after the capped one, with the same logging:
+Power and energy (`nvidia-smi` once a second, whole card, the desktop's idle draw included; energy = mean power x time):
 
-| | 250 W | 480 W | 250 W against 480 W |
+| | q8_0, 250 W | q8_0, 480 W | llama.cpp, 4 drafts, 480 W |
 |---|---|---|---|
-| short prompts, greedy and sampled (7,724 tokens): mean power | 249.5 W | 475.7 W | |
-| the same: mean SM clock | 780 MHz | 1,976 MHz | |
-| the same: energy per token | 2.37 J | 3.46 J | -31% |
-| the 101.6k-token read: mean power | 249.3 W | 444.7 W | |
-| the same: mean SM clock | 1,116 MHz | 1,759 MHz | |
-| the same: rate | 916 tok/s | 1,412 tok/s | -35% |
-| the same: energy per prompt token | 0.258 J | 0.290 J | -11% |
+| short prompts, greedy and sampled: tokens | 7,724 | 7,724 | 7,231 |
+| the same: mean power | 249.6 W | 476.7 W | 463.0 W |
+| the same: mean SM clock | 816 MHz | 1,962 MHz | 1,889 MHz |
+| the same: energy per token | 2.33 J | 3.47 J | 6.96 J |
+| the 101.6k-token read: mean power | 249.4 W | 445.5 W | 446.0 W |
+| the same: mean SM clock | 1,126 MHz | 1,764 MHz | 1,854 MHz |
+| the same: rate | 960 tok/s | 1,481 tok/s | 1,052 tok/s |
+| the same: energy per prompt token | 0.260 J | 0.301 J | 0.424 J |
+| the 282 questions: mean power | 249.2 W | | 457.9 W |
+| the same: energy | 557.5 kJ | | 1,169.4 kJ |
+| the same: energy per reply token | 4.31 J | | 9.03 J |
 
-- **Output:** all 282 answers are byte-identical to the 480 W pass's, and the four greedy replies have the same lengths.
-- **The session did not drift:** the second 480 W pass matched that run's column within 1.1% on the decode and
-  prompt-read rows (greedy 166.0 against 165.3 tok/s, the 101.6k-token read 72.0 against 72.5 s).
+- **Output:** all 282 answers at 250 W are byte-identical to the 480 W run's, and to the same engine's at no drafts.
+- **The session did not drift:** the 480 W pass at its end matched the full run's q8_0 column within 0.5% on decode at short
+  prompts and 38k (0.6% at 101.6k), and the 101.6k-token read took 68.6 against 68.5 s. llama.cpp at no drafts matched its
+  column within 0.8%; at 4 drafts it read 1.4 to 3.3% slower than in the full run, with all 282 answers byte-identical, so
+  the full run's llama.cpp column is the safer comparison for decode.
+- **Prompt reads are the one place llama.cpp at 480 W beats this engine at 250 W.** It also uses 1.6x the energy for it.
 - **The limit held:** every sample in the capped passes read an enforced limit of 250 W; the highest power reading was
-  255.0 W, the mean over the question pass 249.1 W (570 kJ, not logged at 480 W).
-- **Clocks:** under load the memory clock stayed at 9,851 MHz, so the limit takes the SM clock: 61% lower on short-prompt
-  decode for 24% less speed, 37% lower on the 101.6k-token read for 35% less.
-- **Conditions:** fans at 98%; GPU 37-48 C through the capped passes; the desktop held about 600 MiB of the card.
+  256.1 W.
+- **Clocks:** under load the memory clock stayed at 9,851 MHz, so the limit takes the SM clock: 58% lower on short-prompt
+  decode for 21% less speed, 36% lower on the 101.6k-token read for 35% less.
+- **Conditions:** fans at 98-99%; GPU 26-39 C through the capped passes, 34-70 C for llama.cpp; the desktop held about
+  520 MiB of the card.
 
 ## Parallel agents
 
@@ -399,11 +407,14 @@ nats. The fp16 cache, more precise than q8_0, marks the floor of the measurement
 |---|---|---|---|---|
 | fp16 (2026-10-12 / 10-13) | 98.774% / 0.00113 | 99.096% / 0.00226 | 0.00161 | |
 | q8_0 | 98.737% / 0.00119 (2026-10-17, 7322fbd 10-20) | 99.121% / 0.00219 (10-17) | 99.267% / 0.00163 (10-15) | 99.121% / 0.00217 (10-25, 0278d09) |
-| D: `K*=6,V*=5` + window | = q8_0 (2026-10-20, 7322fbd) | 98.950% / 0.00236 (10-20, 7322fbd) | 99.243% / 0.00160 (10-13) | 99.121% / 0.00226 (10-25, 0278d09) |
+| D: `K*=6,V*=5` + window | = q8_0 (2026-10-20, 7322fbd) | 98.950% / 0.00236 (10-20, 7322fbd) | 99.267% / 0.00161 (2026-11-06) | 99.121% / 0.00226 (10-25, 0278d09) |
 | D': D + 8-bit MTP layer | = q8_0 (10-15, 7d67c5d) | 0.00236 (10-15) | 0.00161 (10-15) | |
 | F: `K*=5r,V*=5` + window | 98.714% / 0.00113 (2026-10-25, 7322fbd) | 98.974% / 0.00242 (10-25, 7322fbd) | 99.341% / 0.00163 (10-25, 7322fbd) | 99.170% / 0.00218 (10-25, 0278d09) |
 | C: `V*=5` + window | = q8_0 (10-13) | 99.072% / 0.00228 (10-13) | 99.316% / 0.00159 (10-13) | |
 | 4-bit everywhere: `*=4`, no window | 0.00547 (10-15) | | | |
+
+On v2026.11.05 (2026-11-06) every q8_0, D and F cell above, and their [100k and 160k rows](#100k-and-160k-context), read as
+listed. The one older cell, D at 64k, moved from 0.00160 to 0.00161 and has the new date.
 
 - The MTP layer's cache only feeds the drafts, so D and D' score the same wherever both were measured.
 - The fp16 cache was no better than q8_0: on its 2026-10-12 / 13 builds q8_0 read 0.00113 on the short set and 0.00219
@@ -591,8 +602,20 @@ which the device / host split rewrote, so a later run of the script is not compa
 - **Greedy output does not depend on the draft depth.** The attention's split-K partition depends only on the context
   length, and the verify GEMMs compute every row the same way whatever the number of rows, so the same prompt gives the
   same token ids at 0, 4 and 7 drafts. Every release is checked this way (v2026.10.30: the Windows build's ids at 0 and
-  7 drafts equal the Linux build's at 7).
-- **llama.cpp's greedy output depends on the draft depth.** Its greedy answers to the 282 questions at 4 and at 7 MTP
+  7 drafts equal the Linux build's at 7). On v2026.11.05 (2026-11-06):
+  - the 282 questions at no drafts against 7 drafts: 0 answers differ, 129,511 tokens on both sides, 41 answers past 1,000
+    tokens (not in the gate: about an hour);
+  - about 2,000 tokens of greedy output (1,874 to 2,048) at no drafts against 7, on q8_0 and on presets D and F past their
+    window: identical
+    (`scripts/exactness.py`, the long check);
+  - the same essay under five draft policies, from no gates to tight gates: identical to no drafts (the policy check).
+- **llama.cpp's greedy output depends on drafting.** Its greedy answers to the 282 questions (b12024, 2026-11-06) differ
+  from its own at no drafts on 113 at 4 drafts and 113 at 7; 72 of the 113 at 4 drafts are under 1,000 tokens. It repeats
+  itself: a fresh no-draft server gave the first 120 questions' answers back byte for byte, the 73 of them that differ from
+  4 drafts included, and two sessions of 4 drafts agree on all 282. Quality doesn't visibly move: 231 right at no drafts,
+  229 at 4 and at 7, and 6 of the 113 at 4 drafts flipped right or wrong (4 for no drafts, 2 for 4 drafts). With no
+  drafts every token goes through the single-token kernels and with drafts most go through the batched ones (its code picks
+  kernels by batch size), the likely reason the split is so much wider than between two draft counts. Between those, its answers at 4 and at 7 MTP
   drafts (b12024, 2026-10-31) differ on 9: none of the 236 answers under 1,000 tokens, 9 of the 46 longer ones. On
   MMLU-Pro (3) and MATH-500 (3) the first difference is 1,936 to 4,550 characters in; on MATH-500 with thinking on (3)
   the reasoning itself went another way (2,228 against 4,795 tokens on one). Asked again twice at 4 drafts on a fresh
@@ -623,6 +646,10 @@ the DeltaNet and convolution state), compared with a fresh prefill of the whole 
 | sampled follow-up / edit / restored park with a fixed seed (the draft vocabulary rebuilt as a fresh prefill builds it) | 9 / 9 equal to fresh (before the change, 5 of 9 differed) | 2026-10-20 |
 | a side request beside a cached conversation, a park and restore | digest after the side request / restore bitwise equal to before; the next replies equal to the conversation alone on a fresh server, greedy and sampled (8 / 8) | 2026-10-19 |
 | a new session resumed at a pinned checkpoint (live, parked, after a side request, after the conversation grew to 63k) | replies equal to the same request on a fresh server, q8_0 and preset D, greedy and sampled | 2026-10-21 |
+| a resume after decoding, a branch and back, a park and restore, a side request, ~11.8k tokens, q8_0, D and F (`scripts/capi_checks.py`) | state bitwise equal to a fresh prefill, and the next 64 greedy ids equal; 50 checks | 2026-11-06 |
+| a follow-up, an edit, a sampled follow-up, three parked conversations, a side request and new sessions at a pinned checkpoint, q8_0, D and F (`scripts/exactness.py`) | replies equal to a fresh server's | 2026-11-06 |
+| the same turns at ~99.5k with the launchers' settings (120k, a 1,024-token chunk) plus an edit inside the prompt, q8_0, D and F; a follow-up at ~255k on F at 262,144 | replies equal to a fresh server's | 2026-11-06 |
+| 20 two-turn conversations, greedy, 2,048 tokens: the second turn after the first, against the same request on a fresh server | 0 of 20 differ | 2026-11-06 |
 
 What it costs (2026-10-14): a follow-up turn re-reads the previous reply (11.6k-token chat, 7 drafts: 167 instead of
 78 ms; with a thinking reply kept in the history: 469 instead of 86 ms). Edits cost the same either way. A fresh
@@ -631,6 +658,12 @@ What it costs (2026-10-14): a follow-up turn re-reads the previous reply (11.6k-
 short set and 99.121% / 0.00231 at 32k with exact reuse, 98.654% / 0.00116 and 99.023% / 0.00232 without. The CLI
 measurements in [against llama.cpp](#against-llamacpp) run without exact reuse (the CLI's default); the launchers'
 server runs with it.
+
+The same 20 conversations on llama.cpp b12024 at 4 drafts (`cache_prompt` on, its default): 20 of 20 differ from a fresh
+server, the first difference a median of 369 characters in (4 to 1,671). They repeat: on another fresh server, five of them gave
+the same warm answers and the same cold ones. With `cache_prompt` false on a running server, 3 of 20 still differ from a
+fresh server. Its [server docs](https://github.com/ggml-org/llama.cpp/blob/master/tools/server/README.md) say the option
+can change results.
 
 ### fp16 range in the prefill GEMMs
 

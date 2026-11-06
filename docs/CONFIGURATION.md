@@ -112,7 +112,8 @@ python3 server/mk_server.py -m Qwen3.8-27B-UD-Q4_K_XL.gguf --port 8080 -c 120000
 
 ## KV cache presets
 
-The KV cache is q8_0 (8 bits per value, one fp16 scale per 32) unless asked otherwise. `MK_KV` stores chosen layers'
+The launchers' KV cache is q8_0 (8 bits per value, one fp16 scale per 32); `--kv auto`, the CLI's default, picks fp16 when it
+fits and q8_0 otherwise. `MK_KV` stores chosen layers'
 K and V at fewer bits, and `MK_KV_WIN` keeps the most recent positions at 8 bits in a ring on top. The presets are
 opt-in and near-lossless: measured by KL divergence against llama.cpp's reference distributions, not bit-identical to
 the q8_0 cache. With C, D and D', a prompt that fits in the window reads only q8_0 rows, and the short-prompt KL report
@@ -166,7 +167,7 @@ what the driver keeps resident, and F stays inside it with the default prefill c
   a ring (sized in steps of 640 positions). With exact reuse, every checkpoint also holds the rings as of its position
   in pinned host memory (preset D': +106 MiB per checkpoint slot).
 - With exact reuse on, a reused or restored conversation under a preset continues bit for bit as the same request sent
-  fresh under that preset (state-digest probe on q8_0 and D').
+  fresh under that preset (`scripts/exactness.py` and the state digest of `scripts/capi_checks.py`, on q8_0, D and F).
 
 Per-layer scans showed K about 2.3 times as sensitive as V, and no setting that saved 0.5 GB or more
 stayed within the KL noise of the q8_0 cache, which is why the presets are opt-in. A plain 4-bit cache
@@ -340,7 +341,7 @@ on (even `0`). The measurement and test switches are in [their own section](#mea
 
 | Variable | Default | What it does | Output | Status |
 |---|---|---|---|---|
-| `MK_EXACT` | `0`; the server sets `1` with `--exact-reuse`, and with `--agents` unless set | exact reuse: every prefill row comes out the same however the sequence was cut into prefill calls and chunks (prefill attention over absolute key segments, checkpoints on the absolute 32-token grid, window rings saved with each checkpoint). The server then restores the last checkpoint at or before the point where a prompt diverges and prefills from there instead of appending to the reply's decoded rows. Cost: a 98k prefill from scratch +1.3%; a follow-up turn re-reads the previous reply (11.6k chat: 167 instead of 78 ms); edits cost the same | reuse = fresh, bit for bit; the prefill arithmetic differs from `0` (KL within noise: 98.662% / 0.00118 vs 98.654% / 0.00116) | served |
+| `MK_EXACT` | `0`; the server sets `1` with `--exact-reuse`, and with `--agents` unless set | exact reuse: every prefill row comes out the same however the sequence was cut into prefill calls and chunks, as long as a prefill starts on the absolute 32-token grid (the engine warns when one doesn't; the server's checkpoints are all on it) (prefill attention over absolute key segments, checkpoints on that grid, window rings saved with each checkpoint). The server then restores the last checkpoint at or before the point where a prompt diverges and prefills from there instead of appending to the reply's decoded rows. Cost: a 98k prefill from scratch +1.3%; a follow-up turn re-reads the previous reply (11.6k chat: 167 instead of 78 ms); edits cost the same | reuse = fresh, bit for bit; the prefill arithmetic differs from `0` (KL within noise: 98.662% / 0.00118 vs 98.654% / 0.00116) | served |
 | `MK_EXACT_SEG` | `4096` | exact mode: positions per absolute key segment of the prefill attention (rounded down to a multiple of 32). Against 8192 on a 98k prompt: the same time from scratch, faster for a restore plus 32 tokens | changes (another fold order); reuse stays exact at any value | option |
 | `MK_EXACT_SPLIT` | `1` | exact mode: the last wave of attention work is split into segment units to balance the GPU; `0`: whole items only | same (every split gives the same rows) | option |
 | `MK_CK_SLOTS` | `8`; the CLI keeps 1 unless set | DeltaNet checkpoint slots in pinned host memory (1-64; ~0.17 GB each). Pinned checkpoints (`--ck-pin`) take slots from this pool | same with exact reuse | served |
