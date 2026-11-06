@@ -66,8 +66,8 @@ below [the current ones](BENCHMARKS.md#headline-numbers), but the shape is the s
 | copying text verbatim, short / at 38k | 7 | 257.7 / 235.3 | 95.1% / 97.9% | 7.51 | 29.1 / 31.9 |
 
 A cycle that verifies 8 rows took ~29.1 ms against 22.3 ms for 1 row (short context), so the gain comes from accepted
-drafts. Without drafts on either side the engine still decodes faster than llama.cpp: 48.3 against 43.5 tok/s on short
-prompts and 44.9 against 36.1 at 38k ([BENCHMARKS.md](BENCHMARKS.md#without-drafts)).
+drafts. Without drafts on either side the engine still decodes faster than llama.cpp: 48.7 against 43.8 tok/s on short
+prompts and 45.2 against 36.3 at 38k ([BENCHMARKS.md](BENCHMARKS.md#without-drafts)).
 
 ## Correctness
 

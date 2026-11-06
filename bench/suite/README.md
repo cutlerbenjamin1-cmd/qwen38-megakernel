@@ -1,7 +1,7 @@
 # Benchmark suite
 
 The clients, items and scoring behind the server tables in [docs/BENCHMARKS.md](../../docs/BENCHMARKS.md) (the full run
-of 2026-11-03, with preset F's 262,144-token run) and the README: the same prompts, request parameters, item
+of 2026-11-06, with preset F's 262,144-token run) and the README: the same prompts, request parameters, item
 selection, warm-up requests, timing fields and scoring rules. Point them at this engine's server or at llama.cpp's
 `llama-server` (the comparison column) and the numbers are comparable with the published ones, within the
 session-to-session spread described there.
@@ -85,7 +85,7 @@ context). The VRAM rows are for the whole card, so nothing else should run on it
 The from-scratch step needs side requests and parking off: with them on, the short request the client sends to clear
 the cache runs beside the cached conversation and keeps it, and the long prompt is then served from the cache.
 
-The llama.cpp columns were measured with llama.cpp b12024's `llama-server` (2026-11-03), tuned (q8_0 KV cache, 4 MTP
+The llama.cpp columns were measured with llama.cpp b12024's `llama-server` (2026-11-06), tuned (q8_0 KV cache, 4 MTP
 drafts; no `--spec-type` without drafts), on the same model file:
 
 ```sh
@@ -107,14 +107,14 @@ server driving this engine. llama-server: `--parallel 4`, with the context it ne
 ## 3. Run the steps
 
 All clients take `--url` (default `http://127.0.0.1:8080`), `--label` (a name for the configuration, written into every
-record) and `--out` (a JSON-lines file; records are appended). Times are for an RTX 3090 on 2026-11-03.
+record) and `--out` (a JSON-lines file; records are appended). Times are for an RTX 3090 on 2026-11-06.
 
 | Step | Server | Command | Time |
 |---|---|---|---|
 | speed | 120k (q8_0 or preset D) | `python -I bench/suite/speed_client.py --label q8 --out speed.jsonl` | ~3 min |
-| questions | the same server, after the speed step | `python -I bench/suite/qa_client.py --label q8 --out qa.jsonl` | ~27 min |
+| questions | the same server, after the speed step | `python -I bench/suite/qa_client.py --label q8 --out qa.jsonl` | ~26 min |
 | from-scratch prefill | 120k, side requests and parking off | `python -I bench/suite/scratch_client.py --label q8 --out scratch.jsonl` | ~2 min |
-| full context | preset F at 262,144 | `python -I bench/suite/maxctx_client.py --label max_f --ctx 262144 --out max.jsonl` | ~41 min |
+| full context | preset F at 262,144 | `python -I bench/suite/maxctx_client.py --label max_f --ctx 262144 --out max.jsonl` | ~37 min |
 | parallel agents | `--agents 4`, Q4_K_M | `python -I bench/suite/parallel_client.py --label agents --n 4 --out parallel.jsonl`, then the same with `--n 1 --tests short,ctx` | ~2 min |
 | scores | none | `python -I bench/suite/score.py qa.jsonl max.jsonl --exec-humaneval --out scores.json` | seconds |
 | tables | none | `python bench/suite/summarize.py speed.jsonl scratch.jsonl max.jsonl parallel.jsonl --scores scores.json` | seconds |
@@ -126,8 +126,8 @@ items already answered under the label), and takes set names to run only some se
 `maxctx_client.py` asks only the first N items of each set: a quick check of a setup, not comparable with the published
 totals. `speed_client.py --mode edit` repeats only the warm-up and the prompt-edit requests, for re-running those rows.
 
-Each 120k server needs a 24 GB card (whole-card VRAM at idle on the reference machine on 2026-11-03: 21.1 GB with q8_0,
-20.0 GB with preset D, 19.8 GB with preset F, 0.6 GB of it the desktop's); preset F's 262,144-token server reached 23.0 GB.
+Each 120k server needs a 24 GB card (whole-card VRAM at idle on the reference machine on 2026-11-06: 21.2 GB with q8_0,
+20.1 GB with preset D, 19.8 GB with preset F, 0.6 GB of it the desktop's); preset F's 262,144-token server reached 23.0 GB.
 `maxctx_client.py --ctx` must be the server's context: it decides which items fit (the smallest needle item needs
 190,191 tokens).
 
@@ -150,7 +150,7 @@ the question totals and the full-context table, and writes them as JSON with `--
   you want.
 - **Re-runs.** `--sub LABEL:KEY[,KEY]=OTHER` takes some rows of a column from another label, e.g. a step re-run after
   something disturbed it. Keys: the row keys listed in `summarize.py`'s usage, `qa` (all question sets) or `qa.SET`.
-  The 2026-11-03 table needed none; the 2026-10-20 one was made with
+  The 2026-11-06 table needed none; the 2026-10-20 one was made with
   `--sub D:edit_msg,edit_sys,qa.gsm8k,qa.mmlu_pro=D_rerun` (a browser opened during the first pass) and its from-scratch
   rows came from separate labels (`--sub q8:pf101k=q8_scratch`).
 - **Question time** includes, on this engine, the side requests and parks the questions cause beside the cached long
