@@ -1218,6 +1218,18 @@ class AnthropicTests(_HttpCase):
                          self.THINK)
         self.assertEqual(o["content"], [{"type": "thinking", "thinking": "Hmm.", "signature": ""}, {"type": "text", "text": "Four"}])
 
+    def test_thinking_budget_is_noted_as_not_enforced(self) -> None:
+        def keys(thinking):
+            notes = []
+            self.mk.anthropic_to_chat({"max_tokens": 50, "messages": [{"role": "user", "content": "hi"}], "thinking": thinking},
+                                      notes)
+            return [k for k, _ in notes]
+        self.assertEqual(keys({"type": "enabled", "budget_tokens": 1024}), ["anthropic-thinking-budget"])
+        self.assertEqual(keys({"type": "adaptive", "budget_tokens": 1024}), ["anthropic-thinking-budget"])
+        self.assertEqual(keys({"type": "enabled"}), [])
+        self.assertEqual(keys({"type": "disabled", "budget_tokens": 1024}), [])
+        self.assertEqual(keys(None), [])
+
     def test_streaming_events(self) -> None:
         base = {"model": "claude-x", "max_tokens": 50, "messages": [{"role": "user", "content": "hi"}], "stream": True}
         _, ev = self._msg(_ScriptEngine(["\n", "Hmm", ".\n", "</think>", "\n\nLet me look.\n\n"]

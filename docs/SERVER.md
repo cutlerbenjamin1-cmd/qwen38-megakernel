@@ -533,8 +533,8 @@ them; the request is translated to a chat request, as llama-server does.
   `tool_choice` auto / none (any / tool: 400, they need constrained sampling), `disable_parallel_tool_use`.
 - **Generation:** `max_tokens` [4096, as llama-server], `stop_sequences`, `temperature` / `top_p` / `top_k`. `thinking`
   `enabled` or `adaptive` turns thinking on; `disabled` or absent turns it off (Anthropic's default); `budget_tokens` is
-  accepted but not enforced (the reasoning ends when the model ends it, within `max_tokens`); `chat_template_kwargs`
-  win.
+  accepted but not enforced (the reasoning ends when the model ends it, within `max_tokens`; the console warns once);
+  `chat_template_kwargs` win.
 - **Replies:** content blocks `thinking` (with an empty signature), `text` and `tool_use` (parsed `input`);
   `stop_reason` `end_turn`, `max_tokens`, `stop_sequence` (with `stop_sequence`) or `tool_use`; `usage` with
   `input_tokens` (prefilled), `cache_read_input_tokens` (reused from the cache) and `output_tokens`.

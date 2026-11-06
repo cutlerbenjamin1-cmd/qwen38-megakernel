@@ -1989,6 +1989,9 @@ def anthropic_to_chat(body, notes=None, mid_system=True):
     if think is not None and not (isinstance(think, dict) and think.get("type") in ("enabled", "adaptive", "disabled")):
         raise BadRequest("thinking: {\"type\": \"enabled\" | \"adaptive\" | \"disabled\"}")
     kw.setdefault("enable_thinking", bool(think) and think["type"] != "disabled")
+    if think and think["type"] != "disabled" and think.get("budget_tokens") is not None:
+        notes.append(("anthropic-thinking-budget", "Anthropic thinking.budget_tokens is not enforced: the reasoning ends "
+                      "when the model ends it, within max_tokens"))
     out["chat_template_kwargs"] = kw
     return out
 
