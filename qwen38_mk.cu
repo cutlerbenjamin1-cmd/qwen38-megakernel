@@ -2499,10 +2499,11 @@ __device__ __forceinline__ void attn_dims(int L_ctx, int & nch, int & cs) {
 // MK_MTP_WIN=N (measurement knob, default off): the MTP slot's decode attention covers the first tile of positions
 // (sinks, StreamingLLM) and the last N ones; ws = the window start (0: everything, also when the window would start
 // inside the first two tiles). The chunk partition is attn_dims over [ws, L_ctx) plus one sink chunk [0, ATP).
+// ws is rounded down to a multiple of ATP: a window ring's tiles must start on one (kv_tile_src: a tile never wraps)
 __device__ __forceinline__ int mtp_ws(int slot, int n) {
     if (slot != N_ATT_SLOTS - 1 || cB.mtp_win <= 0) return 0;
     const int ws = n + 1 - cB.mtp_win;
-    return ws > 2 * ATP ? ws : 0;
+    return ws > 2 * ATP ? ws & ~(ATP - 1) : 0;
 }
 __device__ __forceinline__ void attn_dims_w(int L_ctx, int ws, int & nch, int & cs) {
     attn_dims(L_ctx - ws, nch, cs);
@@ -3089,8 +3090,9 @@ __device__ __forceinline__ void aqx_cp16(unsigned d, const void * s, unsigned c,
 }
 // aq_issue for one side of one full tile (MIX; the caller decides, aq_issue serves the partial last tile of a chunk),
 // issued by WG warps (wi: this one): a warp's lanes copy a pair of rows per step, chunk c = lane & 15 of row rp = lane >> 4,
-// and warp 0 of them the scales. q / s: the side's buffers (main or ring), row: the tile's first row in them (< 2^20 rows of at
-// most 256 bytes: 32 bits hold the offset). Same chunks and destinations as aq_issue for such a tile.
+// and warp 0 of them the scales. q / s: the side's buffers (main or ring), row: the tile's first row in them (rows of at most
+// 256 bytes: the 32-bit byte offset needs row + 16 <= 2^24; rows < NKV (ctx + KV_PAD) < 2^23 with ctx <= 2^20, ctx_limit).
+// Same chunks and destinations as aq_issue for such a tile.
 template <int WG>
 __device__ __forceinline__ void aqx_side(int wi, int lane, const int8_t * q, const __half * s, unsigned row, int bits, uint8_t * st) {
     const unsigned rb = 32u * bits, c = lane & 15, rp = lane >> 4, lim = 2u * bits, st0 = (unsigned) __cvta_generic_to_shared(st);
@@ -5915,9 +5917,12 @@ __device__ __noinline__ void mtp_kv_pass(int row0, unsigned & epoch) {
 #pragma unroll
         for (int k = 0; k < 8; k++) v[k] *= rs * W.kn[lane * 8 + k];
         rope8(v, lane, pp);
-        kv_store(0, slot, g, pp, v);
+        const size_t row = ((size_t) slot * NKV + g) * cB.ctx + pp; // (fp16 cache: attn_core_t's row)
+        if (cB.kvq8) kv_store(0, slot, g, pp, v);
+        else kv_store_f16(static_cast<__half *>(cB.kc) + row * HD, v);
         load8(cB.vbuf + t * KVD + g * 256 + lane * 8, v);
-        kv_store(1, slot, g, pp, v);
+        if (cB.kvq8) kv_store(1, slot, g, pp, v);
+        else kv_store_f16(static_cast<__half *>(cB.vc) + row * HD, v);
     }
 }
 #endif
