@@ -3090,8 +3090,9 @@ __device__ __forceinline__ void aqx_cp16(unsigned d, const void * s, unsigned c,
 }
 // aq_issue for one side of one full tile (MIX; the caller decides, aq_issue serves the partial last tile of a chunk),
 // issued by WG warps (wi: this one): a warp's lanes copy a pair of rows per step, chunk c = lane & 15 of row rp = lane >> 4,
-// and warp 0 of them the scales. q / s: the side's buffers (main or ring), row: the tile's first row in them (< 2^20 rows of at
-// most 256 bytes: 32 bits hold the offset). Same chunks and destinations as aq_issue for such a tile.
+// and warp 0 of them the scales. q / s: the side's buffers (main or ring), row: the tile's first row in them (rows of at most
+// 256 bytes: the 32-bit byte offset needs row + 16 <= 2^24; rows < NKV (ctx + KV_PAD) < 2^23 with ctx <= 2^20, ctx_limit).
+// Same chunks and destinations as aq_issue for such a tile.
 template <int WG>
 __device__ __forceinline__ void aqx_side(int wi, int lane, const int8_t * q, const __half * s, unsigned row, int bits, uint8_t * st) {
     const unsigned rb = 32u * bits, c = lane & 15, rp = lane >> 4, lim = 2u * bits, st0 = (unsigned) __cvta_generic_to_shared(st);
