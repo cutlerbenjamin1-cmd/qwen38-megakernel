@@ -26,7 +26,7 @@ import tempfile
 
 LIB, MODEL, DV = sys.argv[1:4]
 CASES = ("penalty", "slots_dup", "slots_oom", "slots_fit", "ctor_oom", "slots_devoom", "ctor_devoom", "policy", "model_values",
-         "digest_q8", "digest_D", "digest_F")
+         "digest_q8", "digest_D", "digest_F", "digest_W1024")
 PROMPT = b"<|im_start|>user\nWrite a short poem about a lighthouse.<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"
 vp, ip = ctypes.c_void_p, ctypes.POINTER(ctypes.c_int)
 SKIP_RC = 77  # a case's exit code for SKIP (automake's convention)
@@ -695,6 +695,77 @@ def case_digest_D(L):
 
 def case_digest_F(L):
     return digest_reuse(L, {"MK_KV": "K*=5r,V*=5", "MK_KV_WIN": "2048"})
+
+
+def case_digest_W1024(L):
+    """MK_EXACT with MK_KV_WIN=1024: window rings of 1952 rows, shorter than the default prefill chunk (2048), which the
+    engine then caps at 1920. Resumes at checkpoints inside a chunk (1024: its window starts at 0; 3072), each bitwise
+    against the fresh prefill: a checkpoint's ring rows of a chunk longer than the ring held other positions' rows."""
+    os.environ.update({"MK_EXACT": "1", "MK_CK_SLOTS": "8", "MK_KV": "K*=6,V*=5", "MK_KV_WIN": "1024"})
+    os.environ.pop("MK_PF_CAP", None)
+    L.mk_prefill_cks.argtypes = [vp, ip, ctypes.c_int, ip, ctypes.c_int, ctypes.c_int]
+    L.mk_state_digest.argtypes = [vp, ctypes.POINTER(ctypes.c_ulonglong), ctypes.c_int]
+    L.mk_checkpoints.argtypes = [vp, ip, ctypes.c_int]
+    L.mk_rewind_to.argtypes = [vp, ctypes.c_int]
+    L.mk_set_sampling.argtypes = [vp, ctypes.c_float, ctypes.c_float, ctypes.c_int, ctypes.c_float, ctypes.c_ulonglong]
+    L.mk_kv_sizes.argtypes = [vp] + [ctypes.POINTER(ctypes.c_longlong)] * 4
+    h = new(L, 32768)
+    if not check(bool(h), "the engine starts", L):
+        return False
+    sizes = [ctypes.c_longlong() for _ in range(4)]
+    L.mk_kv_sizes(h, *[ctypes.byref(x) for x in sizes])
+    if not check(sizes[1].value > 0, "the preset took effect: the window rings exist"):
+        L.mk_free(h)
+        return False
+    L.mk_set_sampling(h, 0.0, 1.0, 0, 0.0, 0)
+    text = reuse_text(400)
+    buf = (ctypes.c_int * (len(text) + 16))()
+    N = L.mk_tokenize(h, text, len(text), buf, len(text) + 16)
+    assert N > 0, err(L)
+    toks = list(buf[:N])
+
+    def feed(t, cks=()):
+        arr = (ctypes.c_int * len(t))(*t)
+        ca = (ctypes.c_int * max(len(cks), 1))(*cks)
+        first = L.mk_prefill_cks(h, arr, len(t), ca, len(cks), -1)
+        assert first >= 0, err(L)
+        return first
+
+    def digest():
+        n = L.mk_state_digest(h, None, 0)
+        assert n > 0, err(L)
+        a = (ctypes.c_ulonglong * n)()
+        L.mk_state_digest(h, a, n)
+        return list(a)
+
+    def decode(first, n=64):
+        out, got = (ctypes.c_int * 16)(), [first]
+        for _ in range(n):
+            if len(got) >= n:
+                break
+            k = L.mk_step(h, out, 16)
+            assert k >= 0, err(L)
+            got += list(out[:k])
+        return got[:n]
+
+    def checkpoints():
+        n = L.mk_checkpoints(h, None, 0)
+        a = (ctypes.c_int * max(n, 1))()
+        L.mk_checkpoints(h, a, n)
+        return list(a[:n])
+
+    ok = check(N > 4096, f"the prompt ({N} tokens) is past two prefill chunks")
+    first = feed(toks, (1024, 3072))
+    fresh, ids0 = digest(), decode(first)
+    for P in (3072, 1024):  # (the later one first: a rewind keeps the checkpoints before it)
+        if not check(P in checkpoints() and L.mk_rewind_to(h, P) == 0, f"back to the checkpoint at {P}", L):
+            L.mk_free(h)
+            return False
+        first = feed(toks[P:])
+        ok &= check(digest() == fresh, f"a resume at {P} and the rest again: state bitwise equal to the fresh prefill")
+        ok &= check(decode(first) == ids0, "and the next 64 greedy ids equal")
+    L.mk_free(h)
+    return ok
 
 
 def win_commit_free_gb():

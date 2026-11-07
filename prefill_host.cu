@@ -33,6 +33,12 @@ void MKEngine::Impl::pf_init() {
     // MK_PF_CAP: tokens per prefill chunk (multiple of 128); scratch is ~0.33 MB per token
     int cap = 2048;
     if (const char * e = getenv("MK_PF_CAP")) cap = std::max(128, std::min(2048, atoi(e) / 128 * 128));
+    // MK_EXACT checkpoints keep the window rings: ring_snap_rows runs after a whole chunk, which must not wrap a ring
+    if (ring_bytes_ck > 0 && cap > hb.kvrc) {
+        fprintf(stderr, "[mk] MK_PF_CAP %d -> %d: MK_EXACT checkpoints keep the KV window rings, %d rows (MK_KV_WIN=%d), and a "
+                        "prefill chunk must not wrap them\n", cap, hb.kvrc / 128 * 128, hb.kvrc, hb.kvwin);
+        cap = hb.kvrc / 128 * 128;
+    }
     hp.cap = cap;
     mem_mark("before prefill scratch");
     hp.x = dalloc<float>((size_t) cap * D);
