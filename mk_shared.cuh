@@ -531,7 +531,8 @@ constexpr int A2_PART = 6 * A2_Q * HD + 2 * 6 * A2_Q; // floats per partial: o [
 namespace pf {
 #if MK_PF_INFCHK
 enum { CHK_Q, CHK_K, CHK_V, CHK_O, CHK_QKV, CHK_GATE, CHK_SOUT, CHK_GU, CHK_UP, CHK_DOWN, CHK_EH, CHK_HEAD, // GEMMs
-       CHK_IN_NORM, CHK_IN_DN, CHK_IN_MTP, CHK_IN_ATTN, CHK_IN_GLU, CHK_SITES };                            // inputs
+       CHK_IN_NORM, CHK_IN_DN, CHK_IN_MTP, CHK_IN_ATTN, CHK_IN_GLU,                                         // inputs
+       CHK_DN_S, CHK_DN_KS, CHK_DN_U, CHK_DN_UD, CHK_SITES }; // the DeltaNet scan's fp16 MMA operands (S, K S, U, U d)
 constexpr int CHK_LAYERS = 66; // 64 trunk layers, 64 = the MTP block, 65 = the output head
 #endif
 constexpr int BM = 128, BN = 128, BK = 64;

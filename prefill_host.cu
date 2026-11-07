@@ -301,28 +301,28 @@ void MKEngine::Impl::chk_mat(const Mat & m) { // a GEMM's site and layer, from i
 
 void MKEngine::Impl::chk_report(int npos) {
     static const char * const nm[pf::CHK_SITES] = {"attn_q", "attn_k", "attn_v", "attn_o", "dn_qkv", "dn_gate", "dn_out", "ffn_gate",
-                                                  "ffn_up", "ffn_down", "mtp_eh", "head", "in norm_quant", "in dn_out",
-                                                  "in mtp_in", "in attn_gate", "in silu*up"};
+                                                  "ffn_up", "ffn_down", "mtp_eh", "head", "in norm_quant", "in dn_out", "in mtp_in",
+                                                  "in attn_gate", "in silu*up", "dn_scan S", "dn_scan K S", "dn_scan U", "dn_scan U d"};
     constexpr int NL_ = pf::CHK_LAYERS, NS = pf::CHK_SITES;
     std::vector<unsigned long long> c((size_t) NL_ * NS * 2);
     CK(mkl::get_chk_cnt(c.data(), c.size() * sizeof(unsigned long long)));
-    unsigned long long t[2][2] = {{0, 0}, {0, 0}}; // [GEMM | input][kind]
+    unsigned long long t[3][2] = {{0, 0}, {0, 0}, {0, 0}}; // [GEMM | input | DeltaNet scan operand][kind]
     for (int l = 0; l < NL_; l++)
         for (int s = 0; s < NS; s++)
-            for (int k = 0; k < 2; k++) t[s >= pf::CHK_IN_NORM][k] += c[((size_t) l * NS + s) * 2 + k];
+            for (int k = 0; k < 2; k++) t[(s >= pf::CHK_IN_NORM) + (s >= pf::CHK_DN_S)][k] += c[((size_t) l * NS + s) * 2 + k];
     fprintf(stderr, "[mk] MK_PF_INFCHK prefill of %d positions: GEMM fp16 partial sums inf/NaN %llu, non-finite GEMM outputs %llu;"
-                    " fp16 GEMM inputs clamped (|v| > 65504) %llu, NaN (stored as -65504) %llu\n", npos, t[0][0], t[0][1], t[1][0], t[1][1]);
+                    " fp16 GEMM inputs clamped (|v| > 65504) %llu, NaN (stored as -65504) %llu; DeltaNet scan fp16 operands |v| > 65504"
+                    " (not clamped: inf from 65520) %llu, NaN %llu\n", npos, t[0][0], t[0][1], t[1][0], t[1][1], t[2][0], t[2][1]);
     for (int s = 0; s < NS; s++) {
         unsigned long long a[2] = {0, 0};
         std::string where;
         for (int l = 0; l < NL_; l++) {
             const unsigned long long x = c[((size_t) l * NS + s) * 2], y = c[((size_t) l * NS + s) * 2 + 1];
-            a[0] += x;
-            a[1] += y;
+            a[0] += x, a[1] += y;
             if ((x || y) && where.size() < 120) where += " L" + std::to_string(l) + ":" + std::to_string(x) + "/" + std::to_string(y);
         }
         if (a[0] || a[1])
-            fprintf(stderr, "[mk]   %-14s %s %llu, %s %llu  (layer:counts%s)\n", nm[s], s < pf::CHK_IN_NORM ? "partials" : "clamped", a[0],
+            fprintf(stderr, "[mk]   %-14s %s %llu, %s %llu  (layer:counts%s)\n", nm[s], s < pf::CHK_IN_NORM ? "partials" : "> 65504", a[0],
                     s < pf::CHK_IN_NORM ? "outputs" : "NaN", a[1], where.c_str());
     }
     std::fill(c.begin(), c.end(), 0ull);

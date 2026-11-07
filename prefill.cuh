@@ -571,6 +571,10 @@ __global__ void __launch_bounds__(256, 2) pk_dn_scan(int T, int t0, const float 
         float ks[2][4] = {}, qs[2][4] = {};
 #pragma unroll
         for (int s = 0; s < 8; s++) { // k = key dims 16 s .. : B = S tile s
+#if MK_PF_INFCHK
+#pragma unroll
+            for (int e = 0; e < 4; e++) pf::chk_clamp(S[s][e], pf::CHK_DN_S);
+#endif
             const unsigned b0 = movt(pk2(S[s][0], S[s][1])), b1 = movt(pk2(S[s][2], S[s][3]));
 #pragma unroll
             for (int mt = 0; mt < 2; mt++) {
@@ -589,6 +593,10 @@ __global__ void __launch_bounds__(256, 2) pk_dn_scan(int T, int t0, const float 
         for (int s = 0; s < 2; s++) { // k = tokens 16 s ..
             unsigned bv[2];
             ldsm2t(bv, &sV[16 * s + (lane & 15)][8 * w]);
+#if MK_PF_INFCHK
+#pragma unroll
+            for (int e = 0; e < 4; e++) pf::chk_clamp(ks[s][e], pf::CHK_DN_KS);
+#endif
             const unsigned bk0 = movt(pk2(ks[s][0], ks[s][1])), bk1 = movt(pk2(ks[s][2], ks[s][3]));
 #pragma unroll
             for (int mt = 0; mt < 2; mt++) {
@@ -615,6 +623,10 @@ __global__ void __launch_bounds__(256, 2) pk_dn_scan(int T, int t0, const float 
         }
 #pragma unroll
         for (int s = 0; s < 2; s++) {
+#if MK_PF_INFCHK
+#pragma unroll
+            for (int e = 0; e < 4; e++) pf::chk_clamp(u[s][e], pf::CHK_DN_U);
+#endif
             const unsigned bu0 = movt(pk2(u[s][0], u[s][1])), bu1 = movt(pk2(u[s][2], u[s][3]));
 #pragma unroll
             for (int mt = 0; mt < 2; mt++) {
@@ -643,6 +655,10 @@ __global__ void __launch_bounds__(256, 2) pk_dn_scan(int T, int t0, const float 
 #pragma unroll
         for (int s = 0; s < 2; s++) {
             const float da = sd[16 * s + g], db = sd[16 * s + g + 8];
+#if MK_PF_INFCHK
+#pragma unroll
+            for (int e = 0; e < 4; e++) pf::chk_clamp(u[s][e] * (e < 2 ? da : db), pf::CHK_DN_UD);
+#endif
             const unsigned b0 = movt(pk2(u[s][0] * da, u[s][1] * da)), b1 = movt(pk2(u[s][2] * db, u[s][3] * db));
 #pragma unroll
             for (int mt = 0; mt < 8; mt++) {
@@ -822,6 +838,10 @@ __global__ void __launch_bounds__(128, 3) pk_dn_scan4(int T, int t0, const float
         float ks[2][4] = {}, qs[2][4] = {};
 #pragma unroll
         for (int s = 0; s < 8; s++) { // k = key dims 16 s .. : B = S tile s
+#if MK_PF_INFCHK
+#pragma unroll
+            for (int e = 0; e < 4; e++) pf::chk_clamp(S[s][e], pf::CHK_DN_S);
+#endif
             const unsigned b0 = movt(pk2(S[s][0], S[s][1])), b1 = movt(pk2(S[s][2], S[s][3]));
 #pragma unroll
             for (int mt = 0; mt < 2; mt++) {
@@ -839,6 +859,10 @@ __global__ void __launch_bounds__(128, 3) pk_dn_scan4(int T, int t0, const float
         for (int s = 0; s < 2; s++) { // k = tokens 16 s ..
             unsigned bv[2];
             ldsm2t(bv, &sV[16 * s + (lane & 15)][8 * w]);
+#if MK_PF_INFCHK
+#pragma unroll
+            for (int e = 0; e < 4; e++) pf::chk_clamp(ks[s][e], pf::CHK_DN_KS);
+#endif
             const unsigned bk0 = movt(pk2(ks[s][0], ks[s][1])), bk1 = movt(pk2(ks[s][2], ks[s][3]));
 #pragma unroll
             for (int mt = 0; mt < 2; mt++) {
@@ -865,6 +889,10 @@ __global__ void __launch_bounds__(128, 3) pk_dn_scan4(int T, int t0, const float
         }
 #pragma unroll
         for (int s = 0; s < 2; s++) {
+#if MK_PF_INFCHK
+#pragma unroll
+            for (int e = 0; e < 4; e++) pf::chk_clamp(u[s][e], pf::CHK_DN_U);
+#endif
             const unsigned bu0 = movt(pk2(u[s][0], u[s][1])), bu1 = movt(pk2(u[s][2], u[s][3]));
 #pragma unroll
             for (int mt = 0; mt < 2; mt++) {
@@ -893,6 +921,10 @@ __global__ void __launch_bounds__(128, 3) pk_dn_scan4(int T, int t0, const float
 #pragma unroll
         for (int s = 0; s < 2; s++) {
             const float da = sd[16 * s + g], db = sd[16 * s + g + 8];
+#if MK_PF_INFCHK
+#pragma unroll
+            for (int e = 0; e < 4; e++) pf::chk_clamp(u[s][e] * (e < 2 ? da : db), pf::CHK_DN_UD);
+#endif
             const unsigned b0 = movt(pk2(u[s][0] * da, u[s][1] * da)), b1 = movt(pk2(u[s][2] * db, u[s][3] * db));
 #pragma unroll
             for (int mt = 0; mt < 8; mt++) {
