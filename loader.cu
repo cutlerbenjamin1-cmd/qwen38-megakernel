@@ -1309,10 +1309,24 @@ MKEngine::Impl::Impl(const std::string & path, int ctx_, int ndraft_, const std:
                 n4 += hb.kvb[w][s] != 8 || (w == 0 ? hb.kvr[s] : hb.kvrv[s]);
             }
         const size_t ab0 = alloc_bytes; // (alloc_bytes - ab0: the cache's device bytes, rings included)
-        hb.kc = q8 ? (void *) dalloc<int8_t>(vbytes[0]) : (void *) dalloc<__half>(rows * HD);
-        hb.vc = q8 ? (void *) dalloc<int8_t>(vbytes[1]) : (void *) dalloc<__half>(rows * HD);
-        hb.ksc = q8 ? dalloc<__half>(rows * (HD / 32)) : nullptr;
-        hb.vsc = q8 ? dalloc<__half>(rows * (HD / 32)) : nullptr;
+        // a driver without the CUDA sysmem fallback (Linux) fails the allocation where others get the warning below
+        const double kv_gb = q8 ? (vbytes[0] + vbytes[1] + 2.0 * rows * (HD / 32) * 2) / 1e9 : rows * HD * 4.0 / 1e9;
+        const auto kv_oom = [&](const MKCudaError & e, const char * rings) {
+            char msg[1280];
+            snprintf(msg, sizeof msg, "the KV cache (%.2f GB for %d positions%s) does not fit in the free device memory (%.2f GB): %s fits (%s)",
+                     kv_gb, ctx, rings, free_b / 1e9,
+                     q8 ? "a smaller context (-c) or a low-bit preset (MK_KV, docs/CONFIGURATION.md)" : "a smaller context (-c) or --kv q8",
+                     e.what());
+            return MKCudaError(msg);
+        };
+        try {
+            hb.kc = q8 ? (void *) dalloc<int8_t>(vbytes[0]) : (void *) dalloc<__half>(rows * HD);
+            hb.vc = q8 ? (void *) dalloc<int8_t>(vbytes[1]) : (void *) dalloc<__half>(rows * HD);
+            hb.ksc = q8 ? dalloc<__half>(rows * (HD / 32)) : nullptr;
+            hb.vsc = q8 ? dalloc<__half>(rows * (HD / 32)) : nullptr;
+        } catch (const MKCudaError & e) {
+            throw kv_oom(e, "");
+        }
         size_t off[2] = {0, 0};
         for (int s = 0; s < N_ATT_SLOTS; s++)
             for (int w = 0; w < 2; w++) { // slots packed in order: all-q8 gives the same addresses as [slot][head][ctx][HD]
@@ -1351,8 +1365,12 @@ MKEngine::Impl::Impl(const std::string & path, int ctx_, int ndraft_, const std:
             for (int w = 0; w < 2; w++)
                 for (int s = 0; s < kv_slots; s++)
                     if (hb.kvb[w][s] != 8 || win_all) {
-                        hb.kvrp[w][s] = dalloc<int8_t>((size_t) NKV * hb.kvrc * HD);
-                        hb.kvrs[w][s] = dalloc<__half>((size_t) NKV * hb.kvrc * (HD / 32));
+                        try {
+                            hb.kvrp[w][s] = dalloc<int8_t>((size_t) NKV * hb.kvrc * HD);
+                            hb.kvrs[w][s] = dalloc<__half>((size_t) NKV * hb.kvrc * (HD / 32));
+                        } catch (const MKCudaError & e) {
+                            throw kv_oom(e, " and its MK_KV_WIN rings");
+                        }
                         ring_bytes += (size_t) NKV * hb.kvrc * (HD + HD / 16);
                         nr++;
                     }
