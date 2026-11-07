@@ -47,6 +47,16 @@ class InfoMixin:
     def n_vocab(self):
         return getattr(self.eng, "n_vocab", 0)
 
+    def env_number(self, key, default):
+        """an integer setting from the environment as /props shows it (default when unset); main() checks only those it
+        uses, so one that is no integer is shown as the default, with a one-time warning (not a 500 on every /props)"""
+        v = os.environ.get(key) or default
+        try:
+            return int(v)
+        except ValueError:
+            self.warn_once(f"env-{key}", f"{key}={str(v)[:40]!r} is not an integer: /props shows {default}")
+            return default
+
     def engine_info(self):
         """what the server knows for sure about its engine: arguments, environment, the library's own answers"""
         a, e, v = self.args, self.eng, self.vision
@@ -60,7 +70,7 @@ class InfoMixin:
             "exact_reuse": bool(g(e, "exact", False)),
             "checkpoints": {"pool": bool(g(e, "pool", False)), "every": g(a, "ck_every"), "messages": bool(g(a, "ck_msgs")),
                             "pinned": bool(g(a, "ck_pin") and g(e, "ck_pins", False)),
-                            "slots": int(os.environ.get("MK_CK_SLOTS") or 8)},
+                            "slots": self.env_number("MK_CK_SLOTS", 8)},
             "keep_warm_s": self.warm_s, "prefill_cancel": bool(g(e, "_cancel", False)),
             "host_cache": None if self.parked is None else {
                 "budget_mib": self.store_mib, "side_max": g(a, "side_max"), "park_mib": g(a, "park_mib"),
@@ -76,7 +86,7 @@ class InfoMixin:
             "limits": {"max_body_mb": mk_limits.MAX_BODY_MB, "max_inflight_mb": mk_limits.MAX_INFLIGHT_MB,
                        "max_connections": mk_limits.MAX_CONNECTIONS, "request_timeout_s": mk_limits.REQUEST_TIMEOUT_S,
                        "max_images": mk_limits.MAX_IMAGES, "max_stop": MAX_STOP,
-                       "image_max_pixels": int(os.environ.get("MK_IMAGE_MAX_PIXELS") or 100_000_000)},
+                       "image_max_pixels": self.env_number("MK_IMAGE_MAX_PIXELS", mk_limits.IMAGE_MAX_PIXELS)},
             "env": {k: "(set)" if k == "MK_API_KEY" and val else val  # (not the key: /props ends up in bug reports)
                     for k, val in sorted(os.environ.items()) if k.startswith("MK_")},
             "busy": self.busy(), "uptime_s": round(time.time() - self.t_start, 1) if self.t_start else 0.0,

@@ -43,6 +43,11 @@ SURROGATE_RAW = re.compile(rb"\\u[dD][89a-fA-F]|\xed[\xa0-\xbf]")
 SURROGATE = re.compile("[\ud800-\udfff]")
 
 
+def with_trace(e):
+    """an exception for the console line of a 500 (in its except block): its repr and where it was raised"""
+    return f"{e!r}\n{traceback.format_exc().rstrip()}"
+
+
 def lone_surrogate(raw, body):
     """the parsed body holds a lone UTF-16 surrogate (a pair is one character by then): text that has no UTF-8 form,
     on which the tokenizer and the stream events would fail. raw (the body's bytes) is looked at first: one search"""
@@ -268,7 +273,7 @@ def make_handler(srv):
                 except DISCONNECTS:
                     self.close_connection = True
                 except Exception as e:  # (answered, not a dropped connection)
-                    log(f"{path} error:", repr(e))
+                    log(f"{path} error:", with_trace(e))
                     try:
                         self._error(500, str(e), anth)
                     except Exception:
@@ -304,7 +309,7 @@ def make_handler(srv):
                         log(f"#{rid} the client disconnected ({type(e).__name__})")
                 except Exception as e:  # engine failure: report it, keep serving
                     srv.count(requests_failed=1)
-                    log(f"#{rid} error:", repr(e))
+                    log(f"#{rid} error:", with_trace(e))
                     if self.head_sent:  # (as above: the client sees the stream end without its last chunk)
                         log(f"#{rid} the stream had started: closing the connection")
                         self.close_connection = True
@@ -525,7 +530,7 @@ def make_handler(srv):
                 if not st["started"] or isinstance(e, (*DISCONNECTS, ClientGone)):
                     raise
                 bad = isinstance(e, BadRequest)
-                log(f"#{srv.rid} 400: {e}" if bad else f"#{srv.rid} error: {e!r}")
+                log(f"#{srv.rid} 400: {e}" if bad else f"#{srv.rid} error: {with_trace(e)}")
                 event("error", {"type": "error", "error": {"type": "invalid_request_error" if bad else "api_error",
                                                          "message": str(e)}}, last=True)
                 return
@@ -706,7 +711,7 @@ def make_handler(srv):
                 if not st["started"] or isinstance(e, (*DISCONNECTS, ClientGone)):
                     raise  # nothing sent yet: do_POST answers with a status (400 / 500)
                 bad = isinstance(e, BadRequest)
-                log(f"#{srv.rid} 400: {e}" if bad else f"#{srv.rid} error: {e!r}")
+                log(f"#{srv.rid} 400: {e}" if bad else f"#{srv.rid} error: {with_trace(e)}")
                 event({"type": "response.failed", "response": response("failed", error={
                     "code": "invalid_prompt" if bad else "server_error", "message": str(e)})}, last=True)
                 return
@@ -791,7 +796,7 @@ def make_handler(srv):
                     raise  # nothing sent yet: do_POST answers with a status (400 / 500)
                 # the status (200) and part of the reply are out: the error is the stream's last event, OpenAI style
                 bad = isinstance(e, BadRequest)
-                log(f"#{srv.rid} 400: {e}" if bad else f"#{srv.rid} error: {e!r}")
+                log(f"#{srv.rid} 400: {e}" if bad else f"#{srv.rid} error: {with_trace(e)}")
                 err = {"message": str(e), "type": "invalid_request_error" if bad else "server_error", "code": 400 if bad else 500}
                 send(b"data: " + json.dumps({"error": err}, ensure_ascii=False).encode() + b"\n\n")
                 send(b"data: [DONE]\n\n", last=True)

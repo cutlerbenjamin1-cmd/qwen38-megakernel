@@ -656,6 +656,38 @@ class RequestLimitTests(_GateCase):
         self.assertEqual((limits["max_inflight_mb"], limits["max_connections"], limits["request_timeout_s"]),
                          (self.mk.MAX_INFLIGHT_MB, self.mk.MAX_CONNECTIONS, self.mk.REQUEST_TIMEOUT_S))
 
+    def test_props_with_a_setting_that_is_no_integer(self) -> None:
+        # (main() checks MK_IMAGE_MAX_PIXELS only with --mmproj: without, every /props was a 500)
+        srv, http_ = self.serve(base._ScriptEngine(["ok"]))
+        err = io.StringIO()
+        with mock.patch.dict(os.environ, {"MK_IMAGE_MAX_PIXELS": "lots", "MK_CK_SLOTS": "8x"}), \
+                mock.patch.object(sys, "stderr", err), mock.patch.object(self.mk, "CON", self.mk.Console()):
+            for _ in range(2):
+                c = http.client.HTTPConnection("127.0.0.1", http_.port, timeout=10)
+                c.request("GET", "/props")
+                r = c.getresponse()
+                body = r.read()
+                c.close()
+                self.assertEqual(r.status, 200, body[:300])
+        eng = json.loads(body)["engine"]
+        self.assertEqual((eng["limits"]["image_max_pixels"], eng["checkpoints"]["slots"]), (self.mk.IMAGE_MAX_PIXELS, 8))
+        self.assertEqual(err.getvalue().count("MK_IMAGE_MAX_PIXELS='lots' is not an integer"), 1)  # (once)
+        with mock.patch.dict(os.environ, {"MK_IMAGE_MAX_PIXELS": "5000", "MK_CK_SLOTS": ""}):  # (as they are; unset)
+            eng = srv.engine_info()
+        self.assertEqual((eng["limits"]["image_max_pixels"], eng["checkpoints"]["slots"]), (5000, 8))
+
+    def test_a_500_is_logged_with_its_traceback(self) -> None:
+        srv, http_ = self.serve(base._ScriptEngine(["a"] * 40, fail_at=1))
+        body = {"messages": [{"role": "user", "content": "hi"}], "max_tokens": 30}
+        err = io.StringIO()
+        with mock.patch.object(sys, "stderr", err), mock.patch.object(self.mk, "CON", self.mk.Console()):
+            self.assertEqual(http_.post(body)[0], 500)
+            srv.eng.fail_at = srv.eng.cycles + 1  # (and once a stream has started: its error event)
+            self.assertIn(b"no finite logit", http_.raw(base._request({**body, "stream": True}), until=b"0\r\n\r\n"))
+        log = err.getvalue()
+        self.assertEqual(log.count("Traceback (most recent call last)"), 2, log)
+        self.assertEqual(log.count("RuntimeError: decode: no finite logit (test)"), 2, log)
+
 
 class BadFieldTests(_GateCase):
     """fields that used to end in a 500 with a Python exception's text, or in another meaning: a 400, the engine not called"""
