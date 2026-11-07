@@ -292,7 +292,8 @@ int main(int argc, char ** argv) {
     expect("size lie: a third dimension of 2", with([](Spec & s) { s.b_more = {2}; }), 0);
     // (a size lie that stays inside the file parses, like an overlap; the shape-checked read below refuses it)
     expect("size lie inside the file: a as 80 values over b", with([](Spec & s) { s.a_ne0 = 80; }), 1);
-    // offset lies: offset + size inside the data section (an overlap stays inside the file: allowed, as ggml does)
+    // offset lies: offset + size inside the data section (an overlap stays inside the file: allowed here, harmless on a
+    // read-only mapping; ggml's gguf.cpp refuses it, as it wants the tensors contiguous and in order)
     expect("offset lie: b one block later", with([](Spec & s) { s.b_off = 64; }), 0);
     expect("offset lie: b at 2^63", with([](Spec & s) { s.b_off = 1ull << 63; }), 0);
     expect("offset lie: b over a (overlap)", with([](Spec & s) { s.b_off = 0; }), 1);

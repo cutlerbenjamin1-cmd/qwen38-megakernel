@@ -1,6 +1,8 @@
 // Minimal read-only GGUF parser (mmap based). Only what the megakernel loader needs.
 // Every read is checked against the file size and every size is computed without overflow: a truncated or malformed
-// file throws std::runtime_error (never a read outside the mapping, a division by zero or a huge allocation).
+// file throws std::runtime_error (never a read outside the mapping or a division by zero). Every length and count is
+// checked against the bytes left before anything is allocated for it: memory grows with the file's size (a string up to
+// the rest of the file), never with a number the file declares.
 // A tensor's byte size comes from its type and dimensions (never from anything else the file says); its type must be one
 // the engine reads, every dimension at least 1, and offset + size inside the data section. Readers that expect a shape
 // ask for it (File::get(name, dims), shape_is): a tensor with the right name but another shape (fewer rows, an extra
