@@ -4,6 +4,7 @@ import contextlib
 import http.client
 import io
 import json
+import os
 import socket
 import sys
 import tempfile
@@ -1535,6 +1536,16 @@ class ChatTemplateOptionTests(_HttpCase):
         self.assertEqual((code, [c.args for c in calls]), (None, [("file", str(d / "ok.jinja"))]), err)
         self.assertIn("chat template: " + str(d / "ok.jinja"), err)
         self.assertEqual(self._main()[0:3:2], (None, []))  # (no option: the GGUF's, nothing read)
+
+    def test_agents_keep_one_checkpoint_slot_for_the_engines_own_sequence(self) -> None:
+        # (its 1024 positions run the warm-up only; each slot has a pool of its own, MK_SLOT_CK)
+        keys = ("MK_CK_SLOTS", "MK_PF_CAP", "MK_EXACT")
+        clean = {k: v for k, v in os.environ.items() if k not in keys}
+        for argv, preset, want in ((("--agents", "2"), None, "1"), (("--parallel", "2"), None, "1"),
+                                   (("--agents", "2"), "4", "4"), ((), None, None)):
+            with mock.patch.dict(os.environ, {**clean, **({"MK_CK_SLOTS": preset} if preset else {})}, clear=True):
+                code, err, _ = self._main(*argv)
+                self.assertEqual((code, os.environ.get("MK_CK_SLOTS")), (None, want), (argv, preset, err))
 
 
 # === con: the console (log lines with request numbers, the live status line) ===

@@ -235,6 +235,9 @@ def main():
         # cycles computes what it computes alone
         os.environ.setdefault("MK_PF_CAP", "1024")
         os.environ.setdefault("MK_EXACT", "1")
+        # one checkpoint slot for the engine's own sequence (1024 positions, the warm-up only; each slot has its own pool):
+        # the default 8 would pin 8 x 174 MiB of host memory for nothing
+        os.environ.setdefault("MK_CK_SLOTS", "1")
         for k in ("MK_PF_MIX", "MK_PF_CHUNK", "MK_PF_SOLO"):  # (the slot scheduler's: checked before the model loads)
             env_int(k, 0, 0)
     if not 0 < args.video_fps <= 30:
