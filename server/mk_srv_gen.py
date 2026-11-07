@@ -239,6 +239,10 @@ class GenerateMixin:
         if body.get("parallel_tool_calls") is False:
             calls = calls[:1]  # (the first call only)
         rest = parser.unparsed()
+        lost = parser.stray()
+        if lost:  # (Qwen's template tells the model not to write after a call: rare, but never silent)
+            log(f"#{rid} dropped {sum(map(len, lost)):,} chars of text the model wrote between or after its tool calls "
+                f"(a reply carries the calls only)")
         shown = parser.unparsed(streamed=True) if body.get("stream") else rest
         if shown:
             emit("content", shown)

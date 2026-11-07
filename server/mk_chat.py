@@ -107,6 +107,7 @@ class ToolCallParser:
         self.events, self.one = events, one
         self.text, self.pos, self.state = "", 0, "seek"
         self.calls = []
+        self.spans = []  # (start, end) of each complete call in text
         self.end = 0  # where the last complete call ends in text
         self.started = 0  # calls started in the stream
         self.open = []  # where the calls started in the stream that did not complete begin
@@ -132,6 +133,17 @@ class ToolCallParser:
             return ""
         cut = min((s for s in self.open if s >= u), default=len(self.text)) if streamed else len(self.text)
         return self.text[u:cut]
+
+    def stray(self):
+        """the text no reply carries: what lies outside the complete calls before the unparsed markup (between the calls,
+        after the last one), whitespace-only stretches aside"""
+        u = self.text.find(TOOL_OPEN, self.end)
+        bits, pos = [], 0
+        for s, e in self.spans:
+            bits.append(self.text[pos:s])
+            pos = e
+        bits.append(self.text[pos:u if u >= 0 else len(self.text)])
+        return [b.strip() for b in bits if b.strip()]
 
     def _seek(self, final, out):
         i = self.text.find(TOOL_OPEN, self.pos)
@@ -182,6 +194,7 @@ class ToolCallParser:
                 self._arg("}" if c["n"] else "{}", out)
                 self.calls.append({"id": c["id"], "type": "function", "function": {
                     "name": c["name"], "arguments": json.dumps(c["args"], ensure_ascii=False)}})
+                self.spans.append((c["start"], m.end()))
                 self.cur, self.end, self.pos, self.state = None, m.end(), m.end(), "seek"
                 return True
             k = SPACE_RE.match(t, j + 11).end()
@@ -591,3 +604,7 @@ class OutputParser:
         a call the stream started (its client has it as a call whose arguments never became valid JSON)"""
         rest = self.tc.unparsed(streamed) if self.tc else ""
         return (self.tool_sep if self.content_seen else "") + rest if rest else ""
+
+    def stray(self):
+        """the text between or after the tool calls that no reply carries (ToolCallParser.stray)"""
+        return self.tc.stray() if self.tc else []

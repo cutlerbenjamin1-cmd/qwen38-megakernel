@@ -4,10 +4,13 @@ shapes, the official SDKs' stream accumulators when installed), Anthropic typed 
 overflow error, reasoning format and template defaults, llama-server's extra request fields, chunked request bodies."""
 import base64
 import http.client
+import io
 import json
 import socket
+import sys
 import time
 import unittest
+from unittest import mock
 
 from test_mk_server import (CALL, ROOT, TEMPLATE, TOOLS, _FakeVisionLib, _HttpCase, _ScriptEngine, _load_mk_server, _request,
                             _sse, _sse_events)
@@ -167,6 +170,25 @@ class ToolCallStreamTests(_HttpCase):
         self.assertEqual((finish, content), ("tool_calls", ""))
         self.assertEqual(json.loads(calls[0]["function"]["arguments"]), {"content": doc})
         self.assertEqual(calls[0]["function"], whole["message"]["tool_calls"][0]["function"])
+
+    def test_text_after_a_call_is_dropped_and_logged(self) -> None:
+        # (Qwen's template tells the model not to write after a call; when it does, the reply carries the calls only)
+        text = ("Before.\n\n" + _call("write", path="a") + "\nbetween\n" + _call("write", path="b") + "\n\nAfter the call.\n")
+        for n in (1, 3, 8):
+            p = self.mk.OutputParser(False, WRITE)
+            for piece in _pieces(text, n):
+                p.feed(piece)
+            p.feed("", final=True)
+            self.assertEqual((len(p.calls), p.stray(), p.unparsed()), (2, ["between", "After the call."], ""), n)
+        cut = self.mk.OutputParser(False, WRITE)  # (markup after the calls is the reply's text, not dropped)
+        cut.feed(_call("write", path="a") + "\n<tool_call>\n<function=write>\n<parameter=path>\nx", final=True)
+        self.assertEqual((cut.stray(), cut.unparsed()[:11]), ([], "<tool_call>"))
+        self.assertEqual(self.mk.OutputParser(False, []).stray(), [])
+        err = io.StringIO()
+        with mock.patch.object(sys, "stderr", err), mock.patch.object(self.mk, "CON", self.mk.Console()):
+            whole, _, tcs, content, finish = self._openai(_pieces(text), {})
+        self.assertEqual((whole["message"]["content"], content, finish, len(tcs) > 2), ("Before.", "Before.", "tool_calls", True))
+        self.assertEqual(err.getvalue().count("dropped 22 chars of text the model wrote between or after its tool calls"), 2)
 
     def test_anthropic_stream(self) -> None:
         text = "Let me write.\n\n" + _call("write", path="/x", content="q" * 40, mode=1) + "\n" + _call("write", path="/y")
