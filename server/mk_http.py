@@ -48,15 +48,17 @@ def with_trace(e):
     return f"{e!r}\n{traceback.format_exc().rstrip()}"
 
 
-def lone_surrogate(raw, body):
-    """the parsed body holds a lone UTF-16 surrogate (a pair is one character by then): text that has no UTF-8 form,
-    on which the tokenizer and the stream events would fail. raw (the body's bytes) is looked at first: one search"""
+def fix_surrogates(raw, body):
+    """(body, n): the parsed body with each lone UTF-16 surrogate in its keys and strings replaced by U+FFFD (a pair
+    is one character by then, untouched), as a JS client's own UTF-8 encoder would (they cut strings inside a pair):
+    text without a UTF-8 form fails the tokenizer and the stream events. raw (the body's bytes) is looked at first"""
     if not SURROGATE_RAW.search(raw):
-        return False
+        return body, 0
     try:
-        return SURROGATE.search(json.dumps(body, ensure_ascii=False)) is not None
-    except RecursionError:  # (nested about as deep as json.loads takes: not looked at, as before the check)
-        return False
+        text, n = SURROGATE.subn("\ufffd", json.dumps(body, ensure_ascii=False))
+        return (json.loads(text) if n else body), n
+    except RecursionError:  # (nested about as deep as json.loads takes: left as it is)
+        return body, 0
 
 
 def make_handler(srv):
@@ -256,10 +258,10 @@ def make_handler(srv):
             if not isinstance(body, dict):
                 self._error(400, "the request body must be a JSON object", anth)
                 return
-            if lone_surrogate(raw, body):
-                self._error(400, "the request body has a lone UTF-16 surrogate (a \\ud800-\\udfff escape without its "
-                                 "pair): not Unicode text", anth)
-                return
+            body, n = fix_surrogates(raw, body)
+            if n:
+                srv.warn_once("lone-surrogate", f"{path}: {plural(n, 'lone UTF-16 surrogate')} in a request body (a "
+                                                f"\\ud800-\\udfff escape without its pair) replaced with U+FFFD")
             if route in ("tokenize", "detokenize", "apply_template", "input_tokens", "count_tokens", "responses_input_tokens"):
                 try:  # (no generation: the tokenizer, from this thread; images take the engine's lock)
                     t0 = time.time()
