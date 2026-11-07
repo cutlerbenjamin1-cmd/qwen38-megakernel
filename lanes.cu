@@ -136,6 +136,7 @@ auto MKEngine::Impl::ck_new_slots(int n) -> std::vector<CkSlot> {
         CkSlot s;
         if (cudaHostAlloc(&s.mem, nf * 4, cudaHostAllocMapped) != cudaSuccess) {
             cudaGetLastError();
+            fprintf(stderr, "[mk] warning: no pinned host memory for slot checkpoint %d: keeping %d\n", i + 1, i);
             break;
         }
         s.dstate = static_cast<float *>(s.mem);
