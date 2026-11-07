@@ -138,11 +138,12 @@ class SlotScheduler:
     the tokens of its cycles through its SlotJob. Requests wait for a free slot in arrival order and take the one whose
     sequence shares the most with the prompt, less what that discards of the slot's last prompt (a conversation's next
     turn goes back to its own slot and prefills only its new tokens; an empty slot goes before another conversation's).
-    While slots decode, a waiting prompt is fed in chunks, one per cycle in the same pass as their step
-    (mk_slots_step_mixed, MK_PF_MIX rows, default 256; MK_PF_MIX=0: MK_PF_CHUNK tokens between the cycles, default 512,
-    0: the whole prompt), so they keep decoding while a long prompt is read; while none decodes, MK_PF_SOLO tokens per call
-    (default 0: the whole prompt). With MK_EXACT the chunks change no row (the engine feeds every chunk but a prompt's
-    last as batched rows, each ending on the 32-token scan grid: up to 31 tokens off the budget), so a prompt that
+    While slots decode, a waiting prompt is fed in chunks, one per cycle right before their step (mk_slots_step_mixed:
+    the chunk, then the step, separate launches; MK_PF_MIX rows, default 256; MK_PF_MIX=0: MK_PF_CHUNK tokens between
+    the cycles, default 512, 0: the whole prompt), so they keep decoding while a long prompt is read; while none decodes,
+    MK_PF_SOLO tokens per call (default 0: the whole prompt). With MK_EXACT the chunks change no row (the engine feeds
+    every chunk but a prompt's last as batched rows, each ending on the 32-token scan grid: up to 31 tokens off the
+    budget; a last chunk of 32 tokens or fewer joins the one before, so the prompt keeps its checkpoint), so a prompt that
     arrives while others decode gets the reply it gets alone. A closed job is dropped from the queue, its prefill abandoned at the next chunk, or its slot left out of the
     next cycle. Open-jet's SlotScheduler (--parallel / --agents), with jobs that can be closed at any point.
 

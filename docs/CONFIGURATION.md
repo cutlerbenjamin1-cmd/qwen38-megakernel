@@ -136,13 +136,13 @@ model's full 262,144 tokens (below, and [BENCHMARKS.md](BENCHMARKS.md#the-full-c
 D' is D with the MTP layer's cache at 8 bits: ~70 MB more, and the drafts read q8_0 K / V (its speed against D:
 [BENCHMARKS.md](BENCHMARKS.md#c-d-and-e-side-by-side)).
 
-**Preset D** frees ~1.1 GB at 120k context and fits the model's full 262,144-token context on 24 GB. A prompt that
-fits in the window reads only q8_0 rows, so its output is q8_0's; past the window, KL at 32k is 0.00236 against
-q8_0's 0.00219, the 282 questions score the same 230, and prompts read about 4% slower. Decode tok/s also depends on
-the text: with D the reply differs from q8_0's, and with it the draft acceptance. At the full context a 260,896-token
-prompt was read in 326 s, decode at that depth ran at 66 tok/s, a follow-up turn took 1.28 s, the card held 23.5 GB,
-and 4 of 4 needle-in-a-haystack and 4 of 6 LongBench v2 questions at that length were right. Every number, with the
-fp16 cache's own KL floor: [BENCHMARKS.md](BENCHMARKS.md#kv-cache-presets).
+**Preset D** frees ~1.1 GB at 120k context and fits the model's full 262,144-token context on 24 GB. A prompt that fits
+in the window reads only q8_0 rows, so its output is q8_0's; past the window, KL at 32k is 0.00236 against q8_0's
+0.00219, the 282 questions score the same 230, and prompts read about 4% slower. Decode tok/s also depends on the text:
+with D the reply differs from q8_0's, and with it the draft acceptance. At the full context (2026-10-20, 7322fbd) a
+260,896-token prompt was read in 326 s, decode at that depth ran at 66 tok/s, a follow-up turn took 1.28 s, the card
+held 23.5 GB, and 4 of 4 needle-in-a-haystack and 4 of 6 LongBench v2 questions at that length were right. Every number,
+with the fp16 cache's own KL floor: [BENCHMARKS.md](BENCHMARKS.md#kv-cache-presets).
 
 **Preset F** stores K at 5 bits, Hadamard-rotated, and V at 5 bits, with the same window: 0.26 GB less KV cache than D
 at 120k context (2.99 against 3.25 GB) and 0.58 GB less at 262,144 (6.39 against 6.97 GB). Its KL equals q8_0's at 64k
@@ -165,7 +165,8 @@ what the driver keeps resident, and F stays inside it with the default prefill c
 - It needs the q8_0 cache: `--kv q8`, or `--kv auto`, which picks q8_0 whenever `MK_KV` is set; `--kv f16` refuses it.
 - `MK_KV_WIN=W` (only with a non-empty `MK_KV`) keeps every low-bit side's most recent W or more positions as q8_0 in
   a ring (sized in steps of 640 positions). With exact reuse, every checkpoint also holds the rings as of its position
-  in pinned host memory (preset D': +106 MiB per checkpoint slot).
+  in pinned host memory (preset D': +106 MiB per checkpoint slot), and a prefill chunk is at most the ring's length:
+  the engine lowers `MK_PF_CAP` to 1,280 for W up to 640 and to 1,920 up to 1,280 (the presets' 2,048 is not lowered).
 - With exact reuse on, a reused or restored conversation under a preset continues bit for bit as the same request sent
   fresh under that preset (`scripts/exactness.py` and the state digest of `scripts/capi_checks.py`, on q8_0, D and F).
 
@@ -257,7 +258,7 @@ limits in [SERVER.md](SERVER.md#limits).
 | `--allow-host NAME` | `MK_ALLOW_HOSTS` | none | host names clients may use besides localhost, IP addresses and `--host`'s (repeatable or comma-separated; `*` = any name, which turns the DNS-rebinding check off); other names get a 403 | - |
 | `--cors-origin`, `--cors-origins ORIGIN` | `MK_CORS_ORIGINS` | none | web origins (`scheme://host[:port]`) whose pages may call the server (CORS headers, preflights; `*` is refused); pages of other origins get a 403. Clients that are not web pages send no Origin and are not affected | - |
 | `--api-key KEY` | `MK_API_KEY` | none | every request but `/health` and CORS preflights must carry the key (`Authorization: Bearer KEY` or `x-api-key: KEY`); others get a 401 | - |
-| `-c`, `--ctx` | - | `32768` (launchers 120000); with `--agents` `0` (with `--parallel` 32768) | context in tokens, at most the model's full context of 262,144 (more: the engine refuses to start; a KV cache larger than the free device memory loads with a warning, [ENGINE.md](ENGINE.md#kv-cache)); with `--agents` each slot's, 0 = the most that fits | - |
+| `-c`, `--ctx` | - | `32768` (launchers 120000); with `--agents` `0` (with `--parallel` 32768) | context in tokens, at least 1 and at most the model's full context of 262,144 (else the engine refuses to start; a KV cache larger than the free device memory loads with a warning where the driver falls back to system memory, Windows and WSL2, and elsewhere stops the load with an error naming what fits: [ENGINE.md](ENGINE.md#kv-cache)); with `--agents` each slot's, 0 = the most that fits | - |
 | `-d`, `--draft` | - | `4` (launchers 7) | MTP drafts per cycle: 0-7, or 0-15 in a [deep-pass build](EXPERIMENTAL.md#the-deep-pass); more than 4 needs the q8_0 cache, more than 7 also no `MK_KV` | drafts only (8-15: [deep-pass build](EXPERIMENTAL.md#the-deep-pass)) |
 | `--draft-vocab` | - | `draft_vocab_32k.bin` in the repo | the draft head's vocabulary (the 32k most frequent tokens; tokens of the current conversation are added) | drafts only |
 | `--mtp FILE` | `MK_MTP` (engine) | the model file's MTP layer | the MTP draft layer from another GGUF of the same model (checked against it) | drafts only |
@@ -304,14 +305,14 @@ Read by the server only (there is no option for them):
 
 | Variable | Default | What it does |
 |---|---|---|
-| `MK_TIMEOUT_S` | `600` | seconds a connection's read or write may make no progress before the connection closes (llama-server's `--timeout`; `0`: none): idle keep-alive connections, stalled requests, a client that stopped reading a reply |
+| `MK_TIMEOUT_S` | `600` | seconds a connection's read or write may make no progress before the connection closes (llama-server's `--timeout`; `0`: none): idle keep-alive connections, stalled requests, a client that stopped reading a reply. A stream's write that makes no progress for 60 s (this, when it is shorter and not `0`) counts as a disconnect: the generation stops and the engine is free |
 | `MK_REQUEST_TIMEOUT_S` | `300` | seconds a request may take to arrive, from its first byte to the last of its body, before the connection closes (`0`: no limit): a client sending a byte at a time never hits `MK_TIMEOUT_S`. Generating the reply does not count |
 | `MK_MAX_BODY_MB` | `128` | largest request body in MB, Content-Length or chunked; larger ones get a 413 |
 | `MK_MAX_INFLIGHT_MB` | `256` | request bodies in memory at once in MB, all connections (at least `MK_MAX_BODY_MB`); a body past it gets a 503 |
 | `MK_MAX_CONNECTIONS` | `256` | open connections; a connection past it gets a 503 |
 | `MK_MAX_IMAGES` | `32` | images per request; more get a 400 |
 | `MK_MAX_VIDEO_FRAMES` | `256` | video frames per request, all of its videos (64 s at 4 fps) |
-| `MK_PF_MIX` | `256` | `--agents`: rows of a waiting prompt fed in each decode cycle's pass beside the decoding slots (`mk_slots_step_mixed`), so they keep decoding while a long prompt is read; `0`: `MK_PF_CHUNK` tokens between the cycles. With `MK_EXACT` (the `--agents` default) a chunk before the prompt's last ends on the 32-token scan grid (up to 31 tokens off this budget) and the chunking changes no reply |
+| `MK_PF_MIX` | `256` | `--agents`: rows of a waiting prompt fed right before each decode cycle of the decoding slots (`mk_slots_step_mixed`: the chunk, then the step, as separate launches), so they keep decoding while a long prompt is read; `0`: `MK_PF_CHUNK` tokens between the cycles. With `MK_EXACT` (the `--agents` default) a chunk before the prompt's last ends on the 32-token scan grid (up to 31 tokens off this budget), a last chunk of 32 tokens or fewer joins the one before (so the prompt keeps its checkpoint), and the chunking changes no reply |
 | `MK_PF_CHUNK` | `512` | `--agents` with `MK_PF_MIX=0`: prompt tokens fed between two decode cycles (`0`: the whole prompt, the other slots wait); with `MK_EXACT`, on the 32-token grid as `MK_PF_MIX` |
 | `MK_PF_SOLO` | `0` | `--agents`: prompt tokens fed per call while no slot decodes (`0`: the whole prompt); with `MK_EXACT`, on the 32-token grid as `MK_PF_MIX` |
 | `MK_IMAGE_MAX_PIXELS` | `100000000` | largest image or video frame in pixels, checked from the file header before decoding; also read by the vision library. The server reads it only with `--mmproj` |
@@ -319,8 +320,8 @@ Read by the server only (there is no option for them):
 `MK_MAX_BODY_MB`, `MK_MAX_INFLIGHT_MB`, `MK_MAX_CONNECTIONS`, `MK_MAX_IMAGES`, `MK_MAX_VIDEO_FRAMES` and
 `MK_IMAGE_MAX_PIXELS` must be positive integers, the three `MK_PF_*` integers >= 0: anything else ends the server at
 startup with a message. `MK_SIDE_MAX`, `MK_PARK_MIB`, `MK_AGENTS`, `MK_TIMEOUT_S` and `MK_REQUEST_TIMEOUT_S` accept `0`
-(off). The server sets `MK_EXACT=1` for the engine when `--exact-reuse` is given, and with `--agents` sets `MK_EXACT=1`
-and `MK_PF_CAP=1024` unless they are set; it reports `MK_CK_SLOTS` in `/props`.
+(off). The server sets `MK_EXACT=1` for the engine when `--exact-reuse` is given, and with `--agents` sets `MK_EXACT=1`,
+`MK_PF_CAP=1024` and `MK_CK_SLOTS=1` unless they are set; it reports `MK_CK_SLOTS` in `/props`.
 llama-server's `LLAMA_ARG_*` variables are not read.
 
 ## Engine environment variables
@@ -335,7 +336,7 @@ on (even `0`). The measurement and test switches are in [their own section](#mea
 |---|---|---|---|---|
 | `MK_KV` | empty: q8_0 everywhere | per-layer K / V formats on top of the q8_0 cache ([presets, syntax](#kv-cache-presets)) | changes (lossy, KL-gated) | opt-in |
 | `MK_KV_WIN` | `0`: no window | with `MK_KV`: the most recent W positions of every low-bit side also kept as q8_0 in a ring | changes (closer to q8_0) | opt-in |
-| `MK_MTP_WIN` | `0`: off | the MTP layer's decode attention sees only the last N positions. Draft acceptance fell from 97% to 88-90% at 101.6k context for any window of 1k-16k, 5-7% fewer tok/s | drafts only | slower |
+| `MK_MTP_WIN` | `0`: off | the MTP layer's decode attention sees only the first 32 positions and the last N (up to N + 31: the window starts on a 32-position tile). Draft acceptance fell from 97% to 88-90% at 101.6k context for any window of 1k-16k, 5-7% fewer tok/s | drafts only | slower |
 
 ### Exact reuse and checkpoints
 
@@ -344,7 +345,7 @@ on (even `0`). The measurement and test switches are in [their own section](#mea
 | `MK_EXACT` | `0`; the server sets `1` with `--exact-reuse`, and with `--agents` unless set | exact reuse: every prefill row comes out the same however the sequence was cut into prefill calls and chunks, as long as a prefill starts on the absolute 32-token grid (the engine warns when one doesn't; the server's checkpoints are all on it) (prefill attention over absolute key segments, checkpoints on that grid, window rings saved with each checkpoint). The server then restores the last checkpoint at or before the point where a prompt diverges and prefills from there instead of appending to the reply's decoded rows. Cost: a 98k prefill from scratch +1.3%; a follow-up turn re-reads the previous reply (11.6k chat: 167 instead of 78 ms); edits cost the same | reuse = fresh, bit for bit; the prefill arithmetic differs from `0` (KL within noise: 98.662% / 0.00118 vs 98.654% / 0.00116) | served |
 | `MK_EXACT_SEG` | `4096` | exact mode: positions per absolute key segment of the prefill attention (rounded down to a multiple of 32). Against 8192 on a 98k prompt: the same time from scratch, faster for a restore plus 32 tokens | changes (another fold order); reuse stays exact at any value | option |
 | `MK_EXACT_SPLIT` | `1` | exact mode: the last wave of attention work is split into segment units to balance the GPU; `0`: whole items only | same (every split gives the same rows) | option |
-| `MK_CK_SLOTS` | `8`; the CLI keeps 1 unless set | DeltaNet checkpoint slots in pinned host memory (1-64; ~0.17 GB each). Pinned checkpoints (`--ck-pin`) take slots from this pool | same with exact reuse | served |
+| `MK_CK_SLOTS` | `8`; the CLI and `--agents` keep 1 unless set | DeltaNet checkpoint slots in pinned host memory (1-64; ~0.17 GB each). Pinned checkpoints (`--ck-pin`) take slots from this pool. With `--agents` the engine's own sequence only warms up: each slot has its own checkpoints (`MK_SLOT_CK`). When pinned host memory runs out, the pool keeps the slots it got (with none: one slot in device memory), with a warning | same with exact reuse | served |
 | `MK_CK_DEVICE` | `0` | `1`: a single checkpoint slot in device memory instead of the pinned-host pool (the original layout; refused when `MK_EXACT` and `MK_KV_WIN` are both set) | same | earlier path |
 
 ### Speculation (drafts)
@@ -374,7 +375,7 @@ keeps its distribution). The defaults were tuned on replayed logs and live A/B r
 | `droplast` | `0.4` | drop the deepest draft below this |
 | `g7` | `1` | the gates for depths above 5: stop after drafts 2-4 below 0.25, drop draft 5 below 0.3, stop after drafts 5-6 below 0.3, never drop the deepest draft. Any explicit `stop` / `drop` key turns it off. +2.0% at 38k and +4.1% at 101.6k greedy, together with `MK_MTP_KVC` |
 | `dstop` | `0.5` | [deep-pass build](EXPERIMENTAL.md#the-deep-pass) at depths above 7, with `g7`: stop after drafts 8 and later below this |
-| `tier` | `3` | deep-pass build: a cycle verifies its drafts past the 7th (the 16-row pass) only when the sum of the running products of their MTP probabilities, the MTP's own estimate of how many of them will be accepted, is at least this; else up to 7 drafts. `0`: no such condition |
+| `tier` | `3` | deep-pass build: a cycle verifies its drafts past the 7th (the 16-row pass) only when the sum of the running products of their MTP probabilities, the MTP's own estimate of how many of them will be accepted, is at least this; else up to 7 drafts. `0`: no such condition. With sampled drafts verified by sampling (`h1=1`), the sum uses only what is known before the 8th draft is drawn: the running product through the 8th draft's probability, then that probability again for each further draft up to the depth (choosing by the later drafts' own probabilities which drafts get verified would bias the output) |
 | `dctx` | off | from position N on, at most 4 drafts |
 | `chain` | `1` | what the gates compare: `1` the running product of the top-1 probabilities, `0` each draft's own top-1 probability, `2` with sampled drafts the product of the drafted tokens' own probabilities (drop gates off) |
 | `h1` | `1` | when sampling, draft by sampling the MTP head (`0`: its top-1 token) |
@@ -386,7 +387,7 @@ No gates: `depth=0,drop=0,stop=0,chain=0,h1=0` (adaptive depth, top-1 drafts), t
 
 | Variable | Default | What it does | Output | Status |
 |---|---|---|---|---|
-| `MK_PF_CAP` | `2048`; the launchers use `1024` above 96k context, `serve.bat` `512` above 240k with your own `MK_KV` | tokens per prefill chunk, 128-2048 in steps of 128. The scratch is ~0.33 MB per token: 1024 frees ~0.34 GB, and prefill was 4.5% slower on UD-Q4_K_XL | same with exact reuse; not checked without | served |
+| `MK_PF_CAP` | `2048`; the launchers use `1024` above 96k context, `serve.bat` `512` above 240k with your own `MK_KV` | tokens per prefill chunk, 128-2048 in steps of 128. The scratch is ~0.33 MB per token: 1024 frees ~0.34 GB, and prefill was 4.5% slower on UD-Q4_K_XL. With exact reuse and `MK_KV_WIN` up to 1,280 the engine lowers it to the window ring's length (1,280 or 1,920: a chunk must not wrap the rings a checkpoint saves) and says so at load | same with exact reuse; not checked without | served |
 | `MK_ATTN_S8` | `1` | q8_0 cache, prefill attention: `1` int8 Q K^T with one Q scale per 32 dims (+16.7% prefill at 101.6k); `2` one Q scale per row (+5% in the kernel, 1.6 times the Q rounding noise); `0` fp16 tensor cores | changes | served (`1`) |
 | `MK_ATTN_SPLIT` | `1` | `0`: no tail split of long rows in the prefill attention (exact mode never splits) | changes | earlier path |
 | `MK_ATTN_PV16` | `1` | `0`: the attention's P V accumulated in fp32 instead of fp16 | changes | earlier path |
@@ -417,7 +418,7 @@ These switch single decode kernels back to an earlier form, for A/B measurements
 |---|---|---|---|---|
 | `MK_SLOT_RESERVE_MIB` | `1536` | device memory left free when the slots take the most context that fits (`-c 0`), for the prefill and the runtime | - | option |
 | `MK_SLOT_SPILL` | `0` | `1`: no check that the slots fit in the free device memory (plus the memory pool's unused reserve) before they are allocated. Without it a `-c` that does not fit is refused at once, naming what it needs and what is free; with it a Windows / WSL2 driver's CUDA sysmem fallback (on by default) puts the rest in system memory (charged to Windows commit; the KV cache is then read over PCIe) | same | option |
-| `MK_SLOT_CK` | `2` | DeltaNet checkpoints per slot (where a slot's next prompt resumes when it diverges inside the slot's sequence) | same with exact reuse | option |
+| `MK_SLOT_CK` | `2` | DeltaNet checkpoints per slot (where a slot's next prompt resumes when it diverges inside the slot's sequence), in pinned host memory: when that runs out, a slot keeps fewer, with a warning | same with exact reuse | option |
 | `MK_PAR_RMAX` | unset | a value up to 8: batched slot passes of 8 rows (the verify pass's width) instead of the build's `MK_PAR_RMAX` (16). The engine prints which it runs at load (`parallel slots: batched passes of ...`) | same | debug |
 
 ### Memory and host store
@@ -510,6 +511,8 @@ it.
 | `MK_ATT_I8` | `0` | `0` | experiment build ([EXPERIMENTAL.md](EXPERIMENTAL.md#int8-decode-attention)): int8 Q K^T in the decode attention of the all-q8_0 slots, used when the environment variable `MK_ATT_I8=1` is set. One score helper serves every attention kernel, so draft depths and parallel slots stay exact with it; at 40.5k tokens of context attention took 12% less time per 8-row pass, 3-5 rows unchanged (2026-11-02). In active development and on the list for the served build; not part of it yet, its KL divergence gate is not settled | changes | experiment (in development) |
 | `MK_L2_TUNE` | `0` | `0` | experiment build ([EXPERIMENTAL.md](EXPERIMENTAL.md#l2-prefetch-budgets)): the L2 prefetch budgets read from the `MK_L2_*` environment variables, to tune them on a GPU with another L2 size. Without it the device code is unchanged. Hints only: no value changes a token. On an RTX 3090 no setting beat the defaults (2026-11-04) | same | experiment (in development) |
 | `MK_FD_NOINL` | `0x1c` | `0x1c` | bit mask of the token counts whose ffn_down rows run out of line (T 2-4); inline they spilled and the phase ran 0.17-0.25 ms per pass slower | same | served |
+| `MK_W48X` | `1` | `1` | the decode attention of low-bit `MK_KV` slots with the cheaper K / V copies and expansion (`attn_core_q8m`, `attn_core_w48m`: the same staged bytes and partials); `0`: the earlier path. Compile-time because a run-time switch moves ptxas's register allocation | same | served |
+| `MK_W48X_Q8` | `0` | `0` | with `MK_W48X=1`: the all-q8_0 slots run those kernels too, instead of their own (no q8_0 instances in the build) | not checked | option |
 | `MK_NSEQ` | `4` | `4` | the most parallel slots the engine opens (`--agents` 1 to this): the lanes of a batched launch, each with its own views of the row buffers | same | served |
 | `MK_PAR_RMAX` | `16` | `16` | rows of a batched slot pass (16 beat 24 at 3-4 slots: 345 vs 322 tok/s at 4, temperature 0.6); a value up to 8 makes the passes 8 rows (not with `MK_MAXD=16`). The wide pass also needs every main matrix but ffn gate / up in the wide-verify layout and enough SMs | same | served |
 | `MK_K2_TB` | `8` | `8` | tokens per batch of the split-K residual combine (8 beat 4 by 0.5-0.8 us per call at 38k) | same | option |
@@ -517,7 +520,7 @@ it.
 | `MK_K6_DEF`, `MK_K8_DEF`, `MK_K8_NT` | `6`, `6`, `4` | same | the defaults of the `MK_K6`, `MK_K8`, `MK_K8_NT` environment variables | - | option |
 | `MK_PF_FRAG_G` | `-1` | `-1` | prefill GEMMs: the MMA group of a stage after which the next stage's scales and fragments are made (`-1`: the kernel's own) | not checked | option |
 | `MK_PF_NS_IQ4` | `4` | `4` | cp.async stages of the IQ4_XS prefill GEMMs (3 stages were 2-5% slower) | not checked | option |
-| `MK_PF_INFCHK` | `0` | `0` | debug build: counts fp16 overflows (inf / NaN, clamps) per prefill GEMM and layer, printed after each prefill; none on 38k and 101.6k prompts | same | debug |
+| `MK_PF_INFCHK` | `0` | `0` | debug build: counts fp16 overflows (inf / NaN, clamps) per prefill GEMM and layer, and the DeltaNet scan's fp16 MMA operands past 65504 (not clamped), printed after each prefill; none on 38k and 101.6k prompts (2026-10-17, before the scan's counters) | same | debug |
 | `MK_SPEC_LOG` | `0` | `0` | analysis build: with `MK_SPEC_LOG_FILE=path`, one JSON line per decode cycle (drafts, their MTP top logits, verify rows, outcome) | not checked | debug |
 | `MK_TEST_NAN` | `0` | `0` | test build: `MK_TEST_NAN_AT=N` writes NaN K scales into the first attention layer before decode launch N; the engine must stop with an error and the server answer HTTP 500 (or an error event in a started stream) and recover | - | debug |
 | `MK_TEST_SLOTS_FAIL` | `0` | `0` | test build: `MK_TEST_SLOTS_FAIL_AT=k` makes `slots_open` fail (an `MKCudaError`) once slot k is built, so its roll-back runs over real slots (an out-of-memory failure cannot be forced where allocations spill past the VRAM); the next open must succeed | - | debug |
@@ -557,7 +560,7 @@ Model and engine (one per process; in `--batch` mode these stay the command line
 | Option | Default | What it does |
 |---|---|---|
 | `-m FILE` | required | the GGUF |
-| `-c N` | `8192` | context (KV capacity) in tokens, at most the model's context length (262,144) |
+| `-c N` | `8192` | context (KV capacity) in tokens, at least 1 and at most the model's context length (262,144) |
 | `--kv f16\|q8\|auto` | `auto` | KV cache format; `auto`: q8_0 when fp16 does not fit, or when `MK_KV` is set |
 | `--draft-vocab FILE` | none: the full lm_head | the draft head's vocabulary (`draft_vocab_32k.bin`) |
 | `--mtp FILE`, `--no-mtp` | the model file's MTP layer | as the server's options (env `MK_MTP`, `MK_NO_MTP=1`) |
@@ -577,7 +580,7 @@ Generation job (the command line's job, and the defaults of every `--batch` line
 | `--temp T`, `--top-p P`, `--top-k K`, `--min-p P`, `--seed S` | `0` (greedy), `1`, `32`, `0`, `1` | sampling; top-k at most 32 |
 | `--presence-penalty P`, `--frequency-penalty F` | `0` | penalties on the generated tokens (vLLM's semantics; exact under speculation) |
 | `--policy SPEC` | `MK_POLICY` | the draft policy for this job ([keys](#mk_policy-keys)); in a batch it stays for the jobs after it |
-| `--state-dir DIR` | - | post-prefill state files: the first prompt's prefill is restored from DIR when a file of the same prompt, binary, model and settings is there, else saved there (`MK_STATE_WARM_MS` warms the GPU after a restore) |
+| `--state-dir DIR` | - | post-prefill state files: the first prompt's prefill is restored from DIR when a file of the same prompt, binary, GPU, model and settings is there, else saved there (`MK_STATE_WARM_MS` warms the GPU after a restore) |
 | `--digest` | off | print a hash of the sequence state after the first prefill (tests) |
 | `--ids` | off | print the prompt's and the generated token ids |
 | `--quiet` | off | no generated text, only the statistics |
@@ -598,11 +601,11 @@ Scoring and measurement:
 Exit codes: 1 for an error the engine reports (bad arguments, a prompt over the context), 3 for a watchdog timeout,
 4 for a sticky CUDA error.
 
-A `--state-dir` file is keyed by the binary, the model file, the context, the KV formats, the prompt, and every `MK_*`
-variable in the environment except those that only change decode, logging, timing or the load path: names starting
-with `MK_STATE`, `MK_POLICY`, `MK_PROFILE`, `MK_SPEC_LOG`, `MK_MEMLOG`, `MK_LOADLOG`, `MK_LOAD_`, `MK_WDIGEST`,
-`MK_WATCHDOG`, `MK_CK_SLOTS`, `MK_BENCH`, `MK_STACK_LIMIT`, `MK_GSB`, and `MK_K1`, `MK_K2`, `MK_K6`. Any other change
-saves a new file instead of restoring a stale one.
+A `--state-dir` file is keyed by the binary, the GPU (name, compute capability, SM count), the model file, the context,
+the KV formats, the prompt, and every `MK_*` variable in the environment except those that only change decode,
+logging, timing or the load path: names starting with `MK_STATE`, `MK_POLICY`, `MK_PROFILE`, `MK_SPEC_LOG`,
+`MK_MEMLOG`, `MK_LOADLOG`, `MK_LOAD_`, `MK_WDIGEST`, `MK_WATCHDOG`, `MK_CK_SLOTS`, `MK_BENCH`, `MK_STACK_LIMIT`,
+`MK_GSB`, and `MK_K1`, `MK_K2`, `MK_K6`. Any other change saves a new file instead of restoring a stale one.
 
 ## Tools and benchmarks
 
@@ -621,7 +624,9 @@ These are for measuring and checking, not for serving. Each one's usage text is 
 | `bench/think_bench.py` (thinking-mode decode, both engines) | `--seeds N` (2), `-n N` (1024) |
 | `bench/wv_extract.py` | `[qwen38_mk.cu] [out.cuh]`: copies the engine's dp4a GEMV code from `mk_shared.cuh` and `qwen38_mk.cu` into `bench/wv_ref.cuh` for `wvgemm_bench` (`make check` runs it first) |
 | `scripts/gate.sh` (every GPU check of a build: [checking a build](BUILDING.md#checking-a-build)) | `-m GGUF` (default `MK_MODEL`), `--record DIR` (keep the outputs as a reference) or `--ref DIR` (every output, and the inherited `MK_*` environment, must equal the reference's; a check it did not run is a skip), `--out DIR` (default `gate-out`; one holding a recorded reference is refused), `--legs LIST` (default `benches,exactness,pfcap,cli,tinv,slots,capi,kld`), `--model2 GGUF`, `--kld-ref FILE` (the kld leg), `--capi FILE` (default `scripts/capi_checks.py`), `--capi-cases "CASE ..."` (one or more), `--python PY` (with jinja2), `--port N` (default 18190), `--timeout S` (per run, default 1800); exit 1 if a check failed, 2 for bad arguments, a stale build or a refused `--out` |
-| `scripts/capi_checks.py` (the C API: engine errors and roll-backs, out-of-memory inside the free VRAM, penalties, policies, a slot listed twice, a model's values the kernel does not have) | `LIB MODEL DRAFT_VOCAB [CASE ...]`: the given cases (default: all), each in its own process, PASS / FAIL / SKIP, exit 1 on a FAIL and 2 for an unknown case; env `CAPI_DEVOOM=0` (skip the device out-of-memory cases), `CAPI_COMMIT_MIN_GB` (Windows commit those wait for, default 45) |
+| `scripts/exactness.py` (the exact-output checks: [checking a build](BUILDING.md#checking-a-build)) | `-m GGUF` (default `MK_MODEL`), `--bin FILE` (the CLI), `--draft-vocab FILE`, `--depths LIST` (default `0,4,7`), `--legs LIST` (default every leg: `depth,mtp,long,policy,chunks,server,park,resume,deep,full,agents`), `--presets LIST` (default `q8,D,F`), `--long-tokens N` (2048), `--long-min N` (1000), `--deep-tokens N` (100000), `--full-tokens N` (258000), `--out DIR` (default `exactness-out`), `--compare DIR` (another run's results must be identical), `--port N` (18190), `--python PY` (the server's, with jinja2), `--timeout S` (1800, per run, server start or request); exit 1 on a FAIL |
+| `bench/slots_bench.py` (parallel slots over the C API: speed and exactness; the gate's slots leg) | `MODEL`, `speed\|exact\|stagger\|all` (default `speed`), `--lib FILE`, `--draft-vocab FILE` (`''`: none), `--n N` (slots, default 4), `--nmin N` (speed: the fewest, 1), `--gen N` (tokens per slot, 256), `--draft N` (7), `--ctx N` (positions per slot, 8192), `--temp T` (speed, 0.6), `--reps N` (1), `--long` (3.8k-5.7k-token prompts, past the presets' window), `--budget N` (stagger: the late slot's chunk, 1024), `--lead N` (stagger: steps before it, 8), `--ref-chunked`; exit 1 when an exactness check differs |
+| `scripts/capi_checks.py` (the C API: engine errors and roll-backs, out-of-memory inside the free VRAM, penalties, policies, a slot listed twice, a model's values the kernel does not have, the state after a resume, a park and a side request against a fresh prefill, a step right after a restore, an `MK_EXACT` slot's checkpoint) | `LIB MODEL DRAFT_VOCAB [CASE ...]`: the given cases (default: all), each in its own process, PASS / FAIL / SKIP, exit 1 on a FAIL and 2 for an unknown case; env `CAPI_DEVOOM=0` (skip the device out-of-memory cases), `CAPI_COMMIT_MIN_GB` (Windows commit those wait for, default 45) |
 | `bench/suite/fetch.py` (downloads the benchmark items and checks each against `bench/suite/items.json`) | `--data DIR` (default `bench/suite/data`), `--sets NAME ...` (default all, and `pf101k`), `--check` (check the files already there, download nothing) |
 | `bench/suite/speed_client.py` (decode, prefill, first token, follow-up turns, prompt edits, VRAM; one server) | `--label L`, `--out FILE` (JSON lines, appended), `--url URL` (default `http://127.0.0.1:8080`), `--mode all\|edit` (default all; edit: the warm-up and the edit scenarios only), `--data DIR`, `--gpu N\|none` (nvidia-smi GPU for the VRAM and clock records, default 0) |
 | `bench/suite/qa_client.py` (the 282 questions) | `--label`, `--out`, `--url`, `--data`, `--limit N` (the first N items of each set only), then set names (default all) |
@@ -642,6 +647,8 @@ The CUDA microbenchmarks in `bench/` are built by hand (`nvcc ...`, the line is 
 | `WV_L2PF`, `WV_LD256`, `WV_NOPOL`, `WV_TILEMAJ`, `WV_SBU`, `WV_SPS`, `WV_RH`, `WV_PF`, `WV_Q6FM`, `WV_Q6HP`, `WV2_ROLL`, `WV_V2` (-D) | `wvgemm_bench.cu` | variants of the tensor-core verify GEMM under test: L2 prefetch distance, 256-byte fetch hint, no evict-first policy, tile-major layout, super-blocks per batch, stage / row tiling parameters, prefetch form, Q6_K fragment-ordered forms, rolling prefetch, the v2 kernel |
 | `WV_MODE` (-D) | `wvgemm_bench.cu` | diagnostics: 0 normal, 1 loads only, 2 compute only |
 | `WV_QUICK`, `WV_T8ONLY`, `WV_DPMAX5`, `WV_DPONLY`, `WV_Q6ONLY` (-D) | `wvgemm_bench.cu` | shorter experiment builds: fewer token counts, dp4a up to T 5 only, dp4a only, Q6_K only |
+| `KVB_Q8M=1`, `KVB_WARM=S`, `KVB_STRESS_OLD` (env); `KVB_NEW_X` (-D, default 1) | `kvattn_bench.cu` (with `bench/kvattn_gen.py`, which cuts the kernels of two revisions out of `qwen38_mk.cu`) | q8_0 data through the new revision's low-bit kernel; seconds of warm-up before timing (default 4.5; 0 under ncu); the stress mode repeats the old kernel instead of the new; the new revision's `MK_W48X` |
+| `MMQ_SET=1`, `MMQ_CAND='"file"'` (-D, through `MMQFLAGS`) | `mmq_bench.cu` | plain Q5_K only; candidate kernels from a file, each checked against the kernel it must match |
 | `VIT_PROF` (env) | the vision library (`vision/vit_cpu.cpp`) | print a per-stage profile of the CPU image encoder |
 
 ## Measurement, test and debug switches
@@ -708,4 +715,5 @@ a longer one that replaced a conversation with tools, of that conversation (a sh
 back); a conversation parked with low priority evicts only side conversations and other low-priority ones (it is not
 parked when they do not make room), except the conversation a request without tools has just replaced; a shared prefix
 shorter than 1024 tokens is not pinned. A Responses API stream sends a progress event every 10 s during a long
-prefill; browsers may keep a CORS preflight's answer for 86400 s.
+prefill; a stream's write that makes no progress for 60 s ends the request (its client counts as gone); browsers may
+keep a CORS preflight's answer for 86400 s.

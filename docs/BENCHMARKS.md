@@ -68,9 +68,9 @@ and 28.0 against 40.7 at 101.6k context ([without drafts](#without-drafts)).
 | KV presets D / F: KL at 100k context | 0.00226 / 0.00218, against q8_0's 0.00217 | 2026-10-25 | [KV cache presets](#kv-cache-presets) |
 | the same formats without the 8-bit ring: KL at 100k context | 0.00254 / 0.00281 (4-bit K and V: 0.00469) | 2026-11-02 | [without the ring](#without-the-ring) |
 | the full 262,144-token context, preset F | a 260,896-token prompt in 279 s, decode at that depth 77.8 tok/s, 23,589 MiB on the card | 2026-11-06 | [the full context](#the-full-context) |
-| greedy token ids at 0, 4 and 7 drafts, and under every draft policy | identical | each release | [speculation](#speculation) |
+| greedy token ids at 0, 4 and 7 drafts, and under every draft policy | identical | each release (`scripts/gate.sh`) | [speculation](#speculation) |
 | the 282 questions at no drafts against drafted | this engine at 7 drafts: 0 differ. llama.cpp b12024 at 4 drafts: 113 differ, at 7: 113 (4 against 7: 9) | 2026-11-06 | [speculation](#speculation) |
-| Windows build against Linux build | identical output | each release | [Windows and Linux](#windows-and-linux) |
+| Windows build against Linux build | identical output | each release (by hand: `scripts/exactness.py --compare`) | [Windows and Linux](#windows-and-linux) |
 | reused, parked and restored requests (exact reuse) | bit for bit equal to the same request sent fresh, q8_0, D and F, up to ~255k. Second turns on 20 conversations against a fresh server: 0 differ; llama.cpp b12024: 20 | 2026-11-06 | [exact reuse](#exact-reuse) |
 
 ## Against llama.cpp, 2026-11-06
@@ -149,6 +149,10 @@ Notes:
 - **The questions:** llama.cpp at 4 drafts got 229 (GSM8K 50 / 50, MMLU-Pro 45 / 70, ARC-C 47 / 50, MATH-500 28 / 40 and
   9 / 10 with thinking on, HumanEval 38 / 41, NIAH 9 / 9, LongBench v2 3 / 12), in 2,534 s. This engine's answers per
   set: [the full run](#full-run-2026-11-06).
+- **Sampling:** the sampled requests set temperature 1.0, top_p 0.95, top_k 20 and a seed, not `min_p`, so each server
+  used its own default: this engine 0, llama-server llama.cpp's 0.05 (b10246's `common.h`; the GGUF sets no
+  `general.sampling.min_p`). llama-server's `preserve_thinking: true` is what Qwen3.8's template does when the key is
+  absent, as on this server: both keep earlier turns' thinking.
 - **Conditions:** fans pinned at 100% (they read 93-98% at the start and end of each speed pass); GPU 44-69 C and SM
   clock 1,860-2,025 MHz at those points; memory clock 9,851 MHz. llama.cpp ran natively on Windows, this engine under
   WSL2. No pass was repeated.
@@ -386,7 +390,9 @@ not run again for v2026.11.05 (2026-11-06, the table above), so the last two col
   60.5 / 62.1). One request decodes at the same ~61 tok/s with `-np 4 -c 64000` (1.4 GB less VRAM in use) and with
   `-np 1 -c 100000`, and 4 at once give 131 tok/s at `-c 64000` against 126 / 132 at `-c 100000`. Its process's shared
   GPU memory stays at 280 to 640 MiB in every configuration (pinned host buffers), so the `-c 100000` run did not page
-  into system memory. Its SM clock read 780 to 1,245 MHz right after its runs (this server: 1,950 to 1,965 MHz).
+  into system memory. Its SM clock read 780 to 1,245 MHz right after its runs (this server: 1,950 to 1,965 MHz, but
+  its keep-warm load holds the clocks up for 120 s after a request, `MK_KEEP_WARM_S`, so the readings do not compare
+  like for like).
 - The gaps are larger than single-stream ([against llama.cpp](#against-llamacpp-2026-11-06)) because this client
   samples: llama.cpp's sampled decode with MTP drafts is its slower path.
 - v2026.10.30's own pass earlier in the 2026-11-02 session, before llama-server's: 371.0 / 331.0 / 183.0 / 179.0 tok/s.
@@ -630,7 +636,10 @@ which the device / host split rewrote, so a later run of the script is not compa
   rejected one is resampled from the rest of the distribution. Checked with chi-square and PIT tests; the counter-based
   random numbers, keyed by seed and position, were checked with a CPU replica of the loop (396k re-drafted positions)
   and a PIT test on 13,401 re-drafted rows of the engine at 7 drafts (KS p = 0.70; 2026-10-17). Two opt-in policy
-  settings that were biased were fixed or restricted then ([ENGINE.md](ENGINE.md#correctness)).
+  settings that were biased were fixed or restricted then ([ENGINE.md](ENGINE.md#correctness)). These are one-off runs,
+  not part of the gate: the replica is `tests/spec_rng_sim.py` (needs scipy; pytest does not collect it), and the PIT
+  test's script is not in the repository. The gate's sampled runs check that a seeded run is reproducible and that the
+  cache does not change it, not the distribution.
 - **The MTP layer only drafts.** A model file without one runs at depth 0, and its greedy output equals the drafted
   engine's bit for bit (UD-Q4_K_XL, 2026-10-17).
 
@@ -670,7 +679,8 @@ can change results.
 The prefill GEMMs add two 64-wide k stages (128 products) in fp16 before the fp32 accumulators, and store their inputs
 as fp16 clamped to +-65504. A debug build with `MK_PF_INFCHK=1` (73fd978; compiled out of the served build) counts,
 per layer and GEMM, the fp16 partial sums that are inf / NaN, the non-finite outputs, and the inputs the clamp
-saturates or turns from NaN into -65504.
+saturates or turns from NaN into -65504. Since 47f8b0d it also counts the DeltaNet scan's fp16 MMA operands (S, K S,
+U, U d) past 65504, which are not clamped; the runs below predate those counters.
 
 | prompt | result | date |
 |---|---|---|
@@ -713,7 +723,8 @@ file, 2026-10-16:
 
 Every release since has passed the same identity checks natively, and since 2026-10-19 also the side-request and
 parked-conversation scenarios under q8_0 and preset D and the title scenario under preset D (v2026.10.30: all identical
-to the Linux build).
+to the Linux build). These comparisons are made by hand, a run on each build (`scripts/exactness.py --compare`,
+[checking a build](BUILDING.md#checking-a-build)); `scripts/gate.sh` runs on Linux / WSL2 only.
 
 The image encoder's rows first differed between the two builds at fp32 rounding level: its attention took e^x from the
 C library, and glibc's and Microsoft's `expf` differ in the last bit on 193,924 of the 2^32 inputs. Since 2026-10-18
@@ -807,9 +818,10 @@ at 147054b, a 255-token reply after 65 s of idle started in ~65 ms instead of 39
 On the Ryzen 9 5900XT (32 threads):
 - **Images** (2026-10-16): a 196 / 300 / 1,024-token image encodes in 0.51 / 0.78 / 3.56 s back to back; llama.cpp's
   libmtmd on the same CPU took 0.80 / 1.29 / 6.07 s. A new image after the CPU has been idle takes ~1.2-1.5 s for 300
-  tokens while the cores ramp up. The encoder's rows are within 4e-6 to 4e-5 (relative) of an fp64 forward of the
-  vision tower (libmtmd: 4e-3 to 2.7e-2). On six image prompts, the mean KL against llama.cpp fed the same image rows is
-  0.0006-0.0059 (text only: 0.0012). Prompt tokens equal llama-server's on 7 of 7 image prompts.
+  tokens while the cores ramp up. The encoder's rows are within 4e-6 to 4e-5 (relative) of an fp64 forward of the vision
+  tower as llama.cpp's graph runs it, tanh GELU in the patch merger included (libmtmd: 4e-3 to 2.7e-2). On six image
+  prompts, the mean KL against llama.cpp fed the same image rows is 0.0006-0.0059 (text only: 0.0012). Prompt tokens
+  equal llama-server's on 7 of 7 image prompts.
 - **Video** (2026-10-18; frames sampled at 4 fps as llama.cpp does, two consecutive frames per grid of tokens): a 640 x
   360 clip costs ~450 prompt tokens per second of video (228 at 2 fps) and its frame pairs encode in 0.56 s each, about
   real time at 4 fps; 320 x 240: 167 tokens per second, 0.22 s per pair; 1280 x 720: 1,861 tokens per second, ~3.2 s

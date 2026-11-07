@@ -462,8 +462,8 @@ class Engine:
         return self._slot_tokens(n, out, cnt)
 
     def slots_step_mixed(self, pslot, budget, slots):
-        """slots_step with the next `budget` tokens of slot pslot's prompt in the same pass: (the slots' tokens, the
-        prompt tokens left)"""
+        """slots_step after the next `budget` tokens of slot pslot's prompt (a launch of their own, first): (the slots'
+        tokens, the prompt tokens left)"""
         n = len(slots)
         sa, out, cnt = (ctypes.c_int * n)(*slots), (ctypes.c_int * (n * self.SLOT_PER))(), (ctypes.c_int * n)()
         rem = ctypes.c_int()

@@ -91,7 +91,7 @@ what they do.
 | conversation cache | `--exact-reuse` (`MK_EXACT=1`), `--ck-every` [4096], `--ck-msgs` [1], `--ck-pin` [1], `--side-max` [8192] (`MK_SIDE_MAX`), `--park-mib` [8192] (`MK_PARK_MIB`), `--park-min` [1024], `--park-cks` [2]: [the conversation cache](#the-conversation-cache) |
 | templates and output | `--chat-template-file PATH`, `--chat-template TEMPLATE`, `--chat-template-kwargs JSON` (`MK_CHAT_TEMPLATE_KWARGS`), `--reasoning-format` [auto] (`MK_REASONING_FORMAT`), `--content-specials` [text] (`MK_CONTENT_SPECIALS`) |
 | images and video | `--mmproj FILE`, `--vision-lib`, `--vision-backend` [auto], `--vision-threads` [0: every logical CPU but two], `--image-min-tokens` / `--image-max-tokens` [0: the mmproj's], `--image-cache` [8], `--video-fps` [4], `--video-max-tokens` [0: the image limit], `--video-cache` [2], `--ffmpeg` (`MK_FFMPEG`) |
-| engine environment | `MK_CK_SLOTS` [8], `MK_KEEP_WARM_S` [120], `MK_STORE_CHUNK_MIB` [32], `MK_TIMEOUT_S` [600], `MK_REQUEST_TIMEOUT_S` [300], `MK_MAX_BODY_MB` [128], `MK_MAX_INFLIGHT_MB` [256], `MK_MAX_CONNECTIONS` [256], `MK_MAX_IMAGES` [32], `MK_IMAGE_MAX_PIXELS` [100000000], `MK_MAX_VIDEO_FRAMES` [256] |
+| engine environment | `MK_CK_SLOTS` [8; 1 with `--agents`], `MK_KEEP_WARM_S` [120], `MK_STORE_CHUNK_MIB` [32], `MK_TIMEOUT_S` [600], `MK_REQUEST_TIMEOUT_S` [300], `MK_MAX_BODY_MB` [128], `MK_MAX_INFLIGHT_MB` [256], `MK_MAX_CONNECTIONS` [256], `MK_MAX_IMAGES` [32], `MK_IMAGE_MAX_PIXELS` [100000000], `MK_MAX_VIDEO_FRAMES` [256] |
 
 ## The conversation cache
 
@@ -114,19 +114,22 @@ moves that state around (to host memory and back) without touching its bits.
 |---|---|---|
 | follow-up turn; edited message or system prompt | the same request on a fresh server | `scripts/exactness.py` (q8_0, D, F: at 32k, and at ~100k with the launchers' settings, F also at ~255k) and the state digest of `scripts/capi_checks.py` (every K / V row, window-ring row and DeltaNet / conv state, bitwise against a fresh prefill) |
 | new session resumed at a pinned checkpoint | the same request on a fresh server (greedy, and temperature 1.0 with fixed seeds) | `scripts/exactness.py`, q8_0, D and F: a new session after a live and after a parked conversation; by hand, after a 63k-token one |
-| parked conversation brought back | each conversation alone on a fresh server | `scripts/exactness.py`, q8_0, D and F: three conversations, greedy and sampled; the state digest; 8 interleaved requests on each release |
-| side request, and the conversation kept beside it | each of them alone on a fresh server | `scripts/exactness.py`, q8_0, D and F; the state digest; 5 side-request scenarios and 40 titles beside two conversations on each release |
-| a prefill stopped because the client left | a server that never saw that request | the requests after a stopped prefill, compared on each release |
+| parked conversation brought back | each conversation alone on a fresh server | `scripts/exactness.py`, q8_0, D and F: three conversations, greedy and sampled; the state digest; by hand on each release (not in the scripts), 8 interleaved requests |
+| side request, and the conversation kept beside it | each of them alone on a fresh server | `scripts/exactness.py`, q8_0, D and F; the state digest; by hand on each release (not in the scripts), 5 side-request scenarios and 40 titles beside two conversations |
+| a prefill stopped because the client left | a server that never saw that request | by hand on each release (not in the scripts): the requests after a stopped prefill |
 
 Sampled replies are identical too when the request sets a `seed`: the draft vocabulary the MTP head uses is rebuilt
-after a rewind exactly as a fresh prefill builds it. Without a `seed`, each request draws a random one. The gates run on
-Linux and on the native Windows build, and the two give the same replies.
+after a rewind exactly as a fresh prefill builds it. Without a `seed`, each request draws a random one.
+`scripts/exactness.py` runs on Linux and on the native Windows build (`scripts/gate.sh` on Linux / WSL2), and the two
+builds give the same replies (two runs compared with `--compare`: [BENCHMARKS.md](BENCHMARKS.md#windows-and-linux)).
 
 What is not exact, and against what:
 - **Exact reuse off** (`MK_EXACT_REUSE=0` in the launchers, no `--exact-reuse` on the server): a follow-up appends to
   the cached rows instead of re-prefilling the previous reply, and those rows came from the decode kernels, whose
   arithmetic order differs from the prefill's. Replies are then not bit-identical to the same request sent fresh.
-  Parking and side requests still restore the engine's state bit for bit.
+  Parking and side requests still restore the engine's state bit for bit. With a preset's window (`MK_KV_WIN`), a
+  rewind to a checkpoint also refills the window rows it cannot restore from the low-bit main cache, so they keep the
+  low-bit precision until they leave the window (with exact reuse, each checkpoint keeps the rings).
 - **Low-bit KV presets** (`MK_KV`) are near-lossless against the q8_0 cache, not identical to it; each preset is exact
   with itself. Their accuracy is in [BENCHMARKS.md](BENCHMARKS.md).
 - **llama.cpp** gives different bits (different arithmetic order); the distance is measured in
@@ -433,10 +436,12 @@ MK_AGENTS=4 scripts/serve.sh 8080 0                                        # the
   alone, and `--agents` turns on `MK_EXACT` (unless it is set), so a prompt never reuses the rows a slot decoded (their
   bits depend on how many drafts each cycle verified, which depends on the slots beside it): a follow-up that reaches
   into its last reply resumes at a checkpoint inside its last prompt, as with
-  [exact reuse](#exact-and-how-it-is-checked). A prompt that arrives while other slots decode is fed in chunks beside
-  their cycles; with `MK_EXACT` its rows are those of the same prompt fed in one go (the engine computes every chunk
-  but the prompt's last with the batched prefill kernels and ends it on their 32-token scan grid, so its rows do not
-  depend on where the prompt is cut).
+  [exact reuse](#exact-and-how-it-is-checked) (the scheduler takes the slot back there first: the engine's own
+  `slot_begin` would keep the reply's decoded rows, `qwen38_mk.h`). A prompt that arrives while other slots decode is
+  fed in chunks beside their cycles; with `MK_EXACT` its rows are those of the same prompt fed in one go (the engine
+  computes every chunk but the prompt's last with the batched prefill kernels and ends it on their 32-token scan grid,
+  so its rows do not depend on where the prompt is cut; a last chunk of 32 tokens or fewer joins the one before, so
+  the prompt keeps its checkpoint).
   Sampled replies (temperature above 0 with a `seed`) are reproducible alone, and beside other
   requests keep their distribution but not their tokens: speculative sampling's tokens depend on the draft schedule,
   and a slot's drafts depend on how many slots share the cycle (an engine limitation). Tested with Q4_K_M across
@@ -450,7 +455,7 @@ MK_AGENTS=4 scripts/serve.sh 8080 0                                        # the
 - **Scheduling:** requests wait for a free slot in arrival order. A request takes the free slot whose cached sequence
   shares the most with its prompt, less what that discards of the slot's last prompt: a conversation's next turn goes
   back to its own slot, and a new conversation takes an empty slot before it evicts another one for the few template
-  tokens they share. While slots decode, a waiting prompt is fed 256 rows per cycle in the same pass as their step
+  tokens they share. While slots decode, a waiting prompt is fed 256 rows per cycle, right before their step
   (`MK_PF_MIX`; 0: `MK_PF_CHUNK` [512] tokens between the cycles, 0 = the whole prompt), so they keep decoding, slower,
   while a long prompt is read; with no slot decoding, a prompt is fed whole (`MK_PF_SOLO`: tokens per call). A stop
   string, `max_tokens`, `t_max_predict_ms` or a client that disconnects takes a request out of the next cycle; a client
@@ -523,7 +528,9 @@ them; the request is translated to a chat request, as llama-server does.
   normalized as in llama-server, so its long system prompt is reused.
 - **Messages** of the roles `user`, `assistant` and `system`. Claude Code 2.1 sends its environment as a system message
   after the first user message; with a template that takes a system message only at the start (Qwen's), it is rendered
-  as a user message in its place, where llama-server answers the template's 400.
+  as a user message in its place, where llama-server answers the template's 400. A request that ends with an assistant
+  message (Anthropic's prefill) gets it rendered as a finished turn, and the reply is a new turn, not its continuation
+  (a one-time console warning).
 - **Content blocks:** `text`, `image` (base64), `thinking` (the turn's reasoning), `tool_use`, `tool_result` (tool
   messages, placed before the rest of their user message), `document` with a plain-text or content source (title,
   context and text, as text). Other blocks (PDF documents, server tool blocks, search results, ...) are skipped, as
@@ -534,7 +541,13 @@ them; the request is translated to a chat request, as llama-server does.
 - **Generation:** `max_tokens` [4096, as llama-server], `stop_sequences`, `temperature` / `top_p` / `top_k`. `thinking`
   `enabled` or `adaptive` turns thinking on; `disabled` or absent turns it off (Anthropic's default); `budget_tokens` is
   accepted but not enforced (the reasoning ends when the model ends it, within `max_tokens`; the console warns once);
-  `chat_template_kwargs` win.
+  `chat_template_kwargs` win. So `--chat-template-kwargs '{"enable_thinking": ...}'` and Qwen's soft switches do not
+  reach `/v1/messages` ([Thinking](#thinking)). Earlier turns' thinking blocks that a client sends back (Claude Code
+  does) stay in the prompt: Qwen3.8's template keeps them unless `preserve_thinking` is false
+  (`--chat-template-kwargs '{"preserve_thinking": false}'` drops those before the last user message).
+- **Fields the server does not act on:** `output_format`, `output_config`, `context_management` and `container` are
+  accepted with a one-time console warning (clients send some of them on every request): a structured-output request
+  gets plain text here, where `response_format` on the chat route is a 400.
 - **Replies:** content blocks `thinking` (with an empty signature), `text` and `tool_use` (parsed `input`);
   `stop_reason` `end_turn`, `max_tokens`, `stop_sequence` (with `stop_sequence`) or `tool_use`; `usage` with
   `input_tokens` (prefilled), `cache_read_input_tokens` (reused from the cache) and `output_tokens`.
@@ -615,8 +628,14 @@ Streams follow each API's event format (above). Tool calls are parsed as the mod
   non-streamed reply's `arguments` byte for byte (a parameter the model gives twice: both values are sent, and a JSON
   parser keeps the last, as the reply does).
 - A call the stream started that is then cut (`max_tokens`, a stop string) or left open keeps arguments that are not
-  valid JSON (clients that run a call once its arguments parse never run it), its markup is not repeated as `content`,
-  and `finish_reason` is "length" / "stop" as without streaming.
+  valid JSON, its markup is not repeated as `content`, and `finish_reason` is "length" / "stop" as without streaming.
+  A client should check `finish_reason` / `stop_reason` before it runs a call: an SDK that parses partial JSON
+  (Anthropic's stream accumulator) shows such a call as a `tool_use` block with the input parsed so far (`{}`), where
+  the non-streamed reply has the markup as text; the OpenAI SDK's `stream()` helper raises `LengthFinishReasonError` on
+  "length", as it does against OpenAI.
+- Text the model writes after a complete call (between calls or after the last) is not returned: a reply with calls
+  carries the calls (Qwen3.8's template tells the model not to write there). The console logs how many characters were
+  dropped.
 - `parallel_tool_calls: false`: no call is started after the first complete one. `tool_choice: "none"`: the tools stay
   in the prompt and calls come back as text, as in llama-server.
 
@@ -656,16 +675,21 @@ semantics: over the tokens generated in this response). `repetition_penalty` is 
 is greedy, and greedy replies are the same at any draft depth; sampled replies keep the distribution of sampling
 without drafts ([BENCHMARKS.md](BENCHMARKS.md) has the tests).
 
-Request fields the engine cannot honour are a 400 naming the field, never ignored silently: `n` / `n_cmpl` > 1,
-`logprobs` / `top_logprobs` / `n_probs`, `logit_bias`, `response_format` other than `{"type": "text"}`, `json_schema`,
-`grammar`, `tool_choice` other than "auto" / "none" (forcing a call needs constrained sampling), legacy `functions`,
-`ignore_eos`, audio output, `add_generation_prompt: false` / `continue_final_message`, llama-server's `id_slot` other
-than 0 / -1 (there is one slot) and `n_indent`, and llama.cpp's other samplers (`mirostat`, `typical_p` / `typ_p`,
-`tfs_z`, `xtc_probability`, `dry_multiplier`, `top_n_sigma`, `dynatemp_range`, `min_tokens`) unless they have their
-"off" value (llama.cpp's web UI sends them all). `samplers` (names, or a string of their letters) is accepted only when
-it asks for what the engine does: top_k, top_p, min_p and temperature in llama.cpp's default order (others in their
-default places, penalties first when one is set), e.g. the web UI's "edkypmxt". A body that is not a JSON object,
-non-numeric sampling values and a missing `messages` array are 400s too.
+Request fields the engine cannot honour are a 400 naming the field, never ignored silently (`/v1/messages` aside:
+[Anthropic Messages API](#anthropic-messages-api)): `n` / `n_cmpl` > 1, `logprobs` / `top_logprobs` / `n_probs`,
+`logit_bias`, `response_format` other than `{"type": "text"}`, `json_schema`, `grammar`, `tool_choice` other than "auto"
+/ "none" (forcing a call needs constrained sampling), legacy `functions`, `ignore_eos`, audio output,
+`add_generation_prompt: false` / `continue_final_message`, llama-server's `id_slot` other than 0 / -1 (there is one
+slot) and `n_indent`, and llama.cpp's other samplers (`mirostat`, `typical_p` / `typ_p`, `tfs_z`, `xtc_probability`,
+`dry_multiplier`, `top_n_sigma`, `dynatemp_range`, `min_tokens`) unless they have their "off" value (llama.cpp's web UI
+sends them all). `samplers` (names, or a string of their letters) is accepted only when it asks for what the engine
+does: top_k, top_p, min_p and temperature in llama.cpp's default order (others in their default places, penalties first
+when one is set), e.g. the web UI's "edkypmxt". A body that is not a JSON object, non-numeric sampling values and a
+missing `messages` array are 400s too, and so is a tool that is not an object whose function (wrapped or flat) is an
+object with a non-empty string `name` and `parameters` absent, null or an object (Anthropic: `input_schema`), checked
+before the prompt is rendered. A lone UTF-16 surrogate in a request body (a `\ud800`-`\udfff` escape without its pair,
+or its raw UTF-8 bytes: JS clients send them when they cut a string inside a pair) is replaced with U+FFFD, as a JS
+client's UTF-8 encoder would, and the request runs (a one-time console warning).
 
 Handled by the server: llama-server's `return_progress` (a stream gets `prompt_progress` chunks while the prompt is
 processed: `{"total", "cache", "processed", "time_ms"}` with a `{"role": "assistant", "content": null}` delta, at the
@@ -693,7 +717,8 @@ in its Qwen3.8-27B GGUFs) takes all four.
 With `--mmproj <mmproj GGUF>` (projector `qwen3vl_merger`, e.g. Unsloth's `mmproj-BF16.gguf`; the launchers pass it when
 they find it) the server accepts OpenAI `image_url` parts, Anthropic `image` blocks and Responses `input_image` parts,
 base64 only (`data:` URLs; Anthropic's base64 source; no remote URLs), and `/props` reports `modalities.vision`. The
-vision tower runs on the CPU, so images take no GPU memory.
+vision tower runs on the CPU, so the encoder takes no GPU memory (an image's tokens take KV cache positions, as text
+does).
 
 ```sh
 IMG=$(base64 -w0 photo.jpg)
@@ -702,10 +727,15 @@ curl -s http://127.0.0.1:8080/v1/chat/completions -H 'Content-Type: application/
     {"type": "image_url", "image_url": {"url": "data:image/jpeg;base64,'"$IMG"'"}}]}]}'
 ```
 
-- **The prompt is llama-server's:** a message with images is flattened llama-server's way (text parts joined by
-  newlines, none next to an image), each image becomes `<|vision_start|>`, its rows, `<|vision_end|>`, and decoding and
-  preprocessing (stb_image; smart resize to multiples of 32 px within 8 .. 4,096 tokens, the padded bilinear resize,
-  normalisation) are llama.cpp's bit for bit: the same token counts and pixels as `llama-server --mmproj`.
+- **The prompt is llama-server's:** a message whose content is a list of parts is flattened llama-server's way (text
+  parts joined by newlines, none next to an image or video), with or without images, so Claude Code's text blocks and
+  Codex's `input_text` parts are never run together. Each image becomes `<|vision_start|>`, its rows,
+  `<|vision_end|>`, and decoding and preprocessing (stb_image; smart resize to multiples of 32 px within 8 .. 4,096
+  tokens, the padded bilinear resize, normalisation) are llama.cpp's bit for bit: the same token counts and pixels as
+  `llama-server --mmproj`, except for two images of the same size with no text between them, which llama-server merges
+  into one two-frame temporal pair (half the tokens) and this server keeps as two stills, as Hugging Face transformers
+  does. EXIF orientation is not applied (as in llama.cpp; Hugging Face's loader applies it): rotate phone photos before
+  sending them.
   `--image-min-tokens` / `--image-max-tokens` set the limits (fewer tokens encode faster).
 - **Image formats:** PNG, JPEG, GIF (its first frame) and BMP. The other formats stb_image reads (TGA, PSD, HDR, PIC,
   PNM) are refused with a 400: their loaders have unfixed memory bugs a crafted file reaches (GHSL-2023-147, -149).
@@ -755,7 +785,8 @@ curl -s http://127.0.0.1:8080/v1/chat/completions -H 'Content-Type: application/
   ...). Consecutive frames merge in pairs into one grid of tokens (Qwen-VL's temporal patch of 2): frame 0 stands alone,
   and a run between two timestamps with an odd number of frames ends with a lone frame. Checked against llama.cpp's own
   path on 4 clips (H.264, VP9, 12 to 40 frames): the same texts and grids, and llama-server reported the same prompt
-  token counts.
+  token counts. This is llama.cpp's layout, not the model's own (Hugging Face's processor puts a `<t seconds>` text
+  before each frame pair, at 2 fps).
 - **Reuse:** each frame or pair is an image to the reuse logic (its key: the clip's hash, the frame rate, the token
   limit and its place), so a follow-up turn reuses the whole clip. Decoded and encoded clips are cached
   (`--video-cache` [2] clips between requests); a request holds all of its own. A client that disconnects stops the
@@ -867,14 +898,16 @@ the rest:
   M = C - 17) with the same two fields; on `/v1/responses`, OpenAI's `invalid_request_error` with code
   `context_length_exceeded` and the two fields. Streams get it as the status, before the stream starts.
 - **Disconnects:** before the prefill and before each decode cycle the server checks whether the client closed its
-  connection, and stops. During the prefill a watcher thread checks every 50 ms and asks the engine to stop at its next
-  prefill chunk (a host flag read between chunks of 2,048 tokens, no device sync); the chunk running and the one queued
-  behind it finish, so the engine is free 1-2 chunks later. Nothing of a stopped prefill counts: the engine drops the
-  checkpoints it saved and goes back to the last checkpoint from before it (or resets), with the draft vocabulary as it
-  was at that position, so the next request answers as on a server that never saw it. A client that leaves during
-  decoding leaves what was generated in the cache, as after a reply cut by `max_tokens`, and the next request reuses or
-  rewinds it as usual. A disconnect during a side request brings the kept conversation back like a finished one.
-  (On Windows an aborted client connection raises a different error than on Linux; both are counted as disconnects.)
+  connection, and stops. A stream whose client stops reading counts as a disconnect once a write has made no progress
+  for 60 s ([Limits](#limits)). During the prefill a watcher thread checks every 50 ms and asks the engine to stop at
+  its next prefill chunk (a host flag read between chunks of 2,048 tokens, no device sync); the chunk running and the
+  one queued behind it finish, so the engine is free 1-2 chunks later. Nothing of a stopped prefill counts: the engine
+  drops the checkpoints it saved and goes back to the last checkpoint from before it (or resets), with the draft
+  vocabulary as it was at that position, so the next request answers as on a server that never saw it. A client that
+  leaves during decoding leaves what was generated in the cache, as after a reply cut by `max_tokens`, and the next
+  request reuses or rewinds it as usual. A disconnect during a side request brings the kept conversation back like a
+  finished one. (On Windows an aborted client connection raises a different error than on Linux; both are counted as
+  disconnects.)
 - **Closing:** when the server ends a connection while the client may still be sending (a 400 / 411 / 413 for a body it
   does not read), it shuts down its write side, then reads and drops what the client still sends (at most 1 GiB and
   30 s, 5 s without data, as nginx's lingering close) before closing. Closing with unread data makes the kernel send a
@@ -946,6 +979,7 @@ Read from the environment at startup ([CONFIGURATION.md](CONFIGURATION.md)):
 | request body, `MK_MAX_BODY_MB` | 128 MB | 413, refused before the body is read (also on `Expect: 100-continue`) |
 | request bodies in memory at once, all connections, `MK_MAX_INFLIGHT_MB` | 256 MB (at least `MK_MAX_BODY_MB`) | 503 with `Retry-After`, and the connection closes |
 | a connection's read or write without progress, `MK_TIMEOUT_S` | 600 s (llama-server's `--timeout`; 0: none) | the connection closes: an idle keep-alive one, a stalled request, or a client that stopped reading a reply (a disconnect: the generation stops) |
+| a stream's write without progress (fixed) | 60 s, or `MK_TIMEOUT_S` when that is shorter and not 0 | the client counts as gone, as after a disconnect: the generation stops and the engine is free for the requests waiting for it |
 | a request's arrival, first byte to the last of its body, `MK_REQUEST_TIMEOUT_S` | 300 s (0: none) | the connection closes. A client sending a byte at a time never hits `MK_TIMEOUT_S`, but hits this; generating the reply does not count |
 | open connections, `MK_MAX_CONNECTIONS` | 256 | 503 with `Retry-After` as the connection is accepted, and it closes |
 | images per request, `MK_MAX_IMAGES` | 32 | 400 |

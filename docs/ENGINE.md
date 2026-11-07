@@ -5,7 +5,7 @@ How the engine works inside. Measurements are in [BENCHMARKS.md](BENCHMARKS.md),
 
 A specialised CUDA inference engine for Qwen3.8-27B `Q4_K_M` and unsloth's `UD-Q4_K_XL` (llama.cpp arch `qwen35`:
 48 Gated-DeltaNet + 16 gated-attention layers, one MTP block). It is tuned and tested on an RTX 3090 (sm_86, 82 SMs);
-`make` also builds for other 24 GB GPUs (sm_89, sm_120), which are untested.
+`make` builds for the installed GPU's architecture, so other 24 GB GPUs (sm_89, sm_120) build too; they are untested.
 
 ## Model files
 
@@ -52,8 +52,8 @@ barrier; the host only reads back the accepted tokens. Prompts go through batche
   (`MK_POLICY` key `tier`), and drafts 8-15 need every attention layer's K and V at q8_0. Its output against the default
   build's: [EXPERIMENTAL.md](EXPERIMENTAL.md#the-deep-pass).
 
-Speculation in numbers (CLI, UD-Q4_K_XL, q8_0 KV; tokens over total time). This is an older build, so the rates sit
-below [the current ones](BENCHMARKS.md#headline-numbers), but the shape is the same:
+Speculation in numbers (CLI on 7d67c5d, 2026-10-16, UD-Q4_K_XL, q8_0 KV; tokens over total time). This is an older
+build, so the rates sit below [the current ones](BENCHMARKS.md#headline-numbers), but the shape is the same:
 
 | prompts | drafts | tok/s | draft acceptance | tokens / cycle | ms / cycle |
 |---|---|---|---|---|---|
@@ -75,26 +75,37 @@ The output is not byte-identical to llama.cpp's: the arithmetic is ordered and r
 are close the other one can win, and a generation then continues differently. Measured against llama.cpp's own
 next-token distributions (same GGUF; reference: llama.cpp b10246 generating token by token with its q8_0 KV cache;
 13 sequences of this repo's code and docs, 13,299 positions scored after a 1024-token prompt each), UD-Q4_K_XL with
-the q8_0 KV cache agrees on 98.737% of the top tokens with a mean KL divergence of 0.00119 nats, closer than
-llama.cpp's own batched run (98.489% / 0.00166); most disagreements are near-ties. The
+the q8_0 KV cache agrees on 98.737% of the top tokens with a mean KL divergence of 0.00119 nats (without exact reuse,
+the CLI's default; with it 98.662% / 0.00118, 2026-10-14). llama.cpp's own batched run scores 98.489% / 0.00166
+against the same reference: a scale for how far two orderings of the same arithmetic drift apart, since the reference
+is not exact either (it rounds its KV cache to q8_0). Most disagreements are near-ties. The
 tables (the prefill-only and `mixed` paths, 32k to 160k context, Q4_K_M, image prompts) and the commands that
 reproduce them are in [BENCHMARKS.md](BENCHMARKS.md#against-llamacpp).
 
 `llama_ref` teacher-forces 2048-token chunks of the text (`--chunk`) and stores, per scored position, the 256 most
-likely tokens (`logit_stats.h`); `--kld` compares an engine with such a file (`--ref-out` also writes its own).
+likely tokens (`logit_stats.h`); `--kld` compares an engine with such a file (`--ref-out` also writes its own). The
+KL divergence takes the tokens outside those 256 as one bucket, so it is a lower bound of the full-vocabulary value
+(the report gives the bucket's mean probability).
 `--score-path` selects the megakernel's batched prefill kernels (`prefill`, the default), the decode kernel (`decode`),
 or the prefill kernels for the unscored prompt and the decode kernel for the scored positions (`mixed`, what a
 generation runs).
 
-The prefill and decode kernels do not compute identical arithmetic: the prefill DeltaNet scan (`pk_dn_scan`) feeds the
-recurrent state to fp16 tensor-core MMAs and uses `__expf`, decode's `dn_core` keeps it in fp32 and uses `expf`, and the
-two attention paths fold their partial sums in different orders. A position's state and KV rows therefore differ in
-the last bits depending on which path computed them, which is why exact reuse prefills a reply's rows again instead of
+The prefill and decode kernels do not compute identical arithmetic. Their matrix products take different operands:
+decode quantizes the activations to int8 (one scale per 16 or 32 values, as llama.cpp's q8_1) and sums integer
+products, scaled in fp32; prefill multiplies fp16 activations with fp16 weights (the quantized integers exactly, but
+each sub-block's scale and min, the block's `d` times an integer scale, rounded to fp16) and adds 128 products in fp16
+before fp32 ([Prefill](#prefill)). The prefill DeltaNet scan (`pk_dn_scan`) feeds the recurrent state to fp16
+tensor-core MMAs and uses `__expf`, decode's `dn_core` keeps it in fp32 and uses `expf`, and the two attention paths
+fold their partial sums in different orders. A position's state and KV rows therefore differ depending on which path
+computed them, by operand precision and not only by summation order, though little at the output: against llama.cpp
+the prefill-only path scores a KL of 0.00124 and the mixed one, what a generation runs, 0.00119
+([BENCHMARKS.md](BENCHMARKS.md#against-llamacpp)). This is why exact reuse prefills a reply's rows again instead of
 keeping the decoded ones.
 
 Speculative verification is exact: greedy output is the main model's greedy choice at every draft depth, and with
 sampling a draft is accepted with probability p(draft) and a rejected one is resampled from the rest of the
-distribution, so the sampled distribution is the same as without drafts (chi-square and PIT tests).
+distribution, so the sampled distribution is the same as without drafts (chi-square and PIT tests, below; one-off
+runs, not part of the gate: [BENCHMARKS.md](BENCHMARKS.md#speculation)).
 
 The random numbers come from a counter-based generator keyed by the seed and the position: a row's acceptance and
 resampling numbers by its position, a sampled draft's by the position it drafts. Each position is decided once, and a
@@ -164,8 +175,10 @@ error naming the field. A tensor's byte size always comes from its type and dime
 loader then reads every tensor by the shape it expects (`File::get(name, dims)`, `gguf::shape_is`): each matrix is
 exactly [K, N] (further dimensions 1), `token_embd` exactly [5120, 248320], the norms and vectors their exact sizes, so
 a file with the right names but a short or reshaped tensor is refused, naming it, instead of being read past its end.
-The values compiled into the kernel are checked too: a file whose `qwen35.rope.freq_base` or
-`qwen35.attention.layer_norm_rms_epsilon` differs is refused, naming the key (without the key: a warning).
+The values compiled into the kernel are checked too: a file whose `qwen35.rope.freq_base`,
+`qwen35.attention.layer_norm_rms_epsilon`, `qwen35.rope.dimension_count` (64), `qwen35.rope.dimension_sections`
+([11, 11, 10, 0]: the image M-RoPE split) or `qwen35.full_attention_interval` (4) differs is refused, naming the key
+(without the key: a warning).
 `tests/gguf_fuzz.cpp` (`make tests/gguf_fuzz`) feeds it malformed and randomly corrupted files (size and offset lies
 included) under AddressSanitizer / UBSan, reads every byte of every tensor of the files that parse and tries the
 shape-checked reads; UD-Q4_K_XL, UD-Q4_K_M and Q4_K_M pass every check. The vision projector (mmproj) is read through
@@ -239,7 +252,10 @@ engine calls behind each feature under
   its pinned ones) and `unpark` makes the live engine that sequence again, bit for bit. `side_begin` / `side_end`
   keep the live sequence aside while a short request runs from position 0: the recurrent state is copied out at
   once, KV and window-ring rows only just before a launch would overwrite them (1024 rows at a time), and
-  everything is copied back afterwards.
+  everything is copied back afterwards. After `unpark` or `side_end` the sequence continues with a prefill, which
+  refeeds from the committed position and rebuilds what a decode reads but neither copies (the DeltaNet replay rows
+  of the last cycle's accepted drafts, the drafts' probabilities, the penalty counts); a `step` before it throws where
+  it would read them (`qwen38_mk.h`). The server always prefills.
 - **Keep-warm:** after each request `capi.cpp` runs a one-block, 32-thread polling kernel for `MK_KEEP_WARM_S`
   seconds, each launch ending itself after 50 ms, so the GPU's clocks are still up when the next request comes.
 
@@ -261,7 +277,8 @@ D', E and F: [CONFIGURATION.md](CONFIGURATION.md#kv-cache-presets); their accura
 
 A cache that takes more device memory than was free before it was allocated gets a warning at load, and the load goes
 on: a driver with the CUDA sysmem fallback (Windows, WSL2) puts the rest in system memory, read over PCIe and much
-slower. A smaller `-c`, a preset (`MK_KV`) or `--kv q8` fits.
+slower. Without the fallback (Linux) the allocation fails and the load stops with an error that names the cache's
+size, the free memory and what fits. A smaller `-c`, a preset (`MK_KV`) or `--kv q8` fits.
 
 Each layer's cache and the RoPE table hold 2 x MAXT rows (16, ~0.6 MB in all) past the
 context: with more than 5 drafts, the last cycles before "context full" write the MTP block's draft rows up to 4
@@ -287,12 +304,16 @@ is unchanged) and the engine takes its output rows in the batched prefill. `make
   with AVX2 / FMA kernels (packed 6x16 FMA GEMM micro-kernel, attention on the same kernel with an online softmax,
   exact tanh-GELU, weights widened from the file's type, a pool of pinned workers that take tasks dynamically;
   x86-64 with AVX2 + FMA: Zen 2-5, Haswell+; results independent of the thread count and the same with g++ and MSVC:
-  no C library function whose last bit varies between libraries, the online softmax's e^x being glibc's `expf` algorithm
-  in the encoder's own code, checked equal to glibc's on all 2^32 inputs); `mtmd` = llama.cpp's libmtmd
-  encoder (any CPU); `auto` = `cpu` where it runs.
+  the exponentials are the encoder's own code, the online softmax's rescale factor glibc's `expf` algorithm (checked
+  equal to glibc's on all 2^32 inputs) and its probabilities and the GELU a Cephes-style exp; the C library's `pow`,
+  `cos` and `sin` build only the RoPE table, which no last-bit guarantee covers, but the two builds' rows agree on every
+  image checked: [BENCHMARKS.md](BENCHMARKS.md#windows-and-linux)); `mtmd` = llama.cpp's libmtmd encoder (any CPU);
+  `auto` = `cpu` where it runs.
 
-Accuracy against an fp64 forward of the checkpoint (`vision/vit_ref.py`, 5 images of 196 .. 1024 tokens):
-relative L2 error of the rows, lowest row cosine:
+Accuracy against an fp64 forward of llama.cpp's graph of the tower (`vision/vit_ref.py`, 5 images of 196 .. 1024
+tokens): relative L2 error of the rows, lowest row cosine. The reference, like llama.cpp and vit_cpu, runs the patch
+merger's GELU in the tanh form, where the checkpoint's merger uses the exact (erf) form, so this measures the distance
+to llama.cpp's graph; how far that form is from the checkpoint's is not measured here:
 
 | encoder | rel. error | min row cosine |
 |---|---|---|
@@ -354,9 +375,10 @@ frame or frame pair is an image (the same M-RoPE positions, so the engine needs 
   simple loop, which has no pipeline to fill; low-bit `MK_KV` slots run the pipelined kernel too (`attn_core_q8m`).
   At T > 5 (up to 48 query rows) one pass over K / V serves all rows (`attn_core_w48`).
 - **MTP drafting on device**, with the draft lm_head restricted to the 32,768 most frequent tokens
-  (`draft_vocab_32k.bin`, built by `tools/vocab_freq` from local code + docs; covers ~99.4% of tokens), plus the tokens
-  of the current sequence that are missing from it, added on the fly (identifiers of pasted code). Verification always
-  uses the full vocabulary, so this affects only the acceptance rate, never the output.
+  (`draft_vocab_32k.bin`, open-jet's file, built by `tools/vocab_freq` from local code + docs whose list is not
+  recorded; covers ~99.4% of tokens), plus the tokens of the current sequence that are missing from it, added on the fly
+  (identifiers of pasted code; up to 4,096 rows of them, after which new ones are not added). Verification always uses
+  the full vocabulary, so this affects only the acceptance rate, never the output.
 - **Sampling** keeps the 32 best logits of each verified row; a draft is accepted with probability p(draft) and a
   rejected one is resampled from the rest of the distribution, which keeps the sampled distribution exact.
 - **L2 warm-up**: before each barrier, blocks prefetch (evict-last) what their next latency-bound phase reads first
@@ -364,27 +386,30 @@ frame or frame pair is an image (the same M-RoPE positions, so the engine needs 
 
 ## Prefill
 
-A prompt (all but its last token) is processed in chunks of up to 2048 tokens (`MK_PF_CAP`) by ordinary kernel
-launches (`prefill.cuh`), which leave exactly the state the megakernel expects (trunk and MTP K/V caches, committed
-DeltaNet state, conv ring, hidden-state history); the last prompt token then goes through the megakernel, which
-produces the first token and the first MTP drafts. The same path appends to a running conversation
-(`MKEngine::prefill` on a non-empty sequence, e.g. the next user turn): it starts at the committed DeltaNet position
-and also re-feeds the last emitted token and any accepted drafts not yet folded into the recurrent state; the output is
-token-identical to processing the whole conversation as one fresh prompt. The host queues each chunk's work before it
-waits for the previous chunk, so the GPU does not idle between chunks (`MK_PF_SYNC=1`: the previous flow); on Windows
-those waits use a high-resolution waitable timer, since a plain sleep ends at the next timer tick (15.6 ms by default).
+A prompt (all but its last token) is processed in chunks of up to 2048 tokens (`MK_PF_CAP`) by ordinary kernel launches
+(`prefill.cuh`), which leave exactly the state the megakernel expects (trunk and MTP K/V caches, committed DeltaNet
+state, conv ring, hidden-state history); the last prompt token then goes through the megakernel, which produces the
+first token and the first MTP drafts. The same path appends to a running conversation (`MKEngine::prefill` on a
+non-empty sequence, e.g. the next user turn): it starts at the committed DeltaNet position and also re-feeds the last
+emitted token and any accepted drafts not yet folded into the recurrent state. The earlier positions keep the rows the
+decode kernels wrote, so the result can differ in the last bits from processing the whole conversation as one fresh
+prompt ([Correctness](#correctness)), and at a near-tie in a token; exact reuse instead goes back to a checkpoint inside
+the last prompt and prefills the reply again ([Server](#server)). The host queues each chunk's work before it waits for
+the previous chunk, so the GPU does not idle between chunks (`MK_PF_SYNC=1`: the previous flow); on Windows those waits
+use a high-resolution waitable timer, since a plain sleep ends at the next timer tick (15.6 ms by default).
 
-- **GEMMs on fp16 tensor cores straight from the k-quants** (`prefill_gemm.cuh`): 128 x 128 tiles (narrower token
-  tiles for short prompts), software-pipelined through cp.async stages; weights stay in their GGUF blocks and are
-  dequantised to fp16 in registers (exact small integers via the `0x6400` trick, then one fp16 scale and min per
-  sub-block); activations are fp16 with the elements of each 16-group permuted so that a 4-byte weight word is directly
-  an MMA A fragment. Products accumulate in fp16 over k = 128, then in fp32. Measured inside a 101.6k prefill: 89-105
-  TFLOPS, 108-117 in isolation. FFN gate and up share one GEMM whose epilogue writes `silu(gate) * up` as
-  the down projection's fp16 input. Stage hand-off per type: in the Q5_K and IQ4_NL GEMMs each warp copies
-  the weight bytes of its own rows, so the block barrier covers only the activation tiles (one per two stages); Q6_K,
-  Q3_K, IQ3_S and seven of the mixed-type gate / up pairs use per-stage mbarriers (copies two stages ahead) instead of
-  the block barrier (both need four cp.async stages); the other kernels keep one block barrier per stage. Same products
-  in the same order: bit-identical outputs.
+- **GEMMs on fp16 tensor cores straight from the k-quants** (`prefill_gemm.cuh`): 128 x 128 tiles (narrower token tiles
+  for short prompts), software-pipelined through cp.async stages; weights stay in their GGUF blocks and are dequantised
+  to fp16 in registers (exact small integers via the `0x6400` trick, then one fp16 scale and min per sub-block: the
+  block's `d` times the sub-block's integer scale, rounded to fp16, exact only where a block has just its `d`, Q8_0 and
+  IQ4_NL); activations are fp16 with the elements of each 16-group permuted so that a 4-byte weight word is directly an
+  MMA A fragment. Products accumulate in fp16 over k = 128, then in fp32. Measured inside a 101.6k prefill: 89-105
+  TFLOPS, 108-117 in isolation. FFN gate and up share one GEMM whose epilogue writes `silu(gate) * up` as the down
+  projection's fp16 input. Stage hand-off per type: in the Q5_K and IQ4_NL GEMMs each warp copies the weight bytes of
+  its own rows, so the block barrier covers only the activation tiles (one per two stages); Q6_K, Q3_K, IQ3_S and seven
+  of the mixed-type gate / up pairs use per-stage mbarriers (copies two stages ahead) instead of the block barrier (both
+  need four cp.async stages); the other kernels keep one block barrier per stage. Same products in the same order:
+  bit-identical outputs.
 - **DeltaNet in chunked (WY) form on tensor cores**: per 32-token chunk, `A = tril(beta K K^T)` with the gate decays,
   `T = (I + A)^-1` (one warp, forward substitution), then `U = T beta V - T beta gamma (K S)`, `O = gamma Q S + P U` and
   `S <- gamma_last S + K^T (decay U)`. Value columns are independent, so a block owns (head, 64 columns) and each warp
@@ -404,8 +429,9 @@ those waits use a high-resolution waitable timer, since a plain sleep ends at th
 ## Limitations
 
 - Specialised to this model's shapes (27B) and the weight types under [The GGUF](#the-gguf) (tested: unsloth's Q4_K_M
-  and UD-Q4_K_XL); the loader rejects any other model or type. Tuned and tested on sm_86 (RTX 3090); built for sm_86,
-  sm_89 and sm_120 GPUs with 24 GB or more. `make` builds for the installed GPU (`make ARCH=sm_89` to override).
+  and UD-Q4_K_XL); the loader rejects any other model or type. Tuned and tested on sm_86 (RTX 3090); sm_89 and sm_120
+  GPUs with 24 GB or more build but are untested. `make` builds for one architecture, the installed GPU's (`make
+  ARCH=sm_89` to override).
 - More than 4 drafts needs the q8 KV cache (`--kv q8`; low-bit `MK_KV` presets are fine).
 - The decode kernel runs one block per SM and needs at least 80 SMs for more than 4 drafts (50 for up to 4): the
   engine refuses a smaller GPU at load, naming the requirement (an RTX 3090 has 82). On a GPU with more than 128 SMs it
