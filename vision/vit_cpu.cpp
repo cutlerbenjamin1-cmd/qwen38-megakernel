@@ -795,7 +795,7 @@ void Vit::encode_(const float * img, const float * img1, int tw, int th, float *
     const int pw = tw / ps, ph = th / ps, M = pw * ph, Mp = (M + 11) / 12 * 12, nk16 = (M + 15) / 16;
     float * x = I.x.get((size_t) Mp * D);           // residual stream
     float * qkv = I.qkv.get((size_t) Mp * 3 * D);
-    const size_t apn = (size_t) Mp * std::max(std::max(FF, 4 * D), 768);
+    const size_t apn = (size_t) Mp * std::max({FF, 4 * D, img1 ? 2 * 768 : 768}); // (768: a patch's im2col row, per frame)
     float * ap0 = I.ap0.get(apn); // packed GEMM inputs: im2col, LayerNorm outputs, attention output, merger input
     float * ap1 = I.ap1.get(apn); // packed GEMM inputs written by a GELU epilogue (MLP hidden, merger hidden)
     const int Mk = nk16 * 16;
