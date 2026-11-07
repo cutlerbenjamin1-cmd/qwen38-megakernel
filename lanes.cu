@@ -14,6 +14,8 @@ void MKEngine::Impl::lane_swap(Lane & l) {
     std::swap(demoted, l.demoted);
     std::swap(dv_n, l.dv_n);
     std::swap(all_acc, l.all_acc);
+    std::swap(stale_replay, l.stale_replay);
+    std::swap(stale_pcnt, l.stale_pcnt);
     std::swap(smp_temp, l.smp_temp);
     std::swap(smp_top_p, l.smp_top_p);
     std::swap(smp_min_p, l.smp_min_p);

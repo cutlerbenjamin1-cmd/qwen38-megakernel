@@ -699,6 +699,7 @@ void MKEngine::Impl::reset() {
     memset(&hctl, 0, sizeof(hctl));
     CK(cudaMemcpy(hb.ctl, &hctl, sizeof(Ctl), cudaMemcpyHostToDevice));
     CK(cudaMemset(hb.cnt, 0, 16));
+    stale_replay = stale_pcnt = false;
 }
 
 
@@ -1095,6 +1096,7 @@ int MKEngine::prefill(const std::vector<int> & tokens, const std::vector<int> & 
     p_->nd_avail = p_->ndraft > 0 ? std::min(p_->ndraft, c.nd_prod) : 0;
     p_->all_acc = true;
     p_->last_acc = p_->nd_avail;
+    p_->stale_replay = p_->stale_pcnt = false;
     CK(cudaGetLastError());
 #if MK_SPEC_LOG
     p_->slog_drafts();
@@ -1292,6 +1294,11 @@ int MKEngine::step(std::vector<int> & out) {
 int MKEngine::Impl::step_live(std::vector<int> & out) {
     Ctl & c = hctl;
     if (c.n + MAXD + 2 >= ctx) throw std::runtime_error("context full"); // (rows past ctx: KV_PAD)
+    // (after book_set: kvgb is read for accepted drafts not folded in, dq to verify sampled drafts, pcnt for penalties)
+    if ((stale_replay && (c.dn_c < c.n || (nd_avail > 0 && c.dsmp && smp_temp > 0.f))) ||
+        (stale_pcnt && (pen_pres != 0.f || pen_freq != 0.f)))
+        throw std::runtime_error("step: the sequence was brought back (unpark / side_end) without the state this "
+                                 "step reads (DeltaNet replay rows, the drafts' q', penalty counts): prefill first");
     // verify the previous launch's drafts, minus any that would put this launch's rows across an
     // attention-partition boundary (once per ATT_BUCKET positions; keeps greedy output depth-independent)
     // T >= 6 runs as one MAXT-row pass (padding rows): the whole n + 1 .. n + MAXT must lie in one partition, else at most 5
@@ -1332,6 +1339,7 @@ int MKEngine::Impl::step_live(std::vector<int> & out) {
 #endif
     launch(MODE_DECODE, T, 0);
     ctl_fetch(c);
+    stale_replay = false; // (this launch wrote the replay rows and q' the next one reads)
     nd_avail = nd > 0 ? std::min(nd, c.nd_prod) : 0;
 #if MK_SPEC_LOG
     slog_cycle(n0, T, drafts, c);

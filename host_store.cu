@@ -157,6 +157,7 @@ void MKEngine::Impl::book_set(const Book & k) {
     last_acc = k.last_acc;
     demoted = k.demoted;
     all_acc = k.all_acc;
+    stale_replay = stale_pcnt = true; // (kvgb, dq, pcnt are not part of a Book: the next prefill rebuilds them)
 }
 
 void MKEngine::Impl::dv_set(const std::vector<int> & ids) {

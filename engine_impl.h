@@ -31,6 +31,11 @@ struct MKEngine::Impl {
     int nd_avail;        // drafts produced by the previous launch (verified by the next decode cycle)
     bool all_acc = true; // the last decode cycle accepted all of its drafts
     int last_acc = 0;    // drafts the last decode cycle accepted
+    // After book_set (unpark, side_unpark, side_end) the device holds another sequence's decode-only state. stale_replay:
+    // the DeltaNet replay rows of the drafts accepted since dn_c (kvgb) and the drafts' q' (dq), until the sequence's next
+    // launch rewrites them; stale_pcnt: the response's penalty counts (pcnt), until its next prefill restarts them.
+    // step_live refuses a step that would read them; a prefill rebuilds all of it (it refeeds from dn_c).
+    bool stale_replay = false, stale_pcnt = false;
     // draft-depth policy (MKEngine::set_policy). Default: up to n_draft drafts, the on-device gate on the running
     // product c_k of the MTP's own top-1 probabilities stops drafting after draft k >= 2 when c_k < 0.4 and drops
     // the 4th draft (the T = 5 verify row) when c_4 < 0.4; sampled drafts when sampling. Tuned on replayed logs
@@ -807,8 +812,8 @@ struct MKEngine::Impl {
     bool kv_put(Blob & bl, int a, int b);
     // ring slots a .. b - 1 (of kvrc) of every MK_KV_WIN ring side, each kv head
     bool ring_put(Blob & bl, int a, int b);
-    // the recurrent state: DeltaNet states, conv rings, h ring (what a checkpoint holds; kvgb is not needed: the next
-    // prefill refeeds every position from dn_c on)
+    // the recurrent state: DeltaNet states, conv rings, h ring (what a checkpoint holds; not kvgb, dq or pcnt: the next
+    // prefill refeeds every position from dn_c on, stale_replay)
     bool live_put(Blob & bl);
     size_t kv_token_bytes() const;
     size_t ring_bytes() const;
@@ -891,6 +896,7 @@ struct MKEngine::Impl {
         Ctl hctl{};
         int kv_top = 0, nd_avail = 0, ndraft = 0, last_acc = 0, demoted = 0, dv_n = 0;
         bool all_acc = true;
+        bool stale_replay = false, stale_pcnt = false; // (never set for a lane: swapped so the own sequence keeps its)
         float smp_temp = 0.f, smp_top_p = 1.f, smp_min_p = 0.f;
         int smp_top_k = TOPK_MAX;
         unsigned long long smp_seed = 0;
