@@ -438,57 +438,86 @@ class ConnectionTests(_GateCase):
 
 
 class SurrogateTests(_GateCase):
-    """a lone UTF-16 surrogate in a request body (json.loads takes a \\udcff escape; JS clients send one when they cut a
-    string inside a pair) is text with no UTF-8 form, on which the tokenizer and a stream's events fail: a 400 in the
-    route's error shape before anything runs. An error once a stream's headers are out closes the connection instead of
-    writing a second response into the stream's body."""
+    """a lone UTF-16 surrogate in a request body (json.loads takes a \\udcff escape and its raw UTF-8 bytes; JS clients
+    send one when they cut a string inside a pair) is text with no UTF-8 form, on which the tokenizer and a stream's
+    events fail: each one becomes U+FFFD right after the body is parsed (keys too; pairs untouched), with a one-time
+    warning, and the request runs. An error once a stream's headers are out closes the connection instead of writing a
+    second response into the stream's body."""
 
     def post(self, http_, path, body):
         data = body if isinstance(body, bytes) else json.dumps(body).encode()  # (json.dumps escapes it: \udcff)
         st, _, out = self.ask(http_, "POST", path, [("Content-Type", "application/json")], data)
         return st, out
 
-    def test_a_lone_surrogate_is_a_400_on_every_route(self) -> None:
+    def test_fix_surrogates(self) -> None:
+        fix = self.mk.fix_surrogates
+        raw = (b'{"a": "x\\udcffy", "\\ud800k": [1, {"b": ["\\ud83d\\ude00", "\\ud83d\\ud83d\\ude00", "\\\\udcff"]}], '
+               b'"c": "\xed\xb3\xbf", "d": 1.5}')
+        body, n = fix(raw, json.loads(raw))
+        self.assertEqual(n, 4)
+        self.assertEqual(body, {"a": "x\ufffdy", "\ufffdk": [1, {"b": ["\U0001F600", "\ufffd\U0001F600", "\\udcff"]}],
+                                "c": "\ufffd", "d": 1.5})
+        self.assertEqual(list(body), ["a", "\ufffdk", "c", "d"])  # (the keys' order kept)
+        for raw in (b'{"a": "\\ud83d\\ude00 \\\\udcff"}', b'{"a": "plain"}'):  # (nothing to replace: the body as parsed)
+            parsed = json.loads(raw)
+            self.assertIs(fix(raw, parsed)[0], parsed)
+            self.assertEqual(fix(raw, parsed)[1], 0)
+        lone = json.loads(b'{"a": "\\udcff"}')
+        with mock.patch("json.dumps", side_effect=RecursionError):  # (nested too deep to encode again: as it is)
+            self.assertEqual(fix(b'{"a": "\\udcff"}', lone), (lone, 0))
+
+    def test_lone_surrogates_become_u_fffd_on_every_route(self) -> None:
         srv, http_ = self.serve(base._ScriptEngine(["ok"]))
         lone, hi = [{"role": "user", "content": "\udcff"}], [{"role": "user", "content": "hi"}]
-        cases = [("/v1/chat/completions", {"messages": lone}, "openai"),
-                 ("/v1/chat/completions", {"messages": lone, "stream": True}, "openai"),
-                 ("/v1/chat/completions", {"messages": hi, "user": "\ud800x"}, "openai"),
-                 ("/v1/chat/completions", {"messages": hi, "metadata": {"\udcff": 1}}, "openai"),  # (a key)
-                 ("/v1/chat/completions", b'{"messages": [{"role": "user", "content": "\xed\xb3\xbf"}]}', "openai"),
-                 ("/tokenize", {"content": "a\udcff"}, "openai"),
-                 ("/v1/messages", {"model": "m", "max_tokens": 4, "messages": lone}, "anthropic"),
-                 ("/v1/messages", {"model": "\udcff", "max_tokens": 4, "stream": True, "messages": hi}, "anthropic"),
-                 ("/v1/messages/count_tokens", {"messages": lone}, "anthropic"),
-                 ("/v1/responses", {"input": "hi", "stream": True, "max_output_tokens": 3, "metadata": {"k": "\udcff"}},
-                  "responses"),
-                 ("/v1/responses/input_tokens", {"input": "\udfff"}, "responses")]
-        for path, body, shape in cases:
-            st, out = self.post(http_, path, body)
-            self.assertEqual(st, 400, (path, out[:200]))
-            o = json.loads(out)
-            err = o["error"]
-            self.assertIn("lone UTF-16 surrogate", err["message"], path)
-            if shape == "anthropic":
-                self.assertEqual((o["type"], err["type"]), ("error", "invalid_request_error"))
-            elif shape == "responses":
-                self.assertEqual((err["type"], err["code"], err["param"]), ("invalid_request_error", None, None))
-            else:
-                self.assertEqual((err["type"], err["code"]), ("invalid_request_error", 400))
-        self.assertEqual(srv.eng.calls, [])
-        # a pair (an emoji, as json.dumps escapes it) is one character; an escaped backslash before "udcff" is text
-        for content in ("\U0001F600", "\\udcff"):
-            st, out = self.post(http_, "/v1/chat/completions", {"messages": [{"role": "user", "content": content}],
-                                                                "max_tokens": 2})
-            self.assertEqual(st, 200, (content, out[:200]))
+        cases = [("/v1/chat/completions", {"messages": lone, "max_tokens": 2}),
+                 ("/v1/chat/completions", {"messages": lone, "max_tokens": 2, "stream": True}),
+                 ("/v1/chat/completions", {"messages": hi, "max_tokens": 2, "user": "\ud800x"}),
+                 ("/v1/chat/completions", {"messages": hi, "max_tokens": 2, "metadata": {"\udcff": 1}}),  # (a key)
+                 ("/tokenize", {"content": "a\udcff"}),
+                 ("/v1/messages", {"model": "m", "max_tokens": 2, "messages": lone}),
+                 ("/v1/messages/count_tokens", {"messages": lone}),
+                 ("/v1/responses", {"input": "\udcff", "max_output_tokens": 2}),
+                 ("/v1/responses/input_tokens", {"input": "\udfff"})]
+        err = io.StringIO()
+        with mock.patch.object(sys, "stderr", err), mock.patch.object(self.mk, "CON", self.mk.Console()):
+            for path, body in cases:
+                st, out = self.post(http_, path, body)
+                self.assertEqual(st, 200, (path, out[:200]))
+        self.assertEqual(err.getvalue().count("lone UTF-16 surrogate"), 1)  # (a one-time warning, with its count)
+        self.assertIn("/v1/chat/completions: 1 lone UTF-16 surrogate in a request body", err.getvalue())
+        self.assertIn(0xFFFD, srv.eng.seq)  # (the prompt the engine got)
+        # the rendered prompt: U+FFFD where each lone surrogate was, pairs and an escaped backslash as sent
+        for raw, want in ((b'{"messages": [{"role": "user", "content": "a\\udcffb"}]}', "a\ufffdb"),
+                          (b'{"messages": [{"role": "user", "content": "a\xed\xb3\xbfb"}]}', "a\ufffdb"),
+                          (b'{"messages": [{"role": "user", "content": "x\\ud83d\\ud83d\\ude00y"}]}', "x\ufffd\U0001F600y"),
+                          (b'{"messages": [{"role": "user", "content": "e\\ud83d\\ude00 \\\\udcff"}]}', "e\U0001F600 \\udcff")):
+            st, out = self.post(http_, "/apply-template", raw)
+            self.assertEqual(st, 200, out[:200])
+            self.assertIn(f"<|im_start|>user\n{want}<|im_end|>", json.loads(out)["prompt"])
+
+    def test_streams_that_echo_a_lone_surrogate_are_valid(self) -> None:
+        # (a Responses stream echoes metadata in response.created: it failed to encode, and so did response.failed)
+        _, http_ = self.serve(base._ScriptEngine(["ok"]))
+        body = {"input": "hi", "stream": True, "max_output_tokens": 3, "metadata": {"k": "\udcff"}}
+        raw = http_.raw(base._request(body).replace(b"/v1/chat/completions", b"/v1/responses"), until=b"0\r\n\r\n")
+        head, events = base._sse(raw)  # (the chunked framing decoded strictly)
+        self.assertTrue(head.startswith(b"HTTP/1.1 200"), raw[:300])
+        events = [json.loads(e) for e in events]
+        self.assertEqual((events[0]["type"], events[0]["response"]["metadata"]), ("response.created", {"k": "\ufffd"}))
+        self.assertEqual((events[-1]["type"], events[-1]["response"]["metadata"]), ("response.completed", {"k": "\ufffd"}))
+        body = {"model": "\udcff", "max_tokens": 3, "stream": True, "messages": [{"role": "user", "content": "hi"}]}
+        raw = http_.raw(base._request(body).replace(b"/v1/chat/completions", b"/v1/messages"), until=b"0\r\n\r\n")
+        _, events = base._sse(raw)
+        self.assertEqual(json.loads(events[0])["message"]["model"], "\ufffd")
+        self.assertEqual(json.loads(events[-1])["type"], "message_stop")
 
     def test_an_error_after_a_stream_started_closes_the_connection(self) -> None:
-        # (the check above off: a Responses stream echoes metadata in response.created, which then failed to encode, and
+        # (the replacement off: a Responses stream echoes metadata in response.created, which then failed to encode, and
         # so did response.failed: the 500 went out inside the open chunked body)
         srv, http_ = self.serve(base._ScriptEngine(["ok"]))
         body = {"input": "hi", "stream": True, "max_output_tokens": 3, "metadata": {"k": "\udcff"}}
         req = base._request(body).replace(b"/v1/chat/completions", b"/v1/responses")
-        with mock.patch.object(self.mk, "lone_surrogate", lambda raw, body: False):
+        with mock.patch.object(self.mk, "fix_surrogates", lambda raw, body: (body, 0)):
             raw = http_.raw(req, timeout=10)
         self.assertTrue(raw.startswith(b"HTTP/1.1 200"), raw[:300])
         self.assertEqual(raw.count(b"HTTP/1.1 "), 1, raw[:600])
