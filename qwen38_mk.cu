@@ -5915,9 +5915,12 @@ __device__ __noinline__ void mtp_kv_pass(int row0, unsigned & epoch) {
 #pragma unroll
         for (int k = 0; k < 8; k++) v[k] *= rs * W.kn[lane * 8 + k];
         rope8(v, lane, pp);
-        kv_store(0, slot, g, pp, v);
+        const size_t row = ((size_t) slot * NKV + g) * cB.ctx + pp; // (fp16 cache: attn_core_t's row)
+        if (cB.kvq8) kv_store(0, slot, g, pp, v);
+        else kv_store_f16(static_cast<__half *>(cB.kc) + row * HD, v);
         load8(cB.vbuf + t * KVD + g * 256 + lane * 8, v);
-        kv_store(1, slot, g, pp, v);
+        if (cB.kvq8) kv_store(1, slot, g, pp, v);
+        else kv_store_f16(static_cast<__half *>(cB.vc) + row * HD, v);
     }
 }
 #endif
