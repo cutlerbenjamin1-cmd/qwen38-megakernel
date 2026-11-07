@@ -812,9 +812,10 @@ at 147054b, a 255-token reply after 65 s of idle started in ~65 ms instead of 39
 On the Ryzen 9 5900XT (32 threads):
 - **Images** (2026-10-16): a 196 / 300 / 1,024-token image encodes in 0.51 / 0.78 / 3.56 s back to back; llama.cpp's
   libmtmd on the same CPU took 0.80 / 1.29 / 6.07 s. A new image after the CPU has been idle takes ~1.2-1.5 s for 300
-  tokens while the cores ramp up. The encoder's rows are within 4e-6 to 4e-5 (relative) of an fp64 forward of the
-  vision tower (libmtmd: 4e-3 to 2.7e-2). On six image prompts, the mean KL against llama.cpp fed the same image rows is
-  0.0006-0.0059 (text only: 0.0012). Prompt tokens equal llama-server's on 7 of 7 image prompts.
+  tokens while the cores ramp up. The encoder's rows are within 4e-6 to 4e-5 (relative) of an fp64 forward of the vision
+  tower as llama.cpp's graph runs it, tanh GELU in the patch merger included (libmtmd: 4e-3 to 2.7e-2). On six image
+  prompts, the mean KL against llama.cpp fed the same image rows is 0.0006-0.0059 (text only: 0.0012). Prompt tokens
+  equal llama-server's on 7 of 7 image prompts.
 - **Video** (2026-10-18; frames sampled at 4 fps as llama.cpp does, two consecutive frames per grid of tokens): a 640 x
   360 clip costs ~450 prompt tokens per second of video (228 at 2 fps) and its frame pairs encode in 0.56 s each, about
   real time at 4 fps; 320 x 240: 167 tokens per second, 0.22 s per pair; 1280 x 720: 1,861 tokens per second, ~3.2 s

@@ -127,7 +127,9 @@ What is not exact, and against what:
 - **Exact reuse off** (`MK_EXACT_REUSE=0` in the launchers, no `--exact-reuse` on the server): a follow-up appends to
   the cached rows instead of re-prefilling the previous reply, and those rows came from the decode kernels, whose
   arithmetic order differs from the prefill's. Replies are then not bit-identical to the same request sent fresh.
-  Parking and side requests still restore the engine's state bit for bit.
+  Parking and side requests still restore the engine's state bit for bit. With a preset's window (`MK_KV_WIN`), a
+  rewind to a checkpoint also refills the window rows it cannot restore from the low-bit main cache, so they keep the
+  low-bit precision until they leave the window (with exact reuse, each checkpoint keeps the rings).
 - **Low-bit KV presets** (`MK_KV`) are near-lossless against the q8_0 cache, not identical to it; each preset is exact
   with itself. Their accuracy is in [BENCHMARKS.md](BENCHMARKS.md).
 - **llama.cpp** gives different bits (different arithmetic order); the distance is measured in
