@@ -1030,6 +1030,24 @@ class EngineTokenizeTests(unittest.TestCase):
         self.assertEqual(len(e.tokenize("a" * (8 << 20))), 2 << 20)  # (8 MiB of text: not a 32 MiB first buffer)
         self.assertEqual(caps, [4016, 1 << 20, 2 << 20])
 
+    def test_a_piece_longer_than_the_first_buffer_is_read_again(self) -> None:
+        # (it was cached empty: a token whose text passes 256 bytes would never be emitted)
+        e, _ = self.engine()
+        e._pieces = {}
+        texts, caps = {1: b"x" * 1000, 2: b"ab"}, []
+
+        def piece(h, t, buf, cap):
+            caps.append(cap)
+            if t not in texts:
+                return -2 ** 31  # (an id outside the vocabulary)
+            if cap < len(texts[t]):
+                return -len(texts[t])
+            buf[:len(texts[t])] = texts[t]
+            return len(texts[t])
+        e.L.mk_piece = piece
+        self.assertEqual([e.piece(1), e.piece(1), e.piece(2), e.piece(3)], [texts[1], texts[1], b"ab", b""])
+        self.assertEqual(caps, [256, 1000, 256, 256])  # (cached after the first time)
+
 
 # === video frame size before the pixel limit ===
 class _Reads(io.BytesIO):

@@ -207,6 +207,9 @@ class Engine:
         if p is None:
             buf = ctypes.create_string_buffer(256)
             n = self.L.mk_piece(self.h, tok, buf, 256)
+            if -2 ** 31 < n < 0:  # (-size: a longer piece, read again into its size, as tokenize does; INT_MIN: an error)
+                buf = ctypes.create_string_buffer(-n)
+                n = self.L.mk_piece(self.h, tok, buf, -n)
             p = self._pieces[tok] = buf.raw[:max(n, 0)]
         return p
 
