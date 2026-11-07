@@ -833,7 +833,8 @@ void MKEngine::set_n_draft(int n) {
     }
     if (n < 0 || n > p_->n_draft_cap)
         throw std::runtime_error("set_n_draft: 0 .. " + std::to_string(p_->n_draft_cap) + " (the engine's construction depth)");
-    p_->n_draft_max = p_->ndraft = p_->nd_avail = n;
+    p_->n_draft_max = p_->ndraft = n;
+    p_->nd_avail = std::min(p_->nd_avail, n); // (the drafts the last launch made, not more: tok[] / dq past them are stale)
     n_draft_ = n;
 }
 
