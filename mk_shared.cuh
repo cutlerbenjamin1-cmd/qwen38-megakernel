@@ -509,7 +509,7 @@ struct PBufs {
     float * rs;   // [cap] RMS scale of the last normed input
     __half * xh;  // [cap][FF] fp16 GEMM input, elements of each 16-group in pf::hperm order
     __half * xh2; // [cap][FF] fp16 silu(gate) * up (ffn_down input), same order
-    float * y0;   // [cap][FF]  qkv | q+gate | ffn gate | logits
+    float * y0;   // [cap][FF]  qkv | q+gate | ffn gate | logits ([cap][QG] when every gate / up pair is fused)
     float * y1;   // [cap][FF]  z | k,v | ffn up
     float * y2;   // [cap][VD]  delta-net / attention output
     __half * dq;  // [cap][QKV] conv'd + normalised q | k | v (fp16)
@@ -531,7 +531,8 @@ constexpr int A2_PART = 6 * A2_Q * HD + 2 * 6 * A2_Q; // floats per partial: o [
 namespace pf {
 #if MK_PF_INFCHK
 enum { CHK_Q, CHK_K, CHK_V, CHK_O, CHK_QKV, CHK_GATE, CHK_SOUT, CHK_GU, CHK_UP, CHK_DOWN, CHK_EH, CHK_HEAD, // GEMMs
-       CHK_IN_NORM, CHK_IN_DN, CHK_IN_MTP, CHK_IN_ATTN, CHK_IN_GLU, CHK_SITES };                            // inputs
+       CHK_IN_NORM, CHK_IN_DN, CHK_IN_MTP, CHK_IN_ATTN, CHK_IN_GLU,                                         // inputs
+       CHK_DN_S, CHK_DN_KS, CHK_DN_U, CHK_DN_UD, CHK_SITES }; // the DeltaNet scan's fp16 MMA operands (S, K S, U, U d)
 constexpr int CHK_LAYERS = 66; // 64 trunk layers, 64 = the MTP block, 65 = the output head
 #endif
 constexpr int BM = 128, BN = 128, BK = 64;

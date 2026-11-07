@@ -666,6 +666,7 @@ __global__ void __launch_bounds__(256, 1)
     static_assert(STG == WPART + hm_x<NB>(), "stage layout");
     static_assert(NB * (BM + 4) * 4 <= (MIX ? hm_smem2<TYPE, TU, NB>() : hm_smem<TYPE, NB>()), "epilogue tile");
     constexpr int HWT = NB / (8 / HNWM), HNI = HWT / 8, XIT = NB * 8 / 256, FG = frag_g(TYPE, TU, GLU, MIX);
+    static_assert(FG >= 0 && FG < 4, "MK_PF_FRAG_G: an MMA group of the stage, 0 .. 3 (else the next stage's fragments are never made)");
     extern __shared__ __align__(16) uint8_t sm[];
     const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5, g = lane >> 2, t4 = lane & 3;
     const int wm = warp % HNWM, wn = warp / HNWM; // warp tile: rows HWR wm .., tokens HWT wn ..
