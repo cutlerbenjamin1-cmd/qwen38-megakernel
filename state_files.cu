@@ -50,6 +50,9 @@ std::string MKEngine::Impl::hex64(unsigned long long v) {
 void MKEngine::Impl::st_name(const std::vector<int> & head, std::string & path, std::string & key) {
     std::ostringstream k;
     k << "mkstate 1 bin " << hex64(self_hash());
+    cudaDeviceProp prop; // (a build for several architectures runs on other GPUs too)
+    CK(cudaGetDeviceProperties(&prop, cuda_dev));
+    k << " gpu " << prop.name << " sm_" << prop.major << prop.minor << " " << prop.multiProcessorCount;
     struct stat st{};
     char rp[PATH_MAX];
     if (!realpath(model_path.c_str(), rp)) snprintf(rp, sizeof rp, "%s", model_path.c_str());
