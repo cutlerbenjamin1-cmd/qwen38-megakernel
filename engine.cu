@@ -1298,9 +1298,18 @@ int MKEngine::Impl::step_live(std::vector<int> & out) {
 #if MK_MAXD > 8
     if (T > MAXT && pol.tier > 0.f) { // the deep pass only when drafts MAXT.. are worth it (Policy::tier)
         float cp = 1.f, e = 0.f;
-        for (int k = 0; k < T - 1; k++) {
-            cp *= c.dconf[k];
-            if (k >= MAXT - 1) e += cp;
+        if (c.dsmp && smp_temp > 0.f) {
+            // sampled drafts, sampled verify: dconf[k >= MAXT] (pass k is fed draft k) and the draft count follow
+            // draft MAXT's own value, and verifying drafts MAXT.. by them biases the output (as chain=2's drop gates:
+            // launch). Only what was fixed before draft MAXT was drawn: dconf[0 .. MAXT - 1], the last repeated up to
+            // the drafting launch's depth
+            for (int k = 0; k < MAXT; k++) cp *= c.dconf[k];
+            for (int k = MAXT - 1; k < ndraft; k++, cp *= c.dconf[MAXT - 1]) e += cp;
+        } else {
+            for (int k = 0; k < T - 1; k++) {
+                cp *= c.dconf[k];
+                if (k >= MAXT - 1) e += cp;
+            }
         }
         if (e < pol.tier) T = MAXT;
     }
