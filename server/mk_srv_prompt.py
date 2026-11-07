@@ -51,8 +51,10 @@ class PromptMixin:
                                               "turns its thinking off / on (chat_template_kwargs and reasoning_effort "
                                               "none win)")
                 kw["enable_thinking"] = soft
-        media = [] if self.vision else None
-        ctx = dict(messages=normalize_messages(body.get("messages") or [], media), add_generation_prompt=True)
+        media, notes = [] if self.vision else None, []
+        ctx = dict(messages=normalize_messages(body.get("messages") or [], media, notes), add_generation_prompt=True)
+        for key, msg in notes:
+            self.warn_once(key, msg)
         if body.get("tools"):
             ctx["tools"] = body["tools"]
         for k, v in (getattr(self.args, "chat_template_kwargs", None) or {}).items():  # (--chat-template-kwargs: under them)

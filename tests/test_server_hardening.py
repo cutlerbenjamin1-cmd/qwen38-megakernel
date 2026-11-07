@@ -774,10 +774,19 @@ class BadFieldTests(_GateCase):
             self.refused(f'{{{self.MSG}, "chat_template_kwargs": {v}}}', b"chat_template_kwargs")
 
     def test_tool_call_arguments_json_cannot_parse(self) -> None:
-        for args in ("not json", "1" * 5000, "[" * 100000 + "]" * 100000):
+        def norm(args):
             call = {"id": "c", "type": "function", "function": {"name": "f", "arguments": args}}
-            out = self.mk.normalize_messages([{"role": "assistant", "content": "", "tool_calls": [call]}])
-            self.assertEqual(out[0]["tool_calls"][0]["function"]["arguments"], {}, args[:20])
+            notes = []
+            out = self.mk.normalize_messages([{"role": "assistant", "content": "", "tool_calls": [call]}], None, notes)
+            return out[0]["tool_calls"][0]["function"]["arguments"], [k for k, _ in notes]
+        for args in ("not json", "1" * 5000, "[" * 100000 + "]" * 100000, "[1]", "5", 5, ["x"]):
+            self.assertEqual(norm(args), ({}, ["tool-call-arguments"]), str(args)[:20])  # (a one-time warning)
+        for args, want in (("", {}), ("  ", {}), (None, {}), ('{"a": 1}', {"a": 1}), ({"a": 1}, {"a": 1})):
+            self.assertEqual(norm(args), (want, []), args)  # (no arguments, or an object: nothing to say)
+        call = {"id": "c", "type": "function", "function": {"name": "f", "arguments": "{oops"}}
+        self.srv.render({"messages": [{"role": "user", "content": "go"}, {"role": "assistant", "content": "",
+                                                                         "tool_calls": [call]}]})
+        self.assertIn("tool-call-arguments", self.srv.warned)
 
 
 class ConsoleInputTests(_GateCase):

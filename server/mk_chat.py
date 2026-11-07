@@ -11,11 +11,13 @@ from mk_media import VIDEO_PARTS, image_bytes, video_bytes
 MEDIA_MARKER = "<__media__>"  # llama-server's (mtmd_default_marker)
 
 
-def normalize_messages(messages, media=None):
+def normalize_messages(messages, media=None, notes=None):
     """media (a list: the server has a vision encoder): image_url parts and video parts (input_video / video_url)
     become MEDIA_MARKER and their file bytes are appended to media in order (videos as VideoBytes). A part list is
     flattened to one string as llama-server does (text parts joined by newlines, no newline next to an image or
-    video), so the prompt around each is llama-server's; text parts are not run together."""
+    video), so the prompt around each is llama-server's; text parts are not run together. notes: gets (key, message)
+    for what was converted (the console's one-time warnings)"""
+    notes = [] if notes is None else notes
     out = []
     for m in messages:
         if not isinstance(m, dict):
@@ -61,12 +63,15 @@ def normalize_messages(messages, media=None):
                     raise BadRequest("messages: each of tool_calls must be an object, with an object as its function")
                 tc = dict(tc)
                 fn = dict(tc.get("function") or {})
-                args = fn.get("arguments")
+                args = given = fn.get("arguments")
                 if isinstance(args, str):
                     try:
                         args = json.loads(args) if args.strip() else {}
                     except (ValueError, RecursionError):  # (not JSON, an integer past the digit limit, nested too deep)
-                        args = {}
+                        args = None
+                if not isinstance(args, dict) and given is not None:
+                    notes.append(("tool-call-arguments", f"a tool call's arguments in a request's history are not a JSON "
+                                  f"object ({str(given)[:40]!r}...): the call is rendered without arguments"))
                 fn["arguments"] = args if isinstance(args, dict) else {}
                 tc["function"] = fn
                 calls.append(tc)
