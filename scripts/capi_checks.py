@@ -25,8 +25,8 @@ import sys
 import tempfile
 
 LIB, MODEL, DV = sys.argv[1:4]
-CASES = ("penalty", "slots_dup", "slots_oom", "slots_fit", "ctor_oom", "slots_devoom", "ctor_devoom", "policy", "model_values",
-         "digest_q8", "digest_D", "digest_F")
+CASES = ("penalty", "slots_dup", "slot_ck", "slots_oom", "slots_fit", "ctor_oom", "slots_devoom", "ctor_devoom", "policy",
+         "model_values", "digest_q8", "digest_D", "digest_F")
 PROMPT = b"<|im_start|>user\nWrite a short poem about a lighthouse.<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"
 vp, ip = ctypes.c_void_p, ctypes.POINTER(ctypes.c_int)
 SKIP_RC = 77  # a case's exit code for SKIP (automake's convention)
@@ -284,6 +284,43 @@ def case_slots_dup(L):
     ok &= check(len(slot_seq(L, h, 0)) == fed, "the refused mixed step fed no prompt chunk")
     ok &= check(L.mk_slot_prefill(h, 0, 1 << 30) == 0, "slot 0: its prompt still prefills", L)
     ok &= check(slot_steps(L, h, [0, 1, 2, 3], 2), "slots 0-3: 2 more batched steps", L)
+    L.mk_free(h)
+    return ok
+
+
+def slot_ids(L, h, slot, k):
+    """the next k tokens slot emits alone (None: a step failed or its context is full)"""
+    sa, out, cnt, got = (ctypes.c_int * 1)(slot), (ctypes.c_int * 16)(), (ctypes.c_int * 1)(), []
+    while len(got) < k:
+        if L.mk_slots_step(h, sa, 1, out, 16, cnt) != 0 or cnt[0] <= 0:
+            return None
+        got += out[:cnt[0]]
+    return got[:k]
+
+
+def case_slot_ck(L):
+    # MK_EXACT: a slot prompt fed in chunks whose last chunk would be <= 32 tokens past a grid point (it used to save no
+    # checkpoint, so a repeat of the prompt reused nothing): the chunk before it takes them, which changes no row
+    os.environ["MK_EXACT"] = "1"
+    h = new(L)
+    if not check(bool(h), "engine", L):
+        return False
+    text = reuse_text(20)
+    buf = (ctypes.c_int * 4096)()
+    n = L.mk_tokenize(h, text, len(text), buf, 4096)
+    ok = check(n >= 100, f"the prompt has {n} >= 100 tokens", L)
+    toks = (ctypes.c_int * 100)(*buf[:100])
+    ok &= check(L.mk_slots_open2(h, 2, 4096, 0) > 0, "slots_open 2 x 4096", L)
+    ok &= check(L.mk_slot_begin2(h, 0, toks, 100, 0.0, 1.0, 20, 0.0, 1, 0, 0) == 0, "slot 0: begin 100 tokens", L)
+    left = [L.mk_slot_prefill(h, 0, 32) for _ in range(3)]
+    ok &= check(left == [68, 36, 0], f"slot 0 fed with budget 32: {left} left after each call (68, 36, 0: the third "
+                                     "chunk takes the 4 tokens past 96)", L)
+    ok &= check(begin(L, h, 1, toks, 100), "slot 1: begin + the whole prompt in one call", L)
+    got = [slot_ids(L, h, s, 16) for s in (0, 1)]
+    ok &= check(got[0] is not None and got[0] == got[1], f"chunked and whole: the same 16 greedy ids ({got[0]} / {got[1]})", L)
+    for s in (0, 1):
+        r = L.mk_slot_begin2(h, s, toks, 100, 0.0, 1.0, 20, 0.0, 1, 0, 0)
+        ok &= check(r == 96, f"slot {s}: the prompt again resumes at its checkpoint at 96 (reused {r})", L)
     L.mk_free(h)
     return ok
 

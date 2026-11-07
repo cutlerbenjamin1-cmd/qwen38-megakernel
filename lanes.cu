@@ -624,6 +624,10 @@ int MKEngine::slot_prefill(int slot, int budget) {
         if (I.exact && n < L.pend.size()) {
             const size_t s = I.seq.size(), e = (s + n) / 32 * 32;
             n = e > s ? e - s : std::min(L.pend.size(), (s / 32 + 1) * 32 - s);
+            // a last chunk of <= 32 tokens from a grid point would save no checkpoint (ck_positions snaps it down onto the
+            // chunk's start): this one takes the rest, up to 32 over the budget (fed from the grid, batched: the same rows)
+            const char * mode = getenv("MK_PREFILL");
+            if (L.pend.size() - n <= 32 && I.hctl.dn_c % 32 == 0 && !(mode && std::string(mode) == "mk")) n = L.pend.size();
         }
         const std::vector<int> chunk(L.pend.begin(), L.pend.begin() + n);
         L.pend.erase(L.pend.begin(), L.pend.begin() + n);
