@@ -180,6 +180,12 @@ class MKEngine {
     // (> 0); the engine itself is unchanged. 0: the sequence is empty; -1: no room in the store. unpark(id): the engine
     // becomes that conversation bit for bit (its current sequence is discarded) and the entry is freed; false: no such
     // entry. park_need: the bytes park() would take now.
+    // "Bit for bit" (unpark, side_unpark, side_end) is the sequence state: KV rows, window rings, recurrent state,
+    // checkpoints, bookkeeping. A decode step also reads device state that is not kept: the DeltaNet replay rows of the
+    // drafts the last cycle accepted, the drafts' q' (sampled drafts) and the response's penalty counts. Continue with a
+    // prefill (the next turn's tokens: it refeeds from the committed position and rebuilds them, as the server does).
+    // step() before that throws where it would read them: the first step unless no accepted draft is pending (as right
+    // after a prefill) and the drafts are greedy-verified or point-mass, and any step with penalties.
     int park(int max_checkpoints);
     bool unpark(int id);
     bool park_drop(int id);

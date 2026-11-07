@@ -683,7 +683,9 @@ void mk_kv_sizes(void * hp, long long * per_token, long long * rings, long long 
 int mk_side_begin(void * hp) {
     return guarded(hp, [](MKEngine * e) { return e->side_begin() ? 0 : 1; });
 }
-// 1 the kept sequence is back, 0 it was dropped (the store ran full; the engine is reset), -1 error (dropped too)
+// 1 the kept sequence is back, 0 it was dropped (the store ran full; the engine is reset), -1 error (dropped too).
+// Then (as after mk_side_unpark, mk_unpark) continue with a prefill: mk_step right away only where qwen38_mk.h
+// says (park)
 int mk_side_end(void * hp) {
     return guarded(hp, [](MKEngine * e) { return e->side_end(); });
 }
@@ -718,7 +720,8 @@ int mk_park(void * hp, int max_checkpoints) {
         return id < 0 ? -3 : id;
     });
 }
-// the engine becomes parked conversation id (entry freed): 0, or -1 (no such entry / error)
+// the engine becomes parked conversation id (entry freed): 0, or -1 (no such entry / error); then a prefill
+// (mk_side_end)
 int mk_unpark(void * hp, int id) {
     return guarded(hp, [&](MKEngine * e) {
         if (e->unpark(id)) return 0;

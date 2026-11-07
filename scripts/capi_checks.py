@@ -26,7 +26,7 @@ import tempfile
 
 LIB, MODEL, DV = sys.argv[1:4]
 CASES = ("penalty", "slots_dup", "slots_oom", "slots_fit", "ctor_oom", "slots_devoom", "ctor_devoom", "policy", "model_values",
-         "digest_q8", "digest_D", "digest_F", "digest_W1024")
+         "digest_q8", "digest_D", "digest_F", "digest_W1024", "park_step")
 PROMPT = b"<|im_start|>user\nWrite a short poem about a lighthouse.<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"
 vp, ip = ctypes.c_void_p, ctypes.POINTER(ctypes.c_int)
 SKIP_RC = 77  # a case's exit code for SKIP (automake's convention)
@@ -561,6 +561,80 @@ def case_policy(L):
     ok &= check(bool(h), "without it the engine starts", L)
     if h:
         L.mk_free(h)
+    return ok
+
+
+def case_park_step(L):
+    # mk_step right after mk_unpark / mk_side_end with drafts the last cycle accepted not yet in the DeltaNet state: the
+    # device holds another sequence's replay rows, so the step is refused until a prefill, which then continues the
+    # conversation exactly as without the park (qwen38_mk.h, park)
+    L.mk_store_budget.argtypes = [vp, ctypes.c_longlong]
+    L.mk_set_sampling.argtypes = [vp, ctypes.c_float, ctypes.c_float, ctypes.c_int, ctypes.c_float, ctypes.c_ulonglong]
+    L.mk_park.argtypes = [vp, ctypes.c_int]
+    L.mk_unpark.argtypes = [vp, ctypes.c_int]
+    L.mk_reset.argtypes = [vp]
+    L.mk_side_begin.argtypes = [vp]
+    L.mk_side_end.argtypes = [vp]
+    L.mk_committed.argtypes = [vp]
+    L.mk_sequence.argtypes = [vp, ip, ctypes.c_int]
+    h = new(L)
+    if not check(bool(h), "engine", L):
+        return False
+    L.mk_store_budget(h, 2 * GiB)
+    L.mk_set_sampling(h, 0.0, 1.0, 0, 0.0, 0)
+    out = (ctypes.c_int * 16)()
+
+    def tok(text):
+        buf = (ctypes.c_int * (len(text) + 16))()
+        n = L.mk_tokenize(h, text, len(text), buf, len(text) + 16)
+        assert n > 0, err(L)
+        return list(buf[:n])
+
+    def feed(toks):
+        first = L.mk_prefill(h, (ctypes.c_int * len(toks))(*toks), len(toks))
+        assert first >= 0, err(L)
+        return first
+
+    def decode(first, n=48):
+        got = [first]
+        while len(got) < n:
+            k = L.mk_step(h, out, 16)
+            assert k > 0, err(L)
+            got += list(out[:k])
+        return got[:n]
+
+    def pending():  # accepted drafts the next step replays from the DeltaNet ring (position - committed)
+        return L.mk_sequence(h, None, 0) - 1 - L.mk_committed(h)
+
+    toks, _ = ids(L, h)
+    feed(list(toks))
+    for _ in range(32):
+        assert L.mk_step(h, out, 16) > 0, err(L)
+        if pending() > 0:
+            break
+    if pending() <= 0:
+        skip("no decode cycle accepted a draft in 32 steps (no MTP layer?): nothing pending to test")
+        L.mk_free(h)
+        return None
+    note(f"{pending()} accepted drafts pending")
+    pids = [L.mk_park(h, 0), L.mk_park(h, 0)]
+    if not check(min(pids) > 0, f"parked twice (ids {pids})", L):
+        L.mk_free(h)
+        return False
+    more = tok(b"<|im_end|>\n<|im_start|>user\nNow one about the sea.<|im_end|>\n<|im_start|>assistant\n")
+    other = tok(b"<|im_start|>user\nName three rivers.<|im_end|>\n<|im_start|>assistant\n")
+    want = decode(feed(more))  # (the conversation continued without a park)
+    L.mk_reset(h)
+    decode(feed(other), 16)
+    ok = check(L.mk_unpark(h, pids[0]) == 0, "another conversation ran, the parked one is back", L)
+    ok &= check(L.mk_step(h, out, 16) < 0 and "prefill first" in err(L), "mk_step right away: refused", L)
+    ok &= check(decode(feed(more)) == want, "after a prefill: the 48 greedy ids of the conversation never parked")
+    ok &= check(L.mk_unpark(h, pids[1]) == 0 and L.mk_side_begin(h) == 0, "back again, kept aside for a side request", L)
+    decode(feed(other), 16)
+    ok &= check(L.mk_side_end(h) == 1, "the side request ran, the conversation is back", L)
+    ok &= check(L.mk_step(h, out, 16) < 0 and "prefill first" in err(L), "mk_step right away: refused", L)
+    ok &= check(decode(feed(more)) == want, "after a prefill: the 48 greedy ids of the conversation never parked")
+    L.mk_free(h)
     return ok
 
 
