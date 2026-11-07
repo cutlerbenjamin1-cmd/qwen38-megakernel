@@ -660,7 +660,7 @@ measurements in [against llama.cpp](#against-llamacpp) run without exact reuse (
 server runs with it.
 
 The same 20 conversations on llama.cpp b12024 at 4 drafts (`cache_prompt` on, its default): 20 of 20 differ from a fresh
-server, the first difference a median of 369 characters in (4 to 1,671). They repeat: on another fresh server, five of them gave
+server, the first difference a median of about 355 characters in (4 to 1,671). They repeat: on another fresh server, five of them gave
 the same warm answers and the same cold ones. With `cache_prompt` false on a running server, 3 of 20 still differ from a
 fresh server. Its [server docs](https://github.com/ggml-org/llama.cpp/blob/master/tools/server/README.md) say the option
 can change results.
