@@ -255,8 +255,12 @@ class MegakernelVisionTests(unittest.TestCase):
         text, media = self._media([img, img])
         self.assertEqual((text, len(media)), (m + m, 2))
         self.assertEqual(media[0][:4], bytes([0x89, 0x50, 0x4E, 0x47]))  # (the decoded data: URL)
-        # a message without images keeps its parts
-        self.assertIsInstance(self._media([{"type": "text", "text": "a"}])[0], list)
+        # a message without images is flattened the same way: its text parts joined by newlines, not run together
+        self.assertEqual(self._media([{"type": "text", "text": "a"}])[0], "a")
+        self.assertEqual(self._media([{"type": "text", "text": "a"}, {"type": "text", "text": "b"}])[0], "a\nb")
+        self.assertEqual(self._media([{"type": "text", "text": ""}, {"text": "b"}, {"type": "text", "text": "c"}])[0],
+                         "b\nc")
+        self.assertEqual(self._media([])[0], "")
 
     def test_remote_image_urls_are_rejected(self) -> None:
         with self.assertRaises(self.mk.BadRequest):

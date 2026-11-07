@@ -13,9 +13,9 @@ MEDIA_MARKER = "<__media__>"  # llama-server's (mtmd_default_marker)
 
 def normalize_messages(messages, media=None):
     """media (a list: the server has a vision encoder): image_url parts and video parts (input_video / video_url)
-    become MEDIA_MARKER and their file bytes are appended to media in order (videos as VideoBytes). A message with
-    media is flattened to one string as llama-server does (text parts joined by newlines, no newline next to an image
-    or video), so the prompt around each is llama-server's."""
+    become MEDIA_MARKER and their file bytes are appended to media in order (videos as VideoBytes). A part list is
+    flattened to one string as llama-server does (text parts joined by newlines, no newline next to an image or
+    video), so the prompt around each is llama-server's; text parts are not run together."""
     out = []
     for m in messages:
         if not isinstance(m, dict):
@@ -30,27 +30,26 @@ def normalize_messages(messages, media=None):
                     raise BadRequest(f"unsupported content part type {part.get('type')!r} (text, image_url, "
                                      f"input_video and video_url only)")
             kinds = {p.get("type") for p in content}
-            if kinds & {"image_url", *VIDEO_PARTS}:
-                if media is None:
-                    what = "image" if "image_url" in kinds else "video"
-                    raise BadRequest(f"{what} input is not supported: start the server with --mmproj")
-                text, after_media = "", False
-                for part in content:
-                    if part.get("type") in VIDEO_PARTS:
-                        media.append(video_bytes(part))
-                        text += MEDIA_MARKER
-                        after_media = True
-                    elif part.get("type") == "image_url":
-                        iu = part.get("image_url")
-                        media.append(image_bytes(iu.get("url") if isinstance(iu, dict) else iu))
-                        text += MEDIA_MARKER
-                        after_media = True
-                    else:
-                        if not after_media and text:
-                            text += "\n"
-                        text += str(part.get("text") or "")
-                        after_media = False
-                m["content"] = text
+            if kinds & {"image_url", *VIDEO_PARTS} and media is None:
+                what = "image" if "image_url" in kinds else "video"
+                raise BadRequest(f"{what} input is not supported: start the server with --mmproj")
+            text, after_media = "", False
+            for part in content:
+                if part.get("type") in VIDEO_PARTS:
+                    media.append(video_bytes(part))
+                    text += MEDIA_MARKER
+                    after_media = True
+                elif part.get("type") == "image_url":
+                    iu = part.get("image_url")
+                    media.append(image_bytes(iu.get("url") if isinstance(iu, dict) else iu))
+                    text += MEDIA_MARKER
+                    after_media = True
+                else:
+                    if not after_media and text:
+                        text += "\n"
+                    text += str(part.get("text") or "")
+                    after_media = False
+            m["content"] = text
         if content is None:
             m["content"] = ""
         if m.get("role") == "assistant" and m.get("tool_calls"):

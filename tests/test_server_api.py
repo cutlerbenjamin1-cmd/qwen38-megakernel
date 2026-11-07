@@ -9,8 +9,8 @@ import socket
 import time
 import unittest
 
-from test_mk_server import (CALL, TEMPLATE, TOOLS, _FakeVisionLib, _HttpCase, _ScriptEngine, _load_mk_server, _request, _sse,
-                            _sse_events)
+from test_mk_server import (CALL, ROOT, TEMPLATE, TOOLS, _FakeVisionLib, _HttpCase, _ScriptEngine, _load_mk_server, _request,
+                            _sse, _sse_events)
 
 WRITE = [{"type": "function", "function": {"name": "write", "parameters": {"type": "object", "properties": {
     "path": {"type": "string"}, "content": {"type": "string"}, "mode": {"type": "integer"}, "opts": {"type": "object"}}}}}]
@@ -299,6 +299,45 @@ def _post(port, path, body, headers=None):
     data = r.read()
     c.close()
     return r.status, data
+
+
+class TextPartTests(_HttpCase):
+    """text-only part lists (Claude Code's text blocks, Codex's input_text parts, AI-SDK clients' text parts) are joined
+    by newlines, as with images and as llama-server joins them: never run together; the count routes count that prompt"""
+
+    PARTS = [{"type": "text", "text": "<system-reminder>r</system-reminder>"}, {"type": "text", "text": "do it"}]
+    JOINED = "<|im_start|>user\n<system-reminder>r</system-reminder>\ndo it<|im_end|>"
+
+    def fed(self, srv):
+        """the prompt the engine got (the test tokenizer: one token per character)"""
+        n = next(c[2] for c in srv.eng.calls if c[0] == "prefill")
+        return "".join(map(chr, srv.eng.seq[:n]))
+
+    def check(self, path, count_path, body):
+        srv, http_ = self.serve(_ScriptEngine(["ok"]))
+        status, data = _post(http_.port, path, body)
+        self.assertEqual(status, 200, data)
+        prompt = self.fed(srv)
+        self.assertIn(self.JOINED, prompt)
+        status, data = _post(http_.port, count_path, body)
+        self.assertEqual((status, json.loads(data)["input_tokens"]), (200, len(prompt)))
+        return srv, http_, prompt
+
+    def test_openai_text_parts(self) -> None:
+        body = {"messages": [{"role": "user", "content": self.PARTS}], "max_tokens": 2}
+        srv, http_, prompt = self.check("/v1/chat/completions", "/v1/chat/completions/input_tokens", body)
+        self.assertEqual(json.loads(_post(http_.port, "/apply-template", body)[1])["prompt"], prompt)
+        srv.template = self.mk.make_template((ROOT / "tests" / "templates" / "qwen38_unsloth.jinja").read_text(encoding="utf-8"))
+        self.assertIn(self.JOINED, srv.render(body)[0])  # (Qwen3.8's template too: it would run a list's parts together)
+
+    def test_anthropic_text_blocks(self) -> None:
+        self.check("/v1/messages", "/v1/messages/count_tokens",
+                   {"model": "m", "max_tokens": 2, "messages": [{"role": "user", "content": self.PARTS}]})
+
+    def test_responses_input_text_parts(self) -> None:
+        parts = [{"type": "input_text", "text": p["text"]} for p in self.PARTS]
+        self.check("/v1/responses", "/v1/responses/input_tokens",
+                   {"max_output_tokens": 2, "input": [{"type": "message", "role": "user", "content": parts}]})
 
 
 class ContextOverflowTests(_HttpCase):

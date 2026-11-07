@@ -88,9 +88,9 @@ class RequestMappingTests(unittest.TestCase):
         chat, info = self.mk.responses_to_chat(_codex(CODEX_INPUT), notes, mid_system=False)
         m = chat["messages"]
         self.assertEqual([x["role"] for x in m], ["system", "user", "user"])
-        # the two developer messages: one system message, trimmed texts joined by a newline (parts: nothing between)
+        # the two developer messages: one system message, trimmed texts joined by a newline (parts: by newlines too)
         self.assertEqual(m[0]["content"], "You are a coding agent running in the Codex CLI.\r\n\r\nBe precise.\n"
-                                          "<skills_instructions>\n## Skills\n</skills_instructions><permissions instructions>\n"
+                                          "<skills_instructions>\n## Skills\n</skills_instructions>\n<permissions instructions>\n"
                                           "sandbox_mode is workspace-write.\n</permissions instructions>")
         self.assertEqual(m[2]["content"], CODEX_INPUT[3]["content"][0]["text"])
         self.assertEqual(sorted(chat), ["messages", "stream", "tool_choice", "tools"])
@@ -102,7 +102,7 @@ class RequestMappingTests(unittest.TestCase):
         self.assertEqual(sorted(k for k, _ in notes), ["responses-summary", "responses-tool-web_search"])
         # the unsloth template merges leading system / developer messages the same way: the prompt is unchanged
         tmpl = self.mk.make_template(UNSLOTH)
-        sep = [{"role": "system" if x["role"] == "developer" else "user", "content": "".join(p["text"] for p in x["content"])}
+        sep = [{"role": "system" if x["role"] == "developer" else "user", "content": "\n".join(p["text"] for p in x["content"])}
                for x in CODEX_INPUT]
         self.assertEqual(tmpl.render(messages=m, tools=chat["tools"], add_generation_prompt=True),
                          tmpl.render(messages=sep, tools=chat["tools"], add_generation_prompt=True))
@@ -144,7 +144,7 @@ class RequestMappingTests(unittest.TestCase):
                     {"id": "call_1", "type": "function", "function": {"name": "exec_command", "arguments": "{\"cmd\": \"ls\"}"}},
                     {"id": "call_2", "type": "function", "function": {"name": "spawn_agent", "arguments": "{}"}}]},
                 {"role": "tool", "tool_call_id": "call_1", "content": "a.txt"},
-                {"role": "tool", "tool_call_id": "call_2", "content": "xy"},
+                {"role": "tool", "tool_call_id": "call_2", "content": "x\ny"},
                 {"role": "assistant", "content": "", "reasoning_content": "Sealed thought.", "tool_calls": [
                     {"id": "call_3", "type": "function", "function": {"name": "apply_patch",
                                                                       "arguments": "{\"input\": \"*** Begin Patch\"}"}}]},

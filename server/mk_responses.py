@@ -51,7 +51,7 @@ def reasoning_open(s, budget=None):
 
 def _resp_content(content, where):
     """a message item's or function output's content (a string, or input_text / output_text / refusal / input_image
-    parts) as chat content: one string (text parts joined as the chat template joins a part list: nothing between),
+    parts) as chat content: one string (text parts joined by newlines, as normalize_messages joins a chat part list),
     or with images the chat parts (normalize_messages flattens them as llama-server does)"""
     if isinstance(content, str):
         return content
@@ -80,7 +80,10 @@ def _resp_content(content, where):
                              "input_image)")
     if any(p["type"] == "image_url" for p in parts):
         return parts
-    return "".join(p["text"] for p in parts)
+    text = ""
+    for p in parts:
+        text += ("\n" if text else "") + p["text"]
+    return text
 
 
 def responses_tools(tools, notes):
