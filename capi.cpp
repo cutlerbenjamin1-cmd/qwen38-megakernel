@@ -326,6 +326,7 @@ int mk_slots_open2(void * hp, int n, int ctx, int seg_tokens) {
 int mk_slots_open(void * hp, int n, int ctx) { return mk_slots_open2(hp, n, ctx, 0); }
 
 // slot <- the prompt (temp 0: greedy), reusing what it can: returns the reused count (or -1); mk_slot_prefill feeds the rest
+// (MK_EXACT: a bit-exact follow-up needs two calls, see MKEngine::slot_begin in qwen38_mk.h)
 int mk_slot_begin2(void * hp, int slot, const int * toks, int n, float temp, float top_p, int top_k, float min_p, unsigned long long seed,
                    int share_len, int pin) {
     try {
