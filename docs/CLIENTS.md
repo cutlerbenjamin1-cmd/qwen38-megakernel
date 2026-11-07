@@ -25,7 +25,8 @@ sent fresh.
   one). Most clients take an unknown model for text-only and leave images out of the request.
 - **Thinking:** the model thinks unless told otherwise, at its highest effort (the chat template's default). Some
   clients' "off" level sends nothing (Pi, DeepSeek Harness), which means the most thinking: where the client allows it,
-  map "off" to the `reasoning_effort` value `none`. The effort text sits at the very start of the rendered system
+  map "off" to the `reasoning_effort` value `none` (chat completions and Responses; on `/v1/messages` thinking follows
+  the request's `thinking` field, off when it is absent). The effort text sits at the very start of the rendered system
   prompt, so changing the level in the middle of a session re-reads the whole prompt once.
 
 | client | tested | API | needed | recommended |

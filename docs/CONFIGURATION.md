@@ -305,14 +305,14 @@ Read by the server only (there is no option for them):
 
 | Variable | Default | What it does |
 |---|---|---|
-| `MK_TIMEOUT_S` | `600` | seconds a connection's read or write may make no progress before the connection closes (llama-server's `--timeout`; `0`: none): idle keep-alive connections, stalled requests, a client that stopped reading a reply |
+| `MK_TIMEOUT_S` | `600` | seconds a connection's read or write may make no progress before the connection closes (llama-server's `--timeout`; `0`: none): idle keep-alive connections, stalled requests, a client that stopped reading a reply. A stream's write that makes no progress for 60 s (this, when it is shorter and not `0`) counts as a disconnect: the generation stops and the engine is free |
 | `MK_REQUEST_TIMEOUT_S` | `300` | seconds a request may take to arrive, from its first byte to the last of its body, before the connection closes (`0`: no limit): a client sending a byte at a time never hits `MK_TIMEOUT_S`. Generating the reply does not count |
 | `MK_MAX_BODY_MB` | `128` | largest request body in MB, Content-Length or chunked; larger ones get a 413 |
 | `MK_MAX_INFLIGHT_MB` | `256` | request bodies in memory at once in MB, all connections (at least `MK_MAX_BODY_MB`); a body past it gets a 503 |
 | `MK_MAX_CONNECTIONS` | `256` | open connections; a connection past it gets a 503 |
 | `MK_MAX_IMAGES` | `32` | images per request; more get a 400 |
 | `MK_MAX_VIDEO_FRAMES` | `256` | video frames per request, all of its videos (64 s at 4 fps) |
-| `MK_PF_MIX` | `256` | `--agents`: rows of a waiting prompt fed in each decode cycle's pass beside the decoding slots (`mk_slots_step_mixed`), so they keep decoding while a long prompt is read; `0`: `MK_PF_CHUNK` tokens between the cycles. With `MK_EXACT` (the `--agents` default) a chunk before the prompt's last ends on the 32-token scan grid (up to 31 tokens off this budget) and the chunking changes no reply |
+| `MK_PF_MIX` | `256` | `--agents`: rows of a waiting prompt fed right before each decode cycle of the decoding slots (`mk_slots_step_mixed`: the chunk, then the step, as separate launches), so they keep decoding while a long prompt is read; `0`: `MK_PF_CHUNK` tokens between the cycles. With `MK_EXACT` (the `--agents` default) a chunk before the prompt's last ends on the 32-token scan grid (up to 31 tokens off this budget), a last chunk of 32 tokens or fewer joins the one before (so the prompt keeps its checkpoint), and the chunking changes no reply |
 | `MK_PF_CHUNK` | `512` | `--agents` with `MK_PF_MIX=0`: prompt tokens fed between two decode cycles (`0`: the whole prompt, the other slots wait); with `MK_EXACT`, on the 32-token grid as `MK_PF_MIX` |
 | `MK_PF_SOLO` | `0` | `--agents`: prompt tokens fed per call while no slot decodes (`0`: the whole prompt); with `MK_EXACT`, on the 32-token grid as `MK_PF_MIX` |
 | `MK_IMAGE_MAX_PIXELS` | `100000000` | largest image or video frame in pixels, checked from the file header before decoding; also read by the vision library. The server reads it only with `--mmproj` |
@@ -709,4 +709,5 @@ a longer one that replaced a conversation with tools, of that conversation (a sh
 back); a conversation parked with low priority evicts only side conversations and other low-priority ones (it is not
 parked when they do not make room), except the conversation a request without tools has just replaced; a shared prefix
 shorter than 1024 tokens is not pinned. A Responses API stream sends a progress event every 10 s during a long
-prefill; browsers may keep a CORS preflight's answer for 86400 s.
+prefill; a stream's write that makes no progress for 60 s ends the request (its client counts as gone); browsers may
+keep a CORS preflight's answer for 86400 s.
