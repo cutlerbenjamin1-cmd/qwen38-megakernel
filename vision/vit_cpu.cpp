@@ -709,12 +709,13 @@ void Vit::target_size(int width, int height, int & tw, int & th, int max_tokens)
     auto floor_by = [f](float x) { return static_cast<int>(std::floor(x / static_cast<float>(f))) * f; };
     int h_bar = std::max(f, round_by((float) height));
     int w_bar = std::max(f, round_by((float) width));
-    if (h_bar * w_bar > max_pixels) {
-        const auto beta = std::sqrt(static_cast<float>(height * width) / max_pixels);
+    // (the products in 64 bits: a 100,000,000 x 1 image, MK_IMAGE_MAX_PIXELS' default, rounds to 32 x 100,000,000)
+    if ((long long) h_bar * w_bar > max_pixels) {
+        const auto beta = std::sqrt(static_cast<float>((long long) height * width) / max_pixels);
         h_bar = std::max(f, floor_by(height / beta));
         w_bar = std::max(f, floor_by(width / beta));
-    } else if (h_bar * w_bar < p_->min_pixels) {
-        const auto beta = std::sqrt(static_cast<float>(p_->min_pixels) / (height * width));
+    } else if ((long long) h_bar * w_bar < p_->min_pixels) {
+        const auto beta = std::sqrt(static_cast<float>(p_->min_pixels) / static_cast<float>((long long) height * width));
         h_bar = ceil_by(height * beta);
         w_bar = ceil_by(width * beta);
     }
