@@ -38,6 +38,15 @@ UNSUPPORTED = {"/completion", "/completions", "/v1/completions", "/v1/responses/
                "/infill", "/embedding", "/embeddings", "/v1/embeddings", "/rerank", "/reranking",
                "/v1/rerank", "/v1/reranking", "/v1/audio/transcriptions", "/audio/transcriptions", "/lora-adapters",
                "/v1/chat/completions/control", "/models", "/v1/streams/lookup", "/tools", "/cors-proxy"}
+# a surrogate in a request body: its JSON escape, or its UTF-8 form (json.loads takes both)
+SURROGATE_RAW = re.compile(rb"\\u[dD][89a-fA-F]|\xed[\xa0-\xbf]")
+SURROGATE = re.compile("[\ud800-\udfff]")
+
+
+def lone_surrogate(raw, body):
+    """the parsed body holds a lone UTF-16 surrogate (a pair is one character by then): text that has no UTF-8 form,
+    on which the tokenizer and the stream events would fail. raw (the body's bytes) is looked at first: one search"""
+    return bool(SURROGATE_RAW.search(raw)) and SURROGATE.search(json.dumps(body, ensure_ascii=False)) is not None
 
 
 def make_handler(srv):
@@ -196,8 +205,14 @@ def make_handler(srv):
             else:
                 self._error(404, "not found")
 
+        head_sent = False  # the running POST's status line and headers are out (a stream's: its body follows)
+
+        def end_headers(self):
+            super().end_headers()
+            self.head_sent = True
+
         def do_POST(self):
-            self.charged = 0
+            self.charged, self.head_sent = 0, False
             try:
                 self._post()
             finally:  # (the body and what was parsed from it are gone with the request)
@@ -230,6 +245,10 @@ def make_handler(srv):
                 body = None
             if not isinstance(body, dict):
                 self._error(400, "the request body must be a JSON object", anth)
+                return
+            if lone_surrogate(raw, body):
+                self._error(400, "the request body has a lone UTF-16 surrogate (a \\ud800-\\udfff escape without its "
+                                 "pair): not Unicode text", anth)
                 return
             if route in ("tokenize", "detokenize", "apply_template", "input_tokens", "count_tokens", "responses_input_tokens"):
                 try:  # (no generation: the tokenizer, from this thread; images take the engine's lock)
@@ -273,7 +292,11 @@ def make_handler(srv):
                         self._complete(body)
                 except BadRequest as e:
                     srv.count(requests_bad=1)
-                    self._bad(e, anth, rid)
+                    if self.head_sent:  # (a stream's status and part of its body are out: no second response in it)
+                        log(f"#{rid} 400 after the stream started: {e}; closing the connection")
+                        self.close_connection = True
+                    else:
+                        self._bad(e, anth, rid)
                 except (*DISCONNECTS, ClientGone) as e:
                     srv.count(requests_cancelled=1)
                     self.close_connection = True
@@ -282,10 +305,14 @@ def make_handler(srv):
                 except Exception as e:  # engine failure: report it, keep serving
                     srv.count(requests_failed=1)
                     log(f"#{rid} error:", repr(e))
-                    try:
-                        self._error(500, str(e), anth)
-                    except Exception:
-                        pass
+                    if self.head_sent:  # (as above: the client sees the stream end without its last chunk)
+                        log(f"#{rid} the stream had started: closing the connection")
+                        self.close_connection = True
+                    else:
+                        try:
+                            self._error(500, str(e), anth)
+                        except Exception:
+                            pass
                 finally:
                     srv.request_done()
 

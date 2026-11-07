@@ -397,6 +397,66 @@ class ConnectionTests(_GateCase):
         self.assertEqual(http_.post({"messages": [{"role": "user", "content": "next"}], "max_tokens": 4})[0], 200)
 
 
+class SurrogateTests(_GateCase):
+    """a lone UTF-16 surrogate in a request body (json.loads takes a \\udcff escape; JS clients send one when they cut a
+    string inside a pair) is text with no UTF-8 form, on which the tokenizer and a stream's events fail: a 400 in the
+    route's error shape before anything runs. An error once a stream's headers are out closes the connection instead of
+    writing a second response into the stream's body."""
+
+    def post(self, http_, path, body):
+        data = body if isinstance(body, bytes) else json.dumps(body).encode()  # (json.dumps escapes it: \udcff)
+        st, _, out = self.ask(http_, "POST", path, [("Content-Type", "application/json")], data)
+        return st, out
+
+    def test_a_lone_surrogate_is_a_400_on_every_route(self) -> None:
+        srv, http_ = self.serve(base._ScriptEngine(["ok"]))
+        lone, hi = [{"role": "user", "content": "\udcff"}], [{"role": "user", "content": "hi"}]
+        cases = [("/v1/chat/completions", {"messages": lone}, "openai"),
+                 ("/v1/chat/completions", {"messages": lone, "stream": True}, "openai"),
+                 ("/v1/chat/completions", {"messages": hi, "user": "\ud800x"}, "openai"),
+                 ("/v1/chat/completions", {"messages": hi, "metadata": {"\udcff": 1}}, "openai"),  # (a key)
+                 ("/v1/chat/completions", b'{"messages": [{"role": "user", "content": "\xed\xb3\xbf"}]}', "openai"),
+                 ("/tokenize", {"content": "a\udcff"}, "openai"),
+                 ("/v1/messages", {"model": "m", "max_tokens": 4, "messages": lone}, "anthropic"),
+                 ("/v1/messages", {"model": "\udcff", "max_tokens": 4, "stream": True, "messages": hi}, "anthropic"),
+                 ("/v1/messages/count_tokens", {"messages": lone}, "anthropic"),
+                 ("/v1/responses", {"input": "hi", "stream": True, "max_output_tokens": 3, "metadata": {"k": "\udcff"}},
+                  "responses"),
+                 ("/v1/responses/input_tokens", {"input": "\udfff"}, "responses")]
+        for path, body, shape in cases:
+            st, out = self.post(http_, path, body)
+            self.assertEqual(st, 400, (path, out[:200]))
+            o = json.loads(out)
+            err = o["error"]
+            self.assertIn("lone UTF-16 surrogate", err["message"], path)
+            if shape == "anthropic":
+                self.assertEqual((o["type"], err["type"]), ("error", "invalid_request_error"))
+            elif shape == "responses":
+                self.assertEqual((err["type"], err["code"], err["param"]), ("invalid_request_error", None, None))
+            else:
+                self.assertEqual((err["type"], err["code"]), ("invalid_request_error", 400))
+        self.assertEqual(srv.eng.calls, [])
+        # a pair (an emoji, as json.dumps escapes it) is one character; an escaped backslash before "udcff" is text
+        for content in ("\U0001F600", "\\udcff"):
+            st, out = self.post(http_, "/v1/chat/completions", {"messages": [{"role": "user", "content": content}],
+                                                                "max_tokens": 2})
+            self.assertEqual(st, 200, (content, out[:200]))
+
+    def test_an_error_after_a_stream_started_closes_the_connection(self) -> None:
+        # (the check above off: a Responses stream echoes metadata in response.created, which then failed to encode, and
+        # so did response.failed: the 500 went out inside the open chunked body)
+        srv, http_ = self.serve(base._ScriptEngine(["ok"]))
+        body = {"input": "hi", "stream": True, "max_output_tokens": 3, "metadata": {"k": "\udcff"}}
+        req = base._request(body).replace(b"/v1/chat/completions", b"/v1/responses")
+        with mock.patch.object(self.mk, "lone_surrogate", lambda raw, body: False):
+            raw = http_.raw(req, timeout=10)
+        self.assertTrue(raw.startswith(b"HTTP/1.1 200"), raw[:300])
+        self.assertEqual(raw.count(b"HTTP/1.1 "), 1, raw[:600])
+        self.assertFalse(raw.endswith(b"0\r\n\r\n"))  # (no last chunk: the client sees the stream cut off)
+        self.assertEqual(srv.counters()["requests_failed"], 1)
+        self.assertEqual(http_.post({"messages": [{"role": "user", "content": "hi"}], "max_tokens": 2})[0], 200)
+
+
 class RequestLimitTests(_GateCase):
     """what connections can hold: the bytes of bodies in memory, how long a request may take to arrive, how many"""
 
