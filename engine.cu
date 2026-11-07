@@ -366,11 +366,15 @@ static const char * const kPhName[PH_COUNT] = {
 // MK_PROF_DUMP: one launch's raw stamps, times in ns (56-bit globaltimer, wrap-safe like prof_collect): per barrier its
 // phase, end (after the launch start), duration, fill mark and every block's arrival (after the phase start; -1: none,
 // barriers >= 1024 keep no arrivals). MK_PROF_DUMP_N = k > 1: launches MK_PROF_DUMP .. + k - 1, each to MK_PROF_DUMP_FILE.<n>
-// (a phase's minimum over several launches filters the occasional whole-GPU pause)
+// (a phase's minimum over several launches filters the occasional whole-GPU pause). %p in MK_PROF_DUMP_FILE becomes the
+// process id: Nsight Compute's application replay runs the program once per pass, and each pass keeps its own stamps
 static void prof_dump(const std::vector<unsigned long long> & pr, long n, int T, int nsm, bool multi) {
     const unsigned long long M = (1ull << 56) - 1;
     const char * env = getenv("MK_PROF_DUMP_FILE");
-    const std::string ps = env ? (multi ? std::string(env) + "." + std::to_string(n) : std::string(env)) : std::string();
+    std::string ps = env ? env : "";
+    const std::string pid = std::to_string((long) getpid());
+    for (size_t i = ps.find("%p"); i != std::string::npos; i = ps.find("%p", i + pid.size())) ps.replace(i, 2, pid);
+    if (env && multi) ps += "." + std::to_string(n);
     const char * path = env ? ps.c_str() : nullptr;
     FILE * f = path ? fopen(path, "w") : stderr;
     if (!f) {

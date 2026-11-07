@@ -660,7 +660,7 @@ a value acts when it is set to anything.
 |---|---|
 | `MK_PROFILE` | per-phase timing of the decode launches, printed at the end, including a "min-composed" estimate that filters out time-slicing by other GPU users |
 | `MK_PROFILE_SEQ` | with `MK_PROFILE`: every barrier position's phase and minimum time (per-layer costs) |
-| `MK_PROF_DUMP=N` | with `MK_PROFILE`: the raw barrier stamps (every barrier's phase, end, duration and each block's arrival, in ns) of launch N, counting every megakernel launch and dumped when it is a decode launch, to `MK_PROF_DUMP_FILE` (default stderr); `MK_PROF_DUMP_N=k`: launches N to N + k - 1 (with a file, one per launch: `<file>.<n>`), so a phase's minimum over them filters out an occasional whole-GPU pause |
+| `MK_PROF_DUMP=N` | with `MK_PROFILE`: the raw barrier stamps (every barrier's phase, end, duration and each block's arrival, in ns) of launch N, counting every megakernel launch and dumped when it is a decode launch, to `MK_PROF_DUMP_FILE` (default stderr); `MK_PROF_DUMP_N=k`: launches N to N + k - 1 (with a file, one per launch: `<file>.<n>`), so a phase's minimum over them filters out an occasional whole-GPU pause; `%p` in the file name becomes the process id, so each pass of Nsight Compute's application replay (one run of the program per pass) keeps its own stamps |
 | `MK_PF_PROFILE` | per-category GPU time of the batched prefill; `MK_PF_PROFILE=2`: idempotent kernels are also timed alone (5 repeats, minimum) |
 | `MK_PF_GAPS=1` | GPU idle time per prefill |
 | `MK_MEMLOG` | device memory per load step: bytes allocated against the drop in free memory (under WSL2 cudaMemGetInfo reads ~550 MiB low, so the in-process deltas are what to trust) |
