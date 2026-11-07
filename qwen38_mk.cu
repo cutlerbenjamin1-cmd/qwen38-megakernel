@@ -280,6 +280,8 @@ __device__ __forceinline__ float bsum(float v, float * red) {
 }
 
 // lane i holds element 32*j+i of row t; quantise the natural 32-block j into the unit layout.
+// roundf(v / (amax / 127)), half away from zero (llama.cpp's quantize_q8_1); kv_store_q8 / aq_i8_q round v * (127 / amax) to
+// even instead: two fixed conventions, don't harmonise them (it would change the stored activations / KV bytes)
 __device__ __forceinline__ void q32_store(const QBuf & q, int t, int j, float v, float ss, bool wss) {
     const int lane = threadIdx.x & 31;
     const float amax = wmax(fabsf(v));
@@ -1948,7 +1950,8 @@ __device__ __noinline__ void dn_core(const LayerW & W, int dl, int n, int dn_c, 
     }
 }
 
-// q8_0 store of one KV row: lane holds values 8 lane .. 8 lane + 7 (4 lanes per 32-value block)
+// q8_0 store of one KV row: lane holds values 8 lane .. 8 lane + 7 (4 lanes per 32-value block). Rounds v * (127 / am) to
+// even, not q32_store's roundf(v / d): the committed KV bytes depend on it
 __device__ __forceinline__ void kv_store_q8(int8_t * q, __half * sc, const float (&v)[8]) {
     const int lane = threadIdx.x & 31;
     float am = 0.f;
