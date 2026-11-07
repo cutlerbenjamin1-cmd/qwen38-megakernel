@@ -5,11 +5,6 @@
 
 namespace {
 
-uint16_t f2h_bits(float f) {
-    __half h = __float2half(f);
-    return *reinterpret_cast<uint16_t *>(&h);
-}
-
 // GGUF Q6_K block (210 B: ql[128] | qh[64] | int8 scales[16] | fp16 d) from 256 integers q in [-32, 31],
 // one scale per 16 of them and the bits of d.
 void put_q6k(uint8_t * blk, const int * q, const int8_t * sc, uint16_t dbits) {
@@ -758,6 +753,31 @@ MKEngine::Impl::Impl(const std::string & path, int ctx_, int ndraft_, const std:
             throw std::runtime_error(msg);
         }
     }
+    // also compiled in: 64 rotated dims (the RoPE table), the IMROPE sections 11 / 11 / 10 (rope_sync: pair i takes t, h,
+    // w for i % 3), an attention layer every 4th (L.attn); read as llama.cpp does (a scalar for the sections: all four)
+    const std::pair<const char *, std::vector<int64_t>> ihp[] = {{"qwen35.rope.dimension_count", {64}},
+                                                                 {"qwen35.rope.dimension_sections", {11, 11, 10, 0}},
+                                                                 {"qwen35.full_attention_interval", {4}}};
+    const auto vstr = [](const std::vector<int64_t> & a) {
+        std::string s;
+        for (size_t i = 0; i < a.size(); i++) s += (i ? ", " : "") + std::to_string(a[i]);
+        return a.size() == 1 ? s : "[" + s + "]";
+    };
+    for (const auto & [key, want] : ihp) {
+        std::vector<int64_t> v;
+        std::string got = "not an integer"; // (a float, a string, a float or long array)
+        if (const auto ia = file.iarrs.find(key); ia != file.iarrs.end()) {
+            v = ia->second;
+            got = vstr(v);
+        } else if (const auto in = file.ints.find(key); in != file.ints.end()) {
+            v.assign(want.size(), (int64_t) in->second);
+            got = vstr(v);
+        } else if (!file.arrs.count(key) && !file.floats.count(key) && !file.strs.count(key)) {
+            fprintf(stderr, "[mk] warning: the model has no %s: this kernel takes it as %s\n", key, vstr(want).c_str());
+            continue;
+        }
+        if (v != want) throw std::runtime_error(std::string("the model's ") + key + " is " + got + ", this kernel is built for " + vstr(want));
+    }
     if (ctx > ctx_limit())
         throw std::runtime_error("context of " + std::to_string(ctx) + " positions exceeds the model's context length (" +
                                  std::to_string(ctx_limit()) + ", qwen35.context_length)");
@@ -1284,10 +1304,24 @@ MKEngine::Impl::Impl(const std::string & path, int ctx_, int ndraft_, const std:
                 n4 += hb.kvb[w][s] != 8 || (w == 0 ? hb.kvr[s] : hb.kvrv[s]);
             }
         const size_t ab0 = alloc_bytes; // (alloc_bytes - ab0: the cache's device bytes, rings included)
-        hb.kc = q8 ? (void *) dalloc<int8_t>(vbytes[0]) : (void *) dalloc<__half>(rows * HD);
-        hb.vc = q8 ? (void *) dalloc<int8_t>(vbytes[1]) : (void *) dalloc<__half>(rows * HD);
-        hb.ksc = q8 ? dalloc<__half>(rows * (HD / 32)) : nullptr;
-        hb.vsc = q8 ? dalloc<__half>(rows * (HD / 32)) : nullptr;
+        // a driver without the CUDA sysmem fallback (Linux) fails the allocation where others get the warning below
+        const double kv_gb = q8 ? (vbytes[0] + vbytes[1] + 2.0 * rows * (HD / 32) * 2) / 1e9 : rows * HD * 4.0 / 1e9;
+        const auto kv_oom = [&](const MKCudaError & e, const char * rings) {
+            char msg[1280];
+            snprintf(msg, sizeof msg, "the KV cache (%.2f GB for %d positions%s) does not fit in the free device memory (%.2f GB): %s fits (%s)",
+                     kv_gb, ctx, rings, free_b / 1e9,
+                     q8 ? "a smaller context (-c) or a low-bit preset (MK_KV, docs/CONFIGURATION.md)" : "a smaller context (-c) or --kv q8",
+                     e.what());
+            return MKCudaError(msg);
+        };
+        try {
+            hb.kc = q8 ? (void *) dalloc<int8_t>(vbytes[0]) : (void *) dalloc<__half>(rows * HD);
+            hb.vc = q8 ? (void *) dalloc<int8_t>(vbytes[1]) : (void *) dalloc<__half>(rows * HD);
+            hb.ksc = q8 ? dalloc<__half>(rows * (HD / 32)) : nullptr;
+            hb.vsc = q8 ? dalloc<__half>(rows * (HD / 32)) : nullptr;
+        } catch (const MKCudaError & e) {
+            throw kv_oom(e, "");
+        }
         size_t off[2] = {0, 0};
         for (int s = 0; s < N_ATT_SLOTS; s++)
             for (int w = 0; w < 2; w++) { // slots packed in order: all-q8 gives the same addresses as [slot][head][ctx][HD]
@@ -1326,8 +1360,12 @@ MKEngine::Impl::Impl(const std::string & path, int ctx_, int ndraft_, const std:
             for (int w = 0; w < 2; w++)
                 for (int s = 0; s < kv_slots; s++)
                     if (hb.kvb[w][s] != 8 || win_all) {
-                        hb.kvrp[w][s] = dalloc<int8_t>((size_t) NKV * hb.kvrc * HD);
-                        hb.kvrs[w][s] = dalloc<__half>((size_t) NKV * hb.kvrc * (HD / 32));
+                        try {
+                            hb.kvrp[w][s] = dalloc<int8_t>((size_t) NKV * hb.kvrc * HD);
+                            hb.kvrs[w][s] = dalloc<__half>((size_t) NKV * hb.kvrc * (HD / 32));
+                        } catch (const MKCudaError & e) {
+                            throw kv_oom(e, " and its MK_KV_WIN rings");
+                        }
                         ring_bytes += (size_t) NKV * hb.kvrc * (HD + HD / 16);
                         nr++;
                     }

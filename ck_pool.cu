@@ -18,6 +18,7 @@ void MKEngine::Impl::ck_alloc() {
                 fprintf(stderr, "[mk] warning: no pinned host memory for DeltaNet checkpoint %d: keeping %d\n", i + 1, i);
                 break;
             }
+            fprintf(stderr, "[mk] warning: no pinned host memory for DeltaNet checkpoints: one in device memory instead (%.0f MiB)\n", nf * 4 / 1048576.0);
             ck_dev = true;
         }
         if (ck_dev) s.mem = dalloc<float>(nf, false);

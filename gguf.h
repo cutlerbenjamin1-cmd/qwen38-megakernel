@@ -1,6 +1,8 @@
 // Minimal read-only GGUF parser (mmap based). Only what the megakernel loader needs.
 // Every read is checked against the file size and every size is computed without overflow: a truncated or malformed
-// file throws std::runtime_error (never a read outside the mapping, a division by zero or a huge allocation).
+// file throws std::runtime_error (never a read outside the mapping or a division by zero). Every length and count is
+// checked against the bytes left before anything is allocated for it: memory grows with the file's size (a string up to
+// the rest of the file), never with a number the file declares.
 // A tensor's byte size comes from its type and dimensions (never from anything else the file says); its type must be one
 // the engine reads, every dimension at least 1, and offset + size inside the data section. Readers that expect a shape
 // ask for it (File::get(name, dims), shape_is): a tensor with the right name but another shape (fewer rows, an extra
@@ -92,6 +94,7 @@ struct File {
     std::map<std::string, std::string> strs;
     std::map<std::string, float> floats; // float32 kvs (rope.freq_base, layer_norm_rms_epsilon)
     std::map<std::string, uint64_t> arrs; // element count of each array kv (e.g. tokenizer.ggml.tokens: the vocabulary)
+    std::map<std::string, std::vector<int64_t>> iarrs; // integer arrays of up to 16 elements (rope.dimension_sections)
 
     static constexpr uint64_t MAX_ALIGNMENT = 1u << 20; // general.alignment: a power of two up to this
 
@@ -164,6 +167,18 @@ struct File {
             default: return 0;
         }
     }
+    // an integer element of type t at p (signed types sign-extended, a u64 as its bits)
+    static int64_t int_at(uint32_t t, const uint8_t * p) {
+        switch (t) {
+            case 0: case 7: return *p;
+            case 1: return (int8_t) *p;
+            case 2: { uint16_t v; memcpy(&v, p, 2); return v; }
+            case 3: { int16_t v; memcpy(&v, p, 2); return v; }
+            case 4: { uint32_t v; memcpy(&v, p, 4); return v; }
+            case 5: { int32_t v; memcpy(&v, p, 4); return v; }
+            default: { int64_t v; memcpy(&v, p, 8); return v; } // 10, 11
+        }
+    }
 
     void skip_val(uint32_t t, const std::string & key) {
         switch (t) {
@@ -173,12 +188,16 @@ struct File {
             case 5: ints[key] = (uint64_t) rd<int32_t>(); break;
             case 6: floats[key] = rd<float>(); break;
             case 8: strs[key] = rds(); break;
-            case 9: { // arrays are skipped; their elements are scalars or strings (ggml rejects nested arrays too)
+            case 9: { // arrays are skipped but short integer ones; their elements are scalars or strings (ggml rejects nested arrays too)
                 const uint32_t et = rd<uint32_t>();
                 const uint64_t n = rd<uint64_t>();
                 arrs[key] = n;
                 if (const uint64_t eb = scalar_bytes(et)) {
                     if (n > (size - pos) / eb) fail("array " + key + " of " + std::to_string(n) + " elements runs past the end");
+                    if (n <= 16 && et != 6 && et != 12) { // (not f32 / f64)
+                        std::vector<int64_t> & v = iarrs[key];
+                        for (uint64_t i = 0; i < n; i++) v.push_back(int_at(et, base + pos + i * eb));
+                    }
                     pos += (size_t) (n * eb);
                 } else if (et == 8) {
                     if (n > (size - pos) / 8) fail("array " + key + " of " + std::to_string(n) + " strings runs past the end");

@@ -17,3 +17,13 @@ jobs:
           python-version: ${{ matrix.python-version }}
       - run: pip install -r requirements.txt pytest openai anthropic  # (the SDK round-trip tests skip without them)
       - run: python -m pytest -q tests
+
+  # the GGUF parser (gguf.h) on malformed files under ASan / UBSan: g++ only (no CUDA; the Makefile's ARCH is sm_86
+  # without nvidia-smi and this target does not use it)
+  gguf-fuzz:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: sudo sysctl -w vm.mmap_rnd_bits=28  # (ASan's shadow memory and the 32 random mmap bits of newer kernels)
+      - run: make tests/gguf_fuzz
+      - run: tests/gguf_fuzz
