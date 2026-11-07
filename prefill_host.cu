@@ -30,7 +30,7 @@ inline void a2_plan(int T, int n0, int slots, size_t part_floats, int & nfull, i
 
 void MKEngine::Impl::pf_init() {
     if (pf_ready) return;
-    // MK_PF_CAP: tokens per prefill chunk (multiple of 128); scratch is ~0.33 MB per token
+    // MK_PF_CAP: tokens per prefill chunk (multiple of 128); scratch ~0.25 MB per token (MK_EXACT, every gate / up fused)
     int cap = 2048;
     if (const char * e = getenv("MK_PF_CAP")) cap = std::max(128, std::min(2048, atoi(e) / 128 * 128));
     // MK_EXACT checkpoints keep the window rings: ring_snap_rows runs after a whole chunk, which must not wrap a ring
