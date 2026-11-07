@@ -97,7 +97,7 @@ void MKEngine::Impl::ck_make_plan() {
     if (ck_dev) return; // (device checkpoint: the end save copies on stream 0)
     const size_t cap = hp.cap;
     const std::pair<void *, size_t> scr[] = {
-        {hp.y0, cap * FF * 4}, {hp.y1, y1_floats * 4}, {hp.xh2, cap * FF * 2}, {hp.y2, cap * VD * 4}, {hp.x, cap * D * 4},
+        {hp.y0, y0_floats * 4}, {hp.y1, y1_floats * 4}, {hp.xh2, cap * FF * 2}, {hp.y2, cap * VD * 4}, {hp.x, cap * D * 4},
         {hp.xm, cap * D * 4},  {hp.dq, cap * QKV * 2}, {hp.xh, cap * 2 * D * 2}, {hp.qh, cap * NH * HD * 2}};
     const std::tuple<void *, size_t, size_t> reg[] = { // state, its byte offset in a slot, bytes
         {hb.dstate, 0, CK_NS * 4}, {hb.conv, CK_NS * 4, CK_NC * 4}, {hb.h_hist, (CK_NS + CK_NC) * 4, CK_NH * 4}};

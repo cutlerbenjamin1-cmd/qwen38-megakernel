@@ -509,7 +509,7 @@ struct PBufs {
     float * rs;   // [cap] RMS scale of the last normed input
     __half * xh;  // [cap][FF] fp16 GEMM input, elements of each 16-group in pf::hperm order
     __half * xh2; // [cap][FF] fp16 silu(gate) * up (ffn_down input), same order
-    float * y0;   // [cap][FF]  qkv | q+gate | ffn gate | logits
+    float * y0;   // [cap][FF]  qkv | q+gate | ffn gate | logits ([cap][QG] when every gate / up pair is fused)
     float * y1;   // [cap][FF]  z | k,v | ffn up
     float * y2;   // [cap][VD]  delta-net / attention output
     __half * dq;  // [cap][QKV] conv'd + normalised q | k | v (fp16)

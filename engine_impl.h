@@ -575,6 +575,7 @@ struct MKEngine::Impl {
     // causal attention of the chunk's T queries (positions n ..) over the cache of attention slot `slot` -> y2
     int a2_slots = 0;
     size_t y1_floats = 0; // hp.y1 in floats (pf_init: cap x FF, or cap x VD in MK_EXACT mode with every gate / up fused)
+    size_t y0_floats = 0; // hp.y0 in floats (pf_init: cap x FF, or cap x QG with every gate / up fused)
     // the slot's main buffer holds K q6 / V q5 (the D / D-prime presets) or K q5 / V q5 (preset F, K rotated or not):
     // pk_attn8's compile-time-format instantiations
     bool kv_k6v5(int slot) const { return hb.kvb[0][slot] == 6 && hb.kvb[1][slot] == 5; }

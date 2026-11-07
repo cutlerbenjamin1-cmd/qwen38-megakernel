@@ -46,13 +46,15 @@ void MKEngine::Impl::pf_init() {
     hp.rs = dalloc<float>(cap);
     hp.xh = dalloc<__half>((size_t) cap * 2 * D); // GEMM inputs: K = D, VD (attention / delta-net out) or 2 D (MTP eh)
     hp.xh2 = dalloc<__half>((size_t) cap * FF);
-    hp.y0 = dalloc<float>((size_t) cap * FF);
+    bool all_fused = true;
+    for (int L = 0; L < NL; L++) all_fused &= glu_fused(hw.L[L].fg, hw.L[L].fu) || (glu_mix_on && glu_mix(hw.L[L].fg, hw.L[L].fu, 0));
+    // y0: [cap][FF] for the two-GEMM gate / up path (gate's output); every pair fused: QG, the most its other users need
+    y0_floats = (size_t) cap * (all_fused ? QG : FF);
+    hp.y0 = dalloc<float>(y0_floats);
     // y1: [cap][FF] for the two-GEMM gate / up path (up's fp32 output) and as a2_plan's tail-split partials (non-exact
     // mode: its capacity bounds the split count, i.e. the numerics, so it stays FF there). In MK_EXACT mode with every
     // gate / up pair fused (same-type or V2 mixed), y1's other users need VD floats per token (DeltaNet z; attention
     // k / v, 2 KVD; EXA partials, whose split is numerically free): 45 KB less per token. MK_PF_Y1=1: always FF.
-    bool all_fused = true;
-    for (int L = 0; L < NL; L++) all_fused &= glu_fused(hw.L[L].fg, hw.L[L].fu) || (glu_mix_on && glu_mix(hw.L[L].fg, hw.L[L].fu, 0));
     const bool y1full = getenv("MK_PF_Y1") && atoi(getenv("MK_PF_Y1")) == 1;
     y1_floats = (size_t) cap * (exact && all_fused && !y1full ? VD : FF);
     hp.y1 = dalloc<float>(y1_floats);
@@ -686,7 +688,7 @@ void MKEngine::Impl::pf_run(const std::vector<int> & toks, int n0, std::vector<i
 #endif
             pf_norm_quant(hp.x, hw.onorm, T);
             std::vector<float> rows;
-            const int tile = std::min(128, cap * FF / VOCAB); // logits rows that fit in y0
+            const int tile = (int) std::min<size_t>(128, y0_floats / VOCAB); // logits rows that fit in y0
             for (int s = 0; s < T; s += tile) {
                 const int nt = std::min(tile, T - s);
                 const int lo = std::max(s, first - n); // rows from lo on are at positions >= first
