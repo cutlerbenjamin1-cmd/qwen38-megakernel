@@ -706,6 +706,7 @@ MKEngine::MKEngine(const std::string & path, int ctx, int n_draft, const std::st
                    const std::string & mtp)
     : p_(nullptr), n_draft_(n_draft) {
     if (n_draft < 0 || n_draft > MAXD - 1) throw std::runtime_error("n_draft must be in [0, " + std::to_string(MAXD - 1) + "]");
+    if (ctx < 1) throw std::runtime_error("context of " + std::to_string(ctx) + " positions (-c): expected at least 1");
     if (mkl::abi_sig() != mk_abi_sig())
         throw std::runtime_error("engine build: the device object (qwen38_mk.cu) was compiled with other settings than the host files: rebuild both");
     p_ = new Impl(path, ctx, n_draft, draft_vocab, kv_mode, mtp);
