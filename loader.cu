@@ -758,6 +758,31 @@ MKEngine::Impl::Impl(const std::string & path, int ctx_, int ndraft_, const std:
             throw std::runtime_error(msg);
         }
     }
+    // also compiled in: 64 rotated dims (the RoPE table), the IMROPE sections 11 / 11 / 10 (rope_sync: pair i takes t, h,
+    // w for i % 3), an attention layer every 4th (L.attn); read as llama.cpp does (a scalar for the sections: all four)
+    const std::pair<const char *, std::vector<int64_t>> ihp[] = {{"qwen35.rope.dimension_count", {64}},
+                                                                 {"qwen35.rope.dimension_sections", {11, 11, 10, 0}},
+                                                                 {"qwen35.full_attention_interval", {4}}};
+    const auto vstr = [](const std::vector<int64_t> & a) {
+        std::string s;
+        for (size_t i = 0; i < a.size(); i++) s += (i ? ", " : "") + std::to_string(a[i]);
+        return a.size() == 1 ? s : "[" + s + "]";
+    };
+    for (const auto & [key, want] : ihp) {
+        std::vector<int64_t> v;
+        std::string got = "not an integer"; // (a float, a string, a float or long array)
+        if (const auto ia = file.iarrs.find(key); ia != file.iarrs.end()) {
+            v = ia->second;
+            got = vstr(v);
+        } else if (const auto in = file.ints.find(key); in != file.ints.end()) {
+            v.assign(want.size(), (int64_t) in->second);
+            got = vstr(v);
+        } else if (!file.arrs.count(key) && !file.floats.count(key) && !file.strs.count(key)) {
+            fprintf(stderr, "[mk] warning: the model has no %s: this kernel takes it as %s\n", key, vstr(want).c_str());
+            continue;
+        }
+        if (v != want) throw std::runtime_error(std::string("the model's ") + key + " is " + got + ", this kernel is built for " + vstr(want));
+    }
     if (ctx > ctx_limit())
         throw std::runtime_error("context of " + std::to_string(ctx) + " positions exceeds the model's context length (" +
                                  std::to_string(ctx_limit()) + ", qwen35.context_length)");

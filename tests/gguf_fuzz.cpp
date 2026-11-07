@@ -34,6 +34,7 @@ struct Spec { // a small, valid file; the tests change one field at a time
     uint32_t align = 32;
     uint64_t arr_n = 3, str_arr_n = 2, str_len = 5;
     uint32_t arr_type = 4;
+    std::vector<uint32_t> arr_vals = {7, 8, 9}; // test.array's bytes
     uint32_t a_dims = 1, a_type = gguf::F32;
     uint64_t a_ne0 = 8, a_off = 0;
     uint64_t b_ne0 = 256, b_ne1 = 2, b_off = 32;
@@ -59,7 +60,7 @@ Bytes build(const Spec & s) {
     put<uint32_t>(b, 9);
     put<uint32_t>(b, s.arr_type);
     put<uint64_t>(b, s.arr_n);
-    for (int i = 0; i < 3; i++) put<uint32_t>(b, 7u + i);
+    for (uint32_t v : s.arr_vals) put<uint32_t>(b, v);
     put_str(b, "test.strings");
     put<uint32_t>(b, 9);
     put<uint32_t>(b, 8);
@@ -177,6 +178,11 @@ int dump(const char * path) {
     for (const auto & [k, v] : g.ints) printf("int %s = %" PRIu64 "\n", k.c_str(), v);
     for (const auto & [k, v] : g.strs) printf("str %s = %zu bytes, hash %zu\n", k.c_str(), v.size(), std::hash<std::string>()(v));
     for (const auto & [k, v] : g.floats) printf("float %s = %.9g\n", k.c_str(), v);
+    for (const auto & [k, v] : g.iarrs) {
+        printf("int array %s =", k.c_str());
+        for (int64_t x : v) printf(" %" PRId64, x);
+        printf("\n");
+    }
     for (const auto & [k, t] : g.tensors) {
         printf("tensor %s type %u ne", k.c_str(), t.type);
         for (auto n : t.ne) printf(" %" PRIu64, n);
@@ -200,7 +206,7 @@ int main(int argc, char ** argv) {
         const auto & a = g.get("a");
         const auto & b = g.get("b");
         const bool same = g.strs["general.architecture"] == "qwen35" && g.ints["general.alignment"] == 32 &&
-                          g.floats["test.float"] == 2.5f && a.nbytes == 32 &&
+                          g.floats["test.float"] == 2.5f && g.iarrs["test.array"] == std::vector<int64_t>{7, 8, 9} && a.nbytes == 32 &&
                           b.nbytes == 288 && ((const float *) a.data)[3] == 4.5f && b.data[287] == (uint8_t) 287 &&
                           b.data == a.data + 32 && (size_t) (b.data + b.nbytes - g.base) == g.size;
         g_n++;
@@ -218,6 +224,31 @@ int main(int argc, char ** argv) {
     }
 
     auto with = [&](auto f) { Spec s = ok; f(s); return build(s); };
+    // short integer arrays (File::iarrs): read at their element width, signed types sign-extended; f32 / f64 arrays and
+    // arrays of more than 16 elements are not kept
+    if (selected("integer arrays")) {
+        struct IA { uint32_t type; uint64_t n; std::vector<uint32_t> vals; std::vector<int64_t> want; bool kept; };
+        const std::vector<uint32_t> w3 = {0xffffffffu, 11, 10}, w4 = {0xffffffffu, 0xffffffffu, 11, 0};
+        const IA cases[] = {{4, 3, w3, {4294967295ll, 11, 10}, true}, {5, 3, w3, {-1, 11, 10}, true},
+                            {2, 6, w3, {65535, 65535, 11, 0, 10, 0}, true}, {3, 6, w3, {-1, -1, 11, 0, 10, 0}, true},
+                            {0, 12, w3, {255, 255, 255, 255, 11, 0, 0, 0, 10, 0, 0, 0}, true},
+                            {1, 12, w3, {-1, -1, -1, -1, 11, 0, 0, 0, 10, 0, 0, 0}, true}, {7, 12, w3, {255, 255, 255, 255, 11, 0, 0, 0, 10, 0, 0, 0}, true},
+                            {10, 2, w4, {-1, 11}, true}, {11, 2, w4, {-1, 11}, true}, {4, 0, {}, {}, true},
+                            {6, 3, w3, {}, false}, {12, 2, w4, {}, false}, {4, 17, std::vector<uint32_t>(17, 1), {}, false}};
+        int bad = 0;
+        for (const IA & c : cases) {
+            if (parse(with([&](Spec & s) { s.arr_type = c.type; s.arr_n = c.n; s.arr_vals = c.vals; })) != 1) {
+                bad++;
+                continue;
+            }
+            gguf::File g(g_path);
+            const auto it = g.iarrs.find("test.array");
+            if ((it != g.iarrs.end()) != c.kept || (c.kept && it->second != c.want)) bad++;
+        }
+        g_n++;
+        if (bad) g_fail++;
+        printf("%s integer arrays (%d of %zu cases wrong)\n", bad ? "FAIL" : "ok  ", bad, sizeof cases / sizeof cases[0]);
+    }
     expect("alignment 0", with([](Spec & s) { s.align = 0; }), 0);
     expect("alignment 3", with([](Spec & s) { s.align = 3; }), 0);
     expect("alignment 2^31", with([](Spec & s) { s.align = 1u << 31; }), 0);
