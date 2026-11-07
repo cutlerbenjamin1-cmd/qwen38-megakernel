@@ -114,13 +114,14 @@ moves that state around (to host memory and back) without touching its bits.
 |---|---|---|
 | follow-up turn; edited message or system prompt | the same request on a fresh server | `scripts/exactness.py` (q8_0, D, F: at 32k, and at ~100k with the launchers' settings, F also at ~255k) and the state digest of `scripts/capi_checks.py` (every K / V row, window-ring row and DeltaNet / conv state, bitwise against a fresh prefill) |
 | new session resumed at a pinned checkpoint | the same request on a fresh server (greedy, and temperature 1.0 with fixed seeds) | `scripts/exactness.py`, q8_0, D and F: a new session after a live and after a parked conversation; by hand, after a 63k-token one |
-| parked conversation brought back | each conversation alone on a fresh server | `scripts/exactness.py`, q8_0, D and F: three conversations, greedy and sampled; the state digest; 8 interleaved requests on each release |
-| side request, and the conversation kept beside it | each of them alone on a fresh server | `scripts/exactness.py`, q8_0, D and F; the state digest; 5 side-request scenarios and 40 titles beside two conversations on each release |
-| a prefill stopped because the client left | a server that never saw that request | the requests after a stopped prefill, compared on each release |
+| parked conversation brought back | each conversation alone on a fresh server | `scripts/exactness.py`, q8_0, D and F: three conversations, greedy and sampled; the state digest; by hand on each release (not in the scripts), 8 interleaved requests |
+| side request, and the conversation kept beside it | each of them alone on a fresh server | `scripts/exactness.py`, q8_0, D and F; the state digest; by hand on each release (not in the scripts), 5 side-request scenarios and 40 titles beside two conversations |
+| a prefill stopped because the client left | a server that never saw that request | by hand on each release (not in the scripts): the requests after a stopped prefill |
 
 Sampled replies are identical too when the request sets a `seed`: the draft vocabulary the MTP head uses is rebuilt
-after a rewind exactly as a fresh prefill builds it. Without a `seed`, each request draws a random one. The gates run on
-Linux and on the native Windows build, and the two give the same replies.
+after a rewind exactly as a fresh prefill builds it. Without a `seed`, each request draws a random one.
+`scripts/exactness.py` runs on Linux and on the native Windows build (`scripts/gate.sh` on Linux / WSL2), and the two
+builds give the same replies (two runs compared with `--compare`: [BENCHMARKS.md](BENCHMARKS.md#windows-and-linux)).
 
 What is not exact, and against what:
 - **Exact reuse off** (`MK_EXACT_REUSE=0` in the launchers, no `--exact-reuse` on the server): a follow-up appends to

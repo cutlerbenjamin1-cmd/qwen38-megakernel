@@ -94,7 +94,8 @@ keeping the decoded ones.
 
 Speculative verification is exact: greedy output is the main model's greedy choice at every draft depth, and with
 sampling a draft is accepted with probability p(draft) and a rejected one is resampled from the rest of the
-distribution, so the sampled distribution is the same as without drafts (chi-square and PIT tests).
+distribution, so the sampled distribution is the same as without drafts (chi-square and PIT tests, below; one-off
+runs, not part of the gate: [BENCHMARKS.md](BENCHMARKS.md#speculation)).
 
 The random numbers come from a counter-based generator keyed by the seed and the position: a row's acceptance and
 resampling numbers by its position, a sampled draft's by the position it drafts. Each position is decided once, and a

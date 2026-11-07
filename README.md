@@ -121,8 +121,8 @@ from the depth). A reused cache or another compiler can drift the same way. This
 the output. All 282 of its answers are the same at 7 drafts as with none:
 
 - **Drafting never changes the answer.** Greedy token ids are identical at 0, 4 and 7 drafts, over about 2,000 tokens of
-  output and under every draft policy. Sampled output keeps the distribution of sampling without drafts (chi-square and PIT
-  tests).
+  output and under every draft policy. Sampled output keeps the distribution of sampling without drafts (chi-square
+  tests of a CPU replica of the loop and a PIT test on the engine, 2026-10-17; not part of the gate).
 - **A cached conversation answers like a fresh one.** With exact reuse (the launchers' default), follow-ups, edits,
   resumed sessions and conversations restored from host memory all continue bit for bit like the same request sent
   fresh, greedy or sampled with the same seed.
@@ -130,9 +130,10 @@ the output. All 282 of its answers are the same at 7 drafts as with none:
   image-encoder rows.
 
 So an agent's run can be reproduced, and an odd reply is never the speculation's or the cache's doing. These hold on q8_0
-and on the presets, each against itself. Every release
-is gated on these checks, and you can run them on your own build: `scripts/exactness.py` for the core checks,
-`scripts/gate.sh` for all of them ([checking a build](docs/BUILDING.md#checking-a-build)).
+and on the presets, each against itself. Every release is gated on the drafting and cache checks, and you can run
+them on your own build: `scripts/exactness.py` for the exact-output checks, `scripts/gate.sh` for those and the rest of
+the GPU checks ([checking a build](docs/BUILDING.md#checking-a-build)). Windows against Linux is `scripts/exactness.py`
+run on both builds and compared with `--compare`, by hand.
 
 Not bit-identical, by design:
 - **llama.cpp.** Its arithmetic is ordered and rounded differently. Against llama.cpp's own token-by-token
