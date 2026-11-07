@@ -432,12 +432,22 @@ def make_handler(srv):
                 self.send_header("Transfer-Encoding", "chunked")
             self.end_headers()
 
+        STREAM_PIECE = 1 << 16  # (a stream's data goes out this much at a time: each piece has STREAM_WRITE_S)
+
         def _stream_send(self, data, last=False):
-            """one piece of an event stream's body (_stream_head's framing); last: then the end of the body"""
-            if self.request_version == "HTTP/1.0":
-                self.wfile.write(data)
-            else:
-                self.wfile.write(b"%x\r\n" % len(data) + data + (b"\r\n0\r\n\r\n" if last else b"\r\n"))
+            """one piece of an event stream's body (_stream_head's framing); last: then the end of the body. A write that
+            makes no progress for mk_limits.STREAM_WRITE_S times out (TimeoutError: the client is gone, as after a
+            reset), whatever MK_TIMEOUT_S is: that stays the limit of the connection's other reads and writes"""
+            if self.request_version != "HTTP/1.0":
+                data = b"%x\r\n" % len(data) + data + (b"\r\n0\r\n\r\n" if last else b"\r\n")
+            sock, view = self.connection, memoryview(data)
+            idle = sock.gettimeout()
+            sock.settimeout(mk_limits.STREAM_WRITE_S if idle is None else min(idle, mk_limits.STREAM_WRITE_S))
+            try:  # (a write's timeout counts from its start: a large one goes out in pieces, each one timed)
+                for i in range(0, len(view), self.STREAM_PIECE):
+                    self.wfile.write(view[i:i + self.STREAM_PIECE])
+            finally:
+                sock.settimeout(idle)
             self.wfile.flush()
 
         def _anthropic_stream(self, chat, model):

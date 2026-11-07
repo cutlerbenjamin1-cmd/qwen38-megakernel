@@ -396,6 +396,25 @@ class ConnectionTests(_GateCase):
         self.assertEqual(eng.cycles, c1, "still generating after the write timed out")
         self.assertEqual(http_.post({"messages": [{"role": "user", "content": "next"}], "max_tokens": 4})[0], 200)
 
+    def test_a_stream_its_client_stopped_reading_ends_after_the_write_timeout(self) -> None:
+        # (no MK_TIMEOUT_S here, the tests' handler has none: before, the stalled write held the engine forever)
+        eng = base._ScriptEngine(["y" * (1 << 18)] * 400)  # (100 MB of events: the socket buffers fill)
+        srv, http_ = self.serve(eng, 1024)
+        self.assertEqual(self.mk.STREAM_WRITE_S, 60)
+        body = {"messages": [{"role": "user", "content": "long"}], "stream": True}
+        with mock.patch.object(self.mk, "STREAM_WRITE_S", 0.5):
+            s = socket.socket()
+            self.addCleanup(s.close)
+            s.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 4096)
+            s.connect(("127.0.0.1", http_.port))
+            s.sendall(base._request(body))  # (and nothing read)
+            t0 = time.monotonic()
+            while srv.counters()["requests_cancelled"] == 0:
+                self.assertLess(time.monotonic() - t0, 20, "the stalled stream still holds the engine")
+                time.sleep(0.05)
+            self.assertLess(eng.cycles, 150, "it generated the whole reply")
+            self.assertEqual(http_.post({"messages": [{"role": "user", "content": "next"}], "max_tokens": 2})[0], 200)
+
 
 class SurrogateTests(_GateCase):
     """a lone UTF-16 surrogate in a request body (json.loads takes a \\udcff escape; JS clients send one when they cut a

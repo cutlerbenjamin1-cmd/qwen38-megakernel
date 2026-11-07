@@ -20,6 +20,9 @@ MAX_VIDEO_FRAMES = 256  # MK_MAX_VIDEO_FRAMES: video frames per request (all of 
 IMAGE_MAX_PIXELS = 100_000_000  # MK_IMAGE_MAX_PIXELS (the vision library's too): larger video frames are not decoded
 VIDEO_DECODE_S = 300  # a video's ffmpeg decode is stopped after this many seconds (400)
 TIMEOUT_S = 600  # MK_TIMEOUT_S: a read or write stalled this long closes the connection (llama-server's --timeout)
+# a stream's write that makes no progress this long: its client stopped reading and is gone (MK_TIMEOUT_S would hold the
+# engine, and every request waiting for it, that long)
+STREAM_WRITE_S = 60
 VIDEO_TS_MS = 5000  # llama.cpp's video timestamp interval (mtmd_helper_video_init_params_default)
 # lingering close (HTTPServer.shutdown_request): what a client still sends after the server's last answer is read and
 # dropped for at most LINGER_S seconds / LINGER_BYTES bytes, LINGER_IDLE_S seconds without data (nginx's defaults)
