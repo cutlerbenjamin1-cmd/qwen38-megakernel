@@ -172,6 +172,8 @@ def anthropic_to_chat(body, notes=None, mid_system=True):
         for t in tools:
             if not isinstance(t, dict) or not t.get("name"):
                 raise BadRequest(f"tools: each tool needs a name, not {str(t)[:80]!r}")
+            if t.get("input_schema") is not None and not isinstance(t["input_schema"], dict):
+                raise BadRequest(f"tools: {str(t['name'])[:80]}: input_schema must be an object (a JSON Schema)")
             if t.get("type") not in (None, "custom"):  # (e.g. bash_20250124, web_search_20250305)
                 notes.append((f"anthropic-tool-{t['type']}", f"Anthropic tool type {t['type']!r} ({t['name']}) is offered "
                               f"to the model as a plain function{'' if t.get('input_schema') else ' without parameters'}"

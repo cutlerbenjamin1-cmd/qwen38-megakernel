@@ -661,6 +661,42 @@ class BadFieldTests(_GateCase):
             self.refused(f'{{"messages": [{{"role": "user", "content": "go"}}, {{"role": "assistant", "content": "", '
                          f'"tool_calls": {calls}}}]}}', b"tool_calls")
 
+    def test_tool_schemas_are_checked_before_the_prompt_runs(self) -> None:
+        # (the reply's tool-call parser read them only after the prefill: a 500 that had spent it, and parked the live
+        # conversation for it)
+        for tools in ('["x"]', '[null]', '[{"type": "function", "function": "f"}]', '[{"type": "function", "function": null}]',
+                      '[{"type": "function", "function": {"name": "t", "parameters": "oops"}}]',
+                      '[{"type": "function", "function": {"name": "t", "parameters": [1]}}]',
+                      '[{"type": "function", "function": {"name": ["x"]}}]', '[{"type": "function", "function": {"name": ""}}]',
+                      '[{"type": "function", "function": {"description": "no name"}}]'):
+            for stream in ("false", "true"):
+                self.refused(f'{{{self.MSG}, "stream": {stream}, "tools": {tools}}}', b"tools")
+        h = [("Content-Type", "application/json")]
+        msgs = [{"role": "user", "content": "hi"}]
+        st, _, out = self.ask(self.http_, "POST", "/v1/messages", h, json.dumps(
+            {"max_tokens": 4, "messages": msgs, "tools": [{"name": "t", "input_schema": "oops"}]}).encode())
+        self.assertEqual((st, json.loads(out)["type"]), (400, "error"))
+        self.assertIn(b"input_schema", out)
+        self.assertEqual(self.srv.eng.calls, [])
+        # every shape the three APIs take still runs
+        chat = [{"type": "function", "function": {"name": "a", "parameters": {"type": "object", "properties": {"p": {}}}}},
+                {"type": "function", "function": {"name": "b"}}, {"type": "function", "function": {"name": "c", "parameters": None}},
+                {"type": "function", "name": "flat", "parameters": {"type": "object"}}]
+        anthropic = [{"name": "read", "input_schema": {"type": "object", "properties": {"path": {"type": "string"}}}},
+                     {"name": "none"}, {"type": "bash_20250124", "name": "bash"},
+                     {"type": "web_search_20250305", "name": "web_search", "max_uses": 5}]
+        responses = [{"type": "function", "name": "f", "parameters": {"type": "object"}}, {"type": "function", "name": "g"},
+                     {"type": "namespace", "name": "ns", "tools": [{"type": "function", "name": "h", "parameters": None}]},
+                     {"type": "custom", "name": "apply_patch", "format": {"type": "grammar", "definition": "x"}},
+                     {"type": "web_search"}]
+        for path, body in (("/v1/chat/completions", {"messages": msgs, "tools": chat}),
+                           ("/v1/messages", {"messages": msgs, "tools": anthropic}),
+                           ("/v1/responses", {"input": "hi", "tools": responses})):
+            for stream in (False, True):
+                st, _, out = self.ask(self.http_, "POST", path, h, json.dumps({**body, "max_tokens": 2, "max_output_tokens": 2,
+                                                                              "stream": stream}).encode())
+                self.assertEqual(st, 200, (path, stream, out[:300]))
+
     def test_chat_template_kwargs_of_the_wrong_type(self) -> None:
         for v in ('"x"', '5', 'true', '["x"]', '[1]', '1.5'):
             self.refused(f'{{{self.MSG}, "chat_template_kwargs": {v}}}', b"chat_template_kwargs")

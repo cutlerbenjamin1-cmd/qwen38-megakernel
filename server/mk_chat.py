@@ -413,6 +413,15 @@ def check_params(body):
                            "sampling, which the megakernel does not have")
     if body.get("tools") is not None and not isinstance(body["tools"], list):
         bad("tools", "an array of tools")
+    for t in body.get("tools") or []:  # (as ToolCallParser reads them: a function object, or the tool itself)
+        fn = t.get("function", t) if isinstance(t, dict) else None
+        if not isinstance(fn, dict):
+            bad("tools", f"each tool must be an object with an object as its function, not {str(t)[:80]!r}")
+        if not isinstance(fn.get("name"), str) or not fn["name"]:
+            bad("tools", f"each tool's function needs a name (a non-empty string), not {str(fn.get('name'))[:80]!r}")
+        if fn.get("parameters") is not None and not isinstance(fn["parameters"], dict):
+            bad("tools", f"{fn['name'][:80]}: parameters must be an object (a JSON Schema), not "
+                         f"{str(fn['parameters'])[:80]!r}")
     if body.get("functions") or body.get("function_call"):
         bad("functions", "the legacy function-calling fields are not supported: use tools")
     if body.get("ignore_eos"):
