@@ -206,9 +206,17 @@ class MKEngine {
     // slot_begin: the slot takes the prompt (sampling as set_sampling), reusing the longest prefix it can (a truncate of
     // emitted tokens, else its newest checkpoint before the divergence); returns the reused tokens, slot_prefill feeds
     // up to budget of the rest per call and returns how many remain (0: ready; budget 0: abandon the rest). The prompt's
-    // last chunk saves a checkpoint before its last token (a repeat of the prompt resumes there). slots_step: one step
-    // of the given slots (two or more: one batched launch, each slot up to 1 + MAXT / n - 1 tokens), the tokens each
-    // emitted (a slot's first call after its prefill: the prefill's token only; empty: its context is full).
+    // last chunk saves a checkpoint before its last token (a repeat of the prompt resumes there). MK_EXACT: a chunk
+    // before the last ends on the 32-token scan grid and a last chunk of 32 tokens or fewer joins the one before (a
+    // budget of 32 or more: chunks within 32 tokens of it); the checkpoint is the grid point at or before the last token.
+    // MK_EXACT follow-ups: a prompt that keeps the slot's reply up to its committed position (last prompt + reply + new
+    // turn) reuses the reply's decoded rows (a truncate, or no rewind when it extends the whole sequence), whose bits
+    // depend on the draft schedule, and prefills from off the grid: not exact (warned once per engine). For a bit-exact
+    // follow-up whose prompt starts with the slot's last prompt, first call slot_begin(slot, that last prompt), which
+    // takes the slot back to its newest checkpoint inside it (else empties it), then slot_begin(slot, prompt), as
+    // mk_server's --agents scheduler does. slots_step: one step of the given slots (two or more: one batched launch, each
+    // slot up to 1 + MAXT / n - 1 tokens), the tokens each emitted (a slot's first call after its prefill: the prefill's
+    // token only; empty: its context is full).
     // slots_step_mixed: pslot's next prompt chunk, then slots_step (a failed chunk steps nothing: no token is lost).
     // Every slot call leaves the engine's own sequence current again. An MKCudaError fails the slots the call ran on:
     // slot_prefill / slots_step refuse them (std::runtime_error) until slot_begin, which starts them from scratch
