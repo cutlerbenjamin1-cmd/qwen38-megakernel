@@ -51,7 +51,12 @@ def with_trace(e):
 def lone_surrogate(raw, body):
     """the parsed body holds a lone UTF-16 surrogate (a pair is one character by then): text that has no UTF-8 form,
     on which the tokenizer and the stream events would fail. raw (the body's bytes) is looked at first: one search"""
-    return bool(SURROGATE_RAW.search(raw)) and SURROGATE.search(json.dumps(body, ensure_ascii=False)) is not None
+    if not SURROGATE_RAW.search(raw):
+        return False
+    try:
+        return SURROGATE.search(json.dumps(body, ensure_ascii=False)) is not None
+    except RecursionError:  # (nested about as deep as json.loads takes: not looked at, as before the check)
+        return False
 
 
 def make_handler(srv):
