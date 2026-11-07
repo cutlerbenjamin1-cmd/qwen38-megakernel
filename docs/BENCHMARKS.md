@@ -149,6 +149,10 @@ Notes:
 - **The questions:** llama.cpp at 4 drafts got 229 (GSM8K 50 / 50, MMLU-Pro 45 / 70, ARC-C 47 / 50, MATH-500 28 / 40 and
   9 / 10 with thinking on, HumanEval 38 / 41, NIAH 9 / 9, LongBench v2 3 / 12), in 2,534 s. This engine's answers per
   set: [the full run](#full-run-2026-11-06).
+- **Sampling:** the sampled requests set temperature 1.0, top_p 0.95, top_k 20 and a seed, not `min_p`, so each server
+  used its own default: this engine 0, llama-server llama.cpp's 0.05 (b10246's `common.h`; the GGUF sets no
+  `general.sampling.min_p`). llama-server's `preserve_thinking: true` is what Qwen3.8's template does when the key is
+  absent, as on this server: both keep earlier turns' thinking.
 - **Conditions:** fans pinned at 100% (they read 93-98% at the start and end of each speed pass); GPU 44-69 C and SM
   clock 1,860-2,025 MHz at those points; memory clock 9,851 MHz. llama.cpp ran natively on Windows, this engine under
   WSL2. No pass was repeated.
@@ -386,7 +390,9 @@ not run again for v2026.11.05 (2026-11-06, the table above), so the last two col
   60.5 / 62.1). One request decodes at the same ~61 tok/s with `-np 4 -c 64000` (1.4 GB less VRAM in use) and with
   `-np 1 -c 100000`, and 4 at once give 131 tok/s at `-c 64000` against 126 / 132 at `-c 100000`. Its process's shared
   GPU memory stays at 280 to 640 MiB in every configuration (pinned host buffers), so the `-c 100000` run did not page
-  into system memory. Its SM clock read 780 to 1,245 MHz right after its runs (this server: 1,950 to 1,965 MHz).
+  into system memory. Its SM clock read 780 to 1,245 MHz right after its runs (this server: 1,950 to 1,965 MHz, but
+  its keep-warm load holds the clocks up for 120 s after a request, `MK_KEEP_WARM_S`, so the readings do not compare
+  like for like).
 - The gaps are larger than single-stream ([against llama.cpp](#against-llamacpp-2026-11-06)) because this client
   samples: llama.cpp's sampled decode with MTP drafts is its slower path.
 - v2026.10.30's own pass earlier in the 2026-11-02 session, before llama-server's: 371.0 / 331.0 / 183.0 / 179.0 tok/s.
