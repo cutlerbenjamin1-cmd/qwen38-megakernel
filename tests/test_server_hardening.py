@@ -396,6 +396,27 @@ class ConnectionTests(_GateCase):
         self.assertEqual(eng.cycles, c1, "still generating after the write timed out")
         self.assertEqual(http_.post({"messages": [{"role": "user", "content": "next"}], "max_tokens": 4})[0], 200)
 
+    def test_connections_send_without_waiting_for_acks(self) -> None:
+        # (TCP_NODELAY: a stream's ~150-byte events every few ms, held by Nagle for the client's delayed ACK over a LAN)
+        _, http_ = self.serve(base._ScriptEngine(["ok"]))
+        seen, real = [], self.mk.GatedHandler.setup
+
+        def setup(h):
+            real(h)
+            seen.append(h.connection.getsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY))
+        with mock.patch.object(self.mk.GatedHandler, "setup", setup):
+            self.assertEqual(http_.post({"messages": [{"role": "user", "content": "hi"}], "max_tokens": 2})[0], 200)
+        self.assertEqual(len(seen), 1)
+        self.assertTrue(seen[0])
+        if hasattr(socket, "AF_UNIX"):  # (a socket that is not TCP: set up all the same)
+            a, b = socket.socketpair(socket.AF_UNIX)
+            with a, b:
+                h = object.__new__(self.mk.GatedHandler)
+                h.request = a
+                h.setup()
+                h.rfile.close()
+                h.wfile.close()
+
     def test_a_stream_its_client_stopped_reading_ends_after_the_write_timeout(self) -> None:
         # (no MK_TIMEOUT_S here, the tests' handler has none: before, the stalled write held the engine forever)
         eng = base._ScriptEngine(["y" * (1 << 18)] * 400)  # (100 MB of events: the socket buffers fill)

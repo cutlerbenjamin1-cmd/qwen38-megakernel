@@ -4,6 +4,7 @@ import io
 import ipaddress
 import json
 import re
+import socket
 import threading
 import time
 from http.server import BaseHTTPRequestHandler
@@ -221,6 +222,10 @@ class GatedHandler(BaseHTTPRequestHandler):
 
     def setup(self):
         super().setup()
+        try:  # (a stream's small events go out as they are written, not held for the client's delayed ACK: Nagle)
+            self.connection.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+        except OSError:  # (not a TCP socket)
+            pass
         self.rfile.close()
         self.reader = RequestReader(self.connection, mk_limits.REQUEST_TIMEOUT_S)
         self.rfile = io.BufferedReader(self.reader)
