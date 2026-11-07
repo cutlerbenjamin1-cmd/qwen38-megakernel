@@ -38,6 +38,25 @@ UNSUPPORTED = {"/completion", "/completions", "/v1/completions", "/v1/responses/
                "/infill", "/embedding", "/embeddings", "/v1/embeddings", "/rerank", "/reranking",
                "/v1/rerank", "/v1/reranking", "/v1/audio/transcriptions", "/audio/transcriptions", "/lora-adapters",
                "/v1/chat/completions/control", "/models", "/v1/streams/lookup", "/tools", "/cors-proxy"}
+# a surrogate in a request body: its JSON escape, or its UTF-8 form (json.loads takes both)
+SURROGATE_RAW = re.compile(rb"\\u[dD][89a-fA-F]|\xed[\xa0-\xbf]")
+SURROGATE = re.compile("[\ud800-\udfff]")
+
+
+def with_trace(e):
+    """an exception for the console line of a 500 (in its except block): its repr and where it was raised"""
+    return f"{e!r}\n{traceback.format_exc().rstrip()}"
+
+
+def lone_surrogate(raw, body):
+    """the parsed body holds a lone UTF-16 surrogate (a pair is one character by then): text that has no UTF-8 form,
+    on which the tokenizer and the stream events would fail. raw (the body's bytes) is looked at first: one search"""
+    if not SURROGATE_RAW.search(raw):
+        return False
+    try:
+        return SURROGATE.search(json.dumps(body, ensure_ascii=False)) is not None
+    except RecursionError:  # (nested about as deep as json.loads takes: not looked at, as before the check)
+        return False
 
 
 def make_handler(srv):
@@ -196,8 +215,14 @@ def make_handler(srv):
             else:
                 self._error(404, "not found")
 
+        head_sent = False  # the running POST's status line and headers are out (a stream's: its body follows)
+
+        def end_headers(self):
+            super().end_headers()
+            self.head_sent = True
+
         def do_POST(self):
-            self.charged = 0
+            self.charged, self.head_sent = 0, False
             try:
                 self._post()
             finally:  # (the body and what was parsed from it are gone with the request)
@@ -231,6 +256,10 @@ def make_handler(srv):
             if not isinstance(body, dict):
                 self._error(400, "the request body must be a JSON object", anth)
                 return
+            if lone_surrogate(raw, body):
+                self._error(400, "the request body has a lone UTF-16 surrogate (a \\ud800-\\udfff escape without its "
+                                 "pair): not Unicode text", anth)
+                return
             if route in ("tokenize", "detokenize", "apply_template", "input_tokens", "count_tokens", "responses_input_tokens"):
                 try:  # (no generation: the tokenizer, from this thread; images take the engine's lock)
                     t0 = time.time()
@@ -249,7 +278,7 @@ def make_handler(srv):
                 except DISCONNECTS:
                     self.close_connection = True
                 except Exception as e:  # (answered, not a dropped connection)
-                    log(f"{path} error:", repr(e))
+                    log(f"{path} error:", with_trace(e))
                     try:
                         self._error(500, str(e), anth)
                     except Exception:
@@ -273,7 +302,11 @@ def make_handler(srv):
                         self._complete(body)
                 except BadRequest as e:
                     srv.count(requests_bad=1)
-                    self._bad(e, anth, rid)
+                    if self.head_sent:  # (a stream's status and part of its body are out: no second response in it)
+                        log(f"#{rid} 400 after the stream started: {e}; closing the connection")
+                        self.close_connection = True
+                    else:
+                        self._bad(e, anth, rid)
                 except (*DISCONNECTS, ClientGone) as e:
                     srv.count(requests_cancelled=1)
                     self.close_connection = True
@@ -281,11 +314,15 @@ def make_handler(srv):
                         log(f"#{rid} the client disconnected ({type(e).__name__})")
                 except Exception as e:  # engine failure: report it, keep serving
                     srv.count(requests_failed=1)
-                    log(f"#{rid} error:", repr(e))
-                    try:
-                        self._error(500, str(e), anth)
-                    except Exception:
-                        pass
+                    log(f"#{rid} error:", with_trace(e))
+                    if self.head_sent:  # (as above: the client sees the stream end without its last chunk)
+                        log(f"#{rid} the stream had started: closing the connection")
+                        self.close_connection = True
+                    else:
+                        try:
+                            self._error(500, str(e), anth)
+                        except Exception:
+                            pass
                 finally:
                     srv.request_done()
 
@@ -405,12 +442,22 @@ def make_handler(srv):
                 self.send_header("Transfer-Encoding", "chunked")
             self.end_headers()
 
+        STREAM_PIECE = 1 << 16  # (a stream's data goes out this much at a time: each piece has STREAM_WRITE_S)
+
         def _stream_send(self, data, last=False):
-            """one piece of an event stream's body (_stream_head's framing); last: then the end of the body"""
-            if self.request_version == "HTTP/1.0":
-                self.wfile.write(data)
-            else:
-                self.wfile.write(b"%x\r\n" % len(data) + data + (b"\r\n0\r\n\r\n" if last else b"\r\n"))
+            """one piece of an event stream's body (_stream_head's framing); last: then the end of the body. A write that
+            makes no progress for mk_limits.STREAM_WRITE_S times out (TimeoutError: the client is gone, as after a
+            reset), whatever MK_TIMEOUT_S is: that stays the limit of the connection's other reads and writes"""
+            if self.request_version != "HTTP/1.0":
+                data = b"%x\r\n" % len(data) + data + (b"\r\n0\r\n\r\n" if last else b"\r\n")
+            sock, view = self.connection, memoryview(data)
+            idle = sock.gettimeout()
+            sock.settimeout(mk_limits.STREAM_WRITE_S if idle is None else min(idle, mk_limits.STREAM_WRITE_S))
+            try:  # (a write's timeout counts from its start: a large one goes out in pieces, each one timed)
+                for i in range(0, len(view), self.STREAM_PIECE):
+                    self.wfile.write(view[i:i + self.STREAM_PIECE])
+            finally:
+                sock.settimeout(idle)
             self.wfile.flush()
 
         def _anthropic_stream(self, chat, model):
@@ -488,7 +535,7 @@ def make_handler(srv):
                 if not st["started"] or isinstance(e, (*DISCONNECTS, ClientGone)):
                     raise
                 bad = isinstance(e, BadRequest)
-                log(f"#{srv.rid} 400: {e}" if bad else f"#{srv.rid} error: {e!r}")
+                log(f"#{srv.rid} 400: {e}" if bad else f"#{srv.rid} error: {with_trace(e)}")
                 event("error", {"type": "error", "error": {"type": "invalid_request_error" if bad else "api_error",
                                                          "message": str(e)}}, last=True)
                 return
@@ -669,7 +716,7 @@ def make_handler(srv):
                 if not st["started"] or isinstance(e, (*DISCONNECTS, ClientGone)):
                     raise  # nothing sent yet: do_POST answers with a status (400 / 500)
                 bad = isinstance(e, BadRequest)
-                log(f"#{srv.rid} 400: {e}" if bad else f"#{srv.rid} error: {e!r}")
+                log(f"#{srv.rid} 400: {e}" if bad else f"#{srv.rid} error: {with_trace(e)}")
                 event({"type": "response.failed", "response": response("failed", error={
                     "code": "invalid_prompt" if bad else "server_error", "message": str(e)})}, last=True)
                 return
@@ -754,7 +801,7 @@ def make_handler(srv):
                     raise  # nothing sent yet: do_POST answers with a status (400 / 500)
                 # the status (200) and part of the reply are out: the error is the stream's last event, OpenAI style
                 bad = isinstance(e, BadRequest)
-                log(f"#{srv.rid} 400: {e}" if bad else f"#{srv.rid} error: {e!r}")
+                log(f"#{srv.rid} 400: {e}" if bad else f"#{srv.rid} error: {with_trace(e)}")
                 err = {"message": str(e), "type": "invalid_request_error" if bad else "server_error", "code": 400 if bad else 500}
                 send(b"data: " + json.dumps({"error": err}, ensure_ascii=False).encode() + b"\n\n")
                 send(b"data: [DONE]\n\n", last=True)

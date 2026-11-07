@@ -396,6 +396,106 @@ class ConnectionTests(_GateCase):
         self.assertEqual(eng.cycles, c1, "still generating after the write timed out")
         self.assertEqual(http_.post({"messages": [{"role": "user", "content": "next"}], "max_tokens": 4})[0], 200)
 
+    def test_connections_send_without_waiting_for_acks(self) -> None:
+        # (TCP_NODELAY: a stream's ~150-byte events every few ms, held by Nagle for the client's delayed ACK over a LAN)
+        _, http_ = self.serve(base._ScriptEngine(["ok"]))
+        seen, real = [], self.mk.GatedHandler.setup
+
+        def setup(h):
+            real(h)
+            seen.append(h.connection.getsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY))
+        with mock.patch.object(self.mk.GatedHandler, "setup", setup):
+            self.assertEqual(http_.post({"messages": [{"role": "user", "content": "hi"}], "max_tokens": 2})[0], 200)
+        self.assertEqual(len(seen), 1)
+        self.assertTrue(seen[0])
+        if hasattr(socket, "AF_UNIX"):  # (a socket that is not TCP: set up all the same)
+            a, b = socket.socketpair(socket.AF_UNIX)
+            with a, b:
+                h = object.__new__(self.mk.GatedHandler)
+                h.request = a
+                h.setup()
+                h.rfile.close()
+                h.wfile.close()
+
+    def test_a_stream_its_client_stopped_reading_ends_after_the_write_timeout(self) -> None:
+        # (no MK_TIMEOUT_S here, the tests' handler has none: before, the stalled write held the engine forever)
+        eng = base._ScriptEngine(["y" * (1 << 18)] * 400)  # (100 MB of events: the socket buffers fill)
+        srv, http_ = self.serve(eng, 1024)
+        self.assertEqual(self.mk.STREAM_WRITE_S, 60)
+        body = {"messages": [{"role": "user", "content": "long"}], "stream": True}
+        with mock.patch.object(self.mk, "STREAM_WRITE_S", 0.5):
+            s = socket.socket()
+            self.addCleanup(s.close)
+            s.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 4096)
+            s.connect(("127.0.0.1", http_.port))
+            s.sendall(base._request(body))  # (and nothing read)
+            t0 = time.monotonic()
+            while srv.counters()["requests_cancelled"] == 0:
+                self.assertLess(time.monotonic() - t0, 20, "the stalled stream still holds the engine")
+                time.sleep(0.05)
+            self.assertLess(eng.cycles, 150, "it generated the whole reply")
+            self.assertEqual(http_.post({"messages": [{"role": "user", "content": "next"}], "max_tokens": 2})[0], 200)
+
+
+class SurrogateTests(_GateCase):
+    """a lone UTF-16 surrogate in a request body (json.loads takes a \\udcff escape; JS clients send one when they cut a
+    string inside a pair) is text with no UTF-8 form, on which the tokenizer and a stream's events fail: a 400 in the
+    route's error shape before anything runs. An error once a stream's headers are out closes the connection instead of
+    writing a second response into the stream's body."""
+
+    def post(self, http_, path, body):
+        data = body if isinstance(body, bytes) else json.dumps(body).encode()  # (json.dumps escapes it: \udcff)
+        st, _, out = self.ask(http_, "POST", path, [("Content-Type", "application/json")], data)
+        return st, out
+
+    def test_a_lone_surrogate_is_a_400_on_every_route(self) -> None:
+        srv, http_ = self.serve(base._ScriptEngine(["ok"]))
+        lone, hi = [{"role": "user", "content": "\udcff"}], [{"role": "user", "content": "hi"}]
+        cases = [("/v1/chat/completions", {"messages": lone}, "openai"),
+                 ("/v1/chat/completions", {"messages": lone, "stream": True}, "openai"),
+                 ("/v1/chat/completions", {"messages": hi, "user": "\ud800x"}, "openai"),
+                 ("/v1/chat/completions", {"messages": hi, "metadata": {"\udcff": 1}}, "openai"),  # (a key)
+                 ("/v1/chat/completions", b'{"messages": [{"role": "user", "content": "\xed\xb3\xbf"}]}', "openai"),
+                 ("/tokenize", {"content": "a\udcff"}, "openai"),
+                 ("/v1/messages", {"model": "m", "max_tokens": 4, "messages": lone}, "anthropic"),
+                 ("/v1/messages", {"model": "\udcff", "max_tokens": 4, "stream": True, "messages": hi}, "anthropic"),
+                 ("/v1/messages/count_tokens", {"messages": lone}, "anthropic"),
+                 ("/v1/responses", {"input": "hi", "stream": True, "max_output_tokens": 3, "metadata": {"k": "\udcff"}},
+                  "responses"),
+                 ("/v1/responses/input_tokens", {"input": "\udfff"}, "responses")]
+        for path, body, shape in cases:
+            st, out = self.post(http_, path, body)
+            self.assertEqual(st, 400, (path, out[:200]))
+            o = json.loads(out)
+            err = o["error"]
+            self.assertIn("lone UTF-16 surrogate", err["message"], path)
+            if shape == "anthropic":
+                self.assertEqual((o["type"], err["type"]), ("error", "invalid_request_error"))
+            elif shape == "responses":
+                self.assertEqual((err["type"], err["code"], err["param"]), ("invalid_request_error", None, None))
+            else:
+                self.assertEqual((err["type"], err["code"]), ("invalid_request_error", 400))
+        self.assertEqual(srv.eng.calls, [])
+        # a pair (an emoji, as json.dumps escapes it) is one character; an escaped backslash before "udcff" is text
+        for content in ("\U0001F600", "\\udcff"):
+            st, out = self.post(http_, "/v1/chat/completions", {"messages": [{"role": "user", "content": content}],
+                                                                "max_tokens": 2})
+            self.assertEqual(st, 200, (content, out[:200]))
+
+    def test_an_error_after_a_stream_started_closes_the_connection(self) -> None:
+        # (the check above off: a Responses stream echoes metadata in response.created, which then failed to encode, and
+        # so did response.failed: the 500 went out inside the open chunked body)
+        srv, http_ = self.serve(base._ScriptEngine(["ok"]))
+        body = {"input": "hi", "stream": True, "max_output_tokens": 3, "metadata": {"k": "\udcff"}}
+        req = base._request(body).replace(b"/v1/chat/completions", b"/v1/responses")
+        with mock.patch.object(self.mk, "lone_surrogate", lambda raw, body: False):
+            raw = http_.raw(req, timeout=10)
+        self.assertTrue(raw.startswith(b"HTTP/1.1 200"), raw[:300])
+        self.assertEqual(raw.count(b"HTTP/1.1 "), 1, raw[:600])
+        self.assertFalse(raw.endswith(b"0\r\n\r\n"))  # (no last chunk: the client sees the stream cut off)
+        self.assertEqual(srv.counters()["requests_failed"], 1)
+        self.assertEqual(http_.post({"messages": [{"role": "user", "content": "hi"}], "max_tokens": 2})[0], 200)
+
 
 class RequestLimitTests(_GateCase):
     """what connections can hold: the bytes of bodies in memory, how long a request may take to arrive, how many"""
@@ -556,6 +656,38 @@ class RequestLimitTests(_GateCase):
         self.assertEqual((limits["max_inflight_mb"], limits["max_connections"], limits["request_timeout_s"]),
                          (self.mk.MAX_INFLIGHT_MB, self.mk.MAX_CONNECTIONS, self.mk.REQUEST_TIMEOUT_S))
 
+    def test_props_with_a_setting_that_is_no_integer(self) -> None:
+        # (main() checks MK_IMAGE_MAX_PIXELS only with --mmproj: without, every /props was a 500)
+        srv, http_ = self.serve(base._ScriptEngine(["ok"]))
+        err = io.StringIO()
+        with mock.patch.dict(os.environ, {"MK_IMAGE_MAX_PIXELS": "lots", "MK_CK_SLOTS": "8x"}), \
+                mock.patch.object(sys, "stderr", err), mock.patch.object(self.mk, "CON", self.mk.Console()):
+            for _ in range(2):
+                c = http.client.HTTPConnection("127.0.0.1", http_.port, timeout=10)
+                c.request("GET", "/props")
+                r = c.getresponse()
+                body = r.read()
+                c.close()
+                self.assertEqual(r.status, 200, body[:300])
+        eng = json.loads(body)["engine"]
+        self.assertEqual((eng["limits"]["image_max_pixels"], eng["checkpoints"]["slots"]), (self.mk.IMAGE_MAX_PIXELS, 8))
+        self.assertEqual(err.getvalue().count("MK_IMAGE_MAX_PIXELS='lots' is not an integer"), 1)  # (once)
+        with mock.patch.dict(os.environ, {"MK_IMAGE_MAX_PIXELS": "5000", "MK_CK_SLOTS": ""}):  # (as they are; unset)
+            eng = srv.engine_info()
+        self.assertEqual((eng["limits"]["image_max_pixels"], eng["checkpoints"]["slots"]), (5000, 8))
+
+    def test_a_500_is_logged_with_its_traceback(self) -> None:
+        srv, http_ = self.serve(base._ScriptEngine(["a"] * 40, fail_at=1))
+        body = {"messages": [{"role": "user", "content": "hi"}], "max_tokens": 30}
+        err = io.StringIO()
+        with mock.patch.object(sys, "stderr", err), mock.patch.object(self.mk, "CON", self.mk.Console()):
+            self.assertEqual(http_.post(body)[0], 500)
+            srv.eng.fail_at = srv.eng.cycles + 1  # (and once a stream has started: its error event)
+            self.assertIn(b"no finite logit", http_.raw(base._request({**body, "stream": True}), until=b"0\r\n\r\n"))
+        log = err.getvalue()
+        self.assertEqual(log.count("Traceback (most recent call last)"), 2, log)
+        self.assertEqual(log.count("RuntimeError: decode: no finite logit (test)"), 2, log)
+
 
 class BadFieldTests(_GateCase):
     """fields that used to end in a 500 with a Python exception's text, or in another meaning: a 400, the engine not called"""
@@ -601,15 +733,60 @@ class BadFieldTests(_GateCase):
             self.refused(f'{{"messages": [{{"role": "user", "content": "go"}}, {{"role": "assistant", "content": "", '
                          f'"tool_calls": {calls}}}]}}', b"tool_calls")
 
+    def test_tool_schemas_are_checked_before_the_prompt_runs(self) -> None:
+        # (the reply's tool-call parser read them only after the prefill: a 500 that had spent it, and parked the live
+        # conversation for it)
+        for tools in ('["x"]', '[null]', '[{"type": "function", "function": "f"}]', '[{"type": "function", "function": null}]',
+                      '[{"type": "function", "function": {"name": "t", "parameters": "oops"}}]',
+                      '[{"type": "function", "function": {"name": "t", "parameters": [1]}}]',
+                      '[{"type": "function", "function": {"name": ["x"]}}]', '[{"type": "function", "function": {"name": ""}}]',
+                      '[{"type": "function", "function": {"description": "no name"}}]'):
+            for stream in ("false", "true"):
+                self.refused(f'{{{self.MSG}, "stream": {stream}, "tools": {tools}}}', b"tools")
+        h = [("Content-Type", "application/json")]
+        msgs = [{"role": "user", "content": "hi"}]
+        st, _, out = self.ask(self.http_, "POST", "/v1/messages", h, json.dumps(
+            {"max_tokens": 4, "messages": msgs, "tools": [{"name": "t", "input_schema": "oops"}]}).encode())
+        self.assertEqual((st, json.loads(out)["type"]), (400, "error"))
+        self.assertIn(b"input_schema", out)
+        self.assertEqual(self.srv.eng.calls, [])
+        # every shape the three APIs take still runs
+        chat = [{"type": "function", "function": {"name": "a", "parameters": {"type": "object", "properties": {"p": {}}}}},
+                {"type": "function", "function": {"name": "b"}}, {"type": "function", "function": {"name": "c", "parameters": None}},
+                {"type": "function", "name": "flat", "parameters": {"type": "object"}}]
+        anthropic = [{"name": "read", "input_schema": {"type": "object", "properties": {"path": {"type": "string"}}}},
+                     {"name": "none"}, {"type": "bash_20250124", "name": "bash"},
+                     {"type": "web_search_20250305", "name": "web_search", "max_uses": 5}]
+        responses = [{"type": "function", "name": "f", "parameters": {"type": "object"}}, {"type": "function", "name": "g"},
+                     {"type": "namespace", "name": "ns", "tools": [{"type": "function", "name": "h", "parameters": None}]},
+                     {"type": "custom", "name": "apply_patch", "format": {"type": "grammar", "definition": "x"}},
+                     {"type": "web_search"}]
+        for path, body in (("/v1/chat/completions", {"messages": msgs, "tools": chat}),
+                           ("/v1/messages", {"messages": msgs, "tools": anthropic}),
+                           ("/v1/responses", {"input": "hi", "tools": responses})):
+            for stream in (False, True):
+                st, _, out = self.ask(self.http_, "POST", path, h, json.dumps({**body, "max_tokens": 2, "max_output_tokens": 2,
+                                                                              "stream": stream}).encode())
+                self.assertEqual(st, 200, (path, stream, out[:300]))
+
     def test_chat_template_kwargs_of_the_wrong_type(self) -> None:
         for v in ('"x"', '5', 'true', '["x"]', '[1]', '1.5'):
             self.refused(f'{{{self.MSG}, "chat_template_kwargs": {v}}}', b"chat_template_kwargs")
 
     def test_tool_call_arguments_json_cannot_parse(self) -> None:
-        for args in ("not json", "1" * 5000, "[" * 100000 + "]" * 100000):
+        def norm(args):
             call = {"id": "c", "type": "function", "function": {"name": "f", "arguments": args}}
-            out = self.mk.normalize_messages([{"role": "assistant", "content": "", "tool_calls": [call]}])
-            self.assertEqual(out[0]["tool_calls"][0]["function"]["arguments"], {}, args[:20])
+            notes = []
+            out = self.mk.normalize_messages([{"role": "assistant", "content": "", "tool_calls": [call]}], None, notes)
+            return out[0]["tool_calls"][0]["function"]["arguments"], [k for k, _ in notes]
+        for args in ("not json", "1" * 5000, "[" * 100000 + "]" * 100000, "[1]", "5", 5, ["x"]):
+            self.assertEqual(norm(args), ({}, ["tool-call-arguments"]), str(args)[:20])  # (a one-time warning)
+        for args, want in (("", {}), ("  ", {}), (None, {}), ('{"a": 1}', {"a": 1}), ({"a": 1}, {"a": 1})):
+            self.assertEqual(norm(args), (want, []), args)  # (no arguments, or an object: nothing to say)
+        call = {"id": "c", "type": "function", "function": {"name": "f", "arguments": "{oops"}}
+        self.srv.render({"messages": [{"role": "user", "content": "go"}, {"role": "assistant", "content": "",
+                                                                         "tool_calls": [call]}]})
+        self.assertIn("tool-call-arguments", self.srv.warned)
 
 
 class ConsoleInputTests(_GateCase):
@@ -893,6 +1070,24 @@ class EngineTokenizeTests(unittest.TestCase):
         self.assertEqual(len(e.tokenize("a" * 4000)), 1000)
         self.assertEqual(len(e.tokenize("a" * (8 << 20))), 2 << 20)  # (8 MiB of text: not a 32 MiB first buffer)
         self.assertEqual(caps, [4016, 1 << 20, 2 << 20])
+
+    def test_a_piece_longer_than_the_first_buffer_is_read_again(self) -> None:
+        # (it was cached empty: a token whose text passes 256 bytes would never be emitted)
+        e, _ = self.engine()
+        e._pieces = {}
+        texts, caps = {1: b"x" * 1000, 2: b"ab"}, []
+
+        def piece(h, t, buf, cap):
+            caps.append(cap)
+            if t not in texts:
+                return -2 ** 31  # (an id outside the vocabulary)
+            if cap < len(texts[t]):
+                return -len(texts[t])
+            buf[:len(texts[t])] = texts[t]
+            return len(texts[t])
+        e.L.mk_piece = piece
+        self.assertEqual([e.piece(1), e.piece(1), e.piece(2), e.piece(3)], [texts[1], texts[1], b"ab", b""])
+        self.assertEqual(caps, [256, 1000, 256, 256])  # (cached after the first time)
 
 
 # === video frame size before the pixel limit ===

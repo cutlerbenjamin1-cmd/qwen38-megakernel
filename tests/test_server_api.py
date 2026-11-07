@@ -4,13 +4,16 @@ shapes, the official SDKs' stream accumulators when installed), Anthropic typed 
 overflow error, reasoning format and template defaults, llama-server's extra request fields, chunked request bodies."""
 import base64
 import http.client
+import io
 import json
 import socket
+import sys
 import time
 import unittest
+from unittest import mock
 
-from test_mk_server import (CALL, TEMPLATE, TOOLS, _FakeVisionLib, _HttpCase, _ScriptEngine, _load_mk_server, _request, _sse,
-                            _sse_events)
+from test_mk_server import (CALL, ROOT, TEMPLATE, TOOLS, _FakeVisionLib, _HttpCase, _ScriptEngine, _load_mk_server, _request,
+                            _sse, _sse_events)
 
 WRITE = [{"type": "function", "function": {"name": "write", "parameters": {"type": "object", "properties": {
     "path": {"type": "string"}, "content": {"type": "string"}, "mode": {"type": "integer"}, "opts": {"type": "object"}}}}}]
@@ -168,6 +171,25 @@ class ToolCallStreamTests(_HttpCase):
         self.assertEqual(json.loads(calls[0]["function"]["arguments"]), {"content": doc})
         self.assertEqual(calls[0]["function"], whole["message"]["tool_calls"][0]["function"])
 
+    def test_text_after_a_call_is_dropped_and_logged(self) -> None:
+        # (Qwen's template tells the model not to write after a call; when it does, the reply carries the calls only)
+        text = ("Before.\n\n" + _call("write", path="a") + "\nbetween\n" + _call("write", path="b") + "\n\nAfter the call.\n")
+        for n in (1, 3, 8):
+            p = self.mk.OutputParser(False, WRITE)
+            for piece in _pieces(text, n):
+                p.feed(piece)
+            p.feed("", final=True)
+            self.assertEqual((len(p.calls), p.stray(), p.unparsed()), (2, ["between", "After the call."], ""), n)
+        cut = self.mk.OutputParser(False, WRITE)  # (markup after the calls is the reply's text, not dropped)
+        cut.feed(_call("write", path="a") + "\n<tool_call>\n<function=write>\n<parameter=path>\nx", final=True)
+        self.assertEqual((cut.stray(), cut.unparsed()[:11]), ([], "<tool_call>"))
+        self.assertEqual(self.mk.OutputParser(False, []).stray(), [])
+        err = io.StringIO()
+        with mock.patch.object(sys, "stderr", err), mock.patch.object(self.mk, "CON", self.mk.Console()):
+            whole, _, tcs, content, finish = self._openai(_pieces(text), {})
+        self.assertEqual((whole["message"]["content"], content, finish, len(tcs) > 2), ("Before.", "Before.", "tool_calls", True))
+        self.assertEqual(err.getvalue().count("dropped 22 chars of text the model wrote between or after its tool calls"), 2)
+
     def test_anthropic_stream(self) -> None:
         text = "Let me write.\n\n" + _call("write", path="/x", content="q" * 40, mode=1) + "\n" + _call("write", path="/y")
         tools = [{"name": "write", "input_schema": WRITE[0]["function"]["parameters"]}]
@@ -246,6 +268,26 @@ class AnthropicBlockTests(_HttpCase):
             "anthropic-block-container_upload", "anthropic-block-search_result", "anthropic-block-server_tool_use",
             "anthropic-block-web_search_tool_result", "anthropic-doc-base64"])
 
+    def test_a_prefill_and_fields_the_server_ignores_are_warnings(self) -> None:
+        # (accepted, as before: Claude Code sends some of these fields; never silent)
+        body = {"max_tokens": 5, "messages": [{"role": "user", "content": "Q"}, {"role": "assistant", "content": "{"}],
+                "output_format": {"type": "json_schema", "schema": {"type": "object"}}, "output_config": {"effort": "high"},
+                "context_management": {"edits": [{"type": "clear_thinking_20251015"}]}, "container": "c1",
+                "metadata": {"user_id": "u"}, "service_tier": "auto"}
+        want = {"anthropic-prefill", "anthropic-field-output_format", "anthropic-field-output_config",
+                "anthropic-field-context_management", "anthropic-field-container"}
+        notes = []
+        self.mk.anthropic_to_chat(body, notes)
+        self.assertEqual({k for k, _ in notes}, want)
+        notes = []
+        self.mk.anthropic_to_chat({"messages": body["messages"][:1], "metadata": {"user_id": "u"}}, notes)
+        self.assertEqual(notes, [])
+        srv, http_ = self.serve(_ScriptEngine(["ok"]))
+        for path in ("/v1/messages", "/v1/messages/count_tokens"):
+            status, data = _post(http_.port, path, body)
+            self.assertEqual(status, 200, data)
+        self.assertTrue(want <= srv.warned)
+
     def test_system_messages_inside_the_conversation(self) -> None:
         # (Claude Code 2.1 sends its reminders as a system message after the first user message)
         body = {"system": [{"type": "text", "text": "S"}], "messages": [
@@ -299,6 +341,45 @@ def _post(port, path, body, headers=None):
     data = r.read()
     c.close()
     return r.status, data
+
+
+class TextPartTests(_HttpCase):
+    """text-only part lists (Claude Code's text blocks, Codex's input_text parts, AI-SDK clients' text parts) are joined
+    by newlines, as with images and as llama-server joins them: never run together; the count routes count that prompt"""
+
+    PARTS = [{"type": "text", "text": "<system-reminder>r</system-reminder>"}, {"type": "text", "text": "do it"}]
+    JOINED = "<|im_start|>user\n<system-reminder>r</system-reminder>\ndo it<|im_end|>"
+
+    def fed(self, srv):
+        """the prompt the engine got (the test tokenizer: one token per character)"""
+        n = next(c[2] for c in srv.eng.calls if c[0] == "prefill")
+        return "".join(map(chr, srv.eng.seq[:n]))
+
+    def check(self, path, count_path, body):
+        srv, http_ = self.serve(_ScriptEngine(["ok"]))
+        status, data = _post(http_.port, path, body)
+        self.assertEqual(status, 200, data)
+        prompt = self.fed(srv)
+        self.assertIn(self.JOINED, prompt)
+        status, data = _post(http_.port, count_path, body)
+        self.assertEqual((status, json.loads(data)["input_tokens"]), (200, len(prompt)))
+        return srv, http_, prompt
+
+    def test_openai_text_parts(self) -> None:
+        body = {"messages": [{"role": "user", "content": self.PARTS}], "max_tokens": 2}
+        srv, http_, prompt = self.check("/v1/chat/completions", "/v1/chat/completions/input_tokens", body)
+        self.assertEqual(json.loads(_post(http_.port, "/apply-template", body)[1])["prompt"], prompt)
+        srv.template = self.mk.make_template((ROOT / "tests" / "templates" / "qwen38_unsloth.jinja").read_text(encoding="utf-8"))
+        self.assertIn(self.JOINED, srv.render(body)[0])  # (Qwen3.8's template too: it would run a list's parts together)
+
+    def test_anthropic_text_blocks(self) -> None:
+        self.check("/v1/messages", "/v1/messages/count_tokens",
+                   {"model": "m", "max_tokens": 2, "messages": [{"role": "user", "content": self.PARTS}]})
+
+    def test_responses_input_text_parts(self) -> None:
+        parts = [{"type": "input_text", "text": p["text"]} for p in self.PARTS]
+        self.check("/v1/responses", "/v1/responses/input_tokens",
+                   {"max_output_tokens": 2, "input": [{"type": "message", "role": "user", "content": parts}]})
 
 
 class ContextOverflowTests(_HttpCase):

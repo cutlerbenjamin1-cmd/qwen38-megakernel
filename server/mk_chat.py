@@ -11,11 +11,13 @@ from mk_media import VIDEO_PARTS, image_bytes, video_bytes
 MEDIA_MARKER = "<__media__>"  # llama-server's (mtmd_default_marker)
 
 
-def normalize_messages(messages, media=None):
+def normalize_messages(messages, media=None, notes=None):
     """media (a list: the server has a vision encoder): image_url parts and video parts (input_video / video_url)
-    become MEDIA_MARKER and their file bytes are appended to media in order (videos as VideoBytes). A message with
-    media is flattened to one string as llama-server does (text parts joined by newlines, no newline next to an image
-    or video), so the prompt around each is llama-server's."""
+    become MEDIA_MARKER and their file bytes are appended to media in order (videos as VideoBytes). A part list is
+    flattened to one string as llama-server does (text parts joined by newlines, no newline next to an image or
+    video), so the prompt around each is llama-server's; text parts are not run together. notes: gets (key, message)
+    for what was converted (the console's one-time warnings)"""
+    notes = [] if notes is None else notes
     out = []
     for m in messages:
         if not isinstance(m, dict):
@@ -30,27 +32,26 @@ def normalize_messages(messages, media=None):
                     raise BadRequest(f"unsupported content part type {part.get('type')!r} (text, image_url, "
                                      f"input_video and video_url only)")
             kinds = {p.get("type") for p in content}
-            if kinds & {"image_url", *VIDEO_PARTS}:
-                if media is None:
-                    what = "image" if "image_url" in kinds else "video"
-                    raise BadRequest(f"{what} input is not supported: start the server with --mmproj")
-                text, after_media = "", False
-                for part in content:
-                    if part.get("type") in VIDEO_PARTS:
-                        media.append(video_bytes(part))
-                        text += MEDIA_MARKER
-                        after_media = True
-                    elif part.get("type") == "image_url":
-                        iu = part.get("image_url")
-                        media.append(image_bytes(iu.get("url") if isinstance(iu, dict) else iu))
-                        text += MEDIA_MARKER
-                        after_media = True
-                    else:
-                        if not after_media and text:
-                            text += "\n"
-                        text += str(part.get("text") or "")
-                        after_media = False
-                m["content"] = text
+            if kinds & {"image_url", *VIDEO_PARTS} and media is None:
+                what = "image" if "image_url" in kinds else "video"
+                raise BadRequest(f"{what} input is not supported: start the server with --mmproj")
+            text, after_media = "", False
+            for part in content:
+                if part.get("type") in VIDEO_PARTS:
+                    media.append(video_bytes(part))
+                    text += MEDIA_MARKER
+                    after_media = True
+                elif part.get("type") == "image_url":
+                    iu = part.get("image_url")
+                    media.append(image_bytes(iu.get("url") if isinstance(iu, dict) else iu))
+                    text += MEDIA_MARKER
+                    after_media = True
+                else:
+                    if not after_media and text:
+                        text += "\n"
+                    text += str(part.get("text") or "")
+                    after_media = False
+            m["content"] = text
         if content is None:
             m["content"] = ""
         if m.get("role") == "assistant" and m.get("tool_calls"):
@@ -62,12 +63,15 @@ def normalize_messages(messages, media=None):
                     raise BadRequest("messages: each of tool_calls must be an object, with an object as its function")
                 tc = dict(tc)
                 fn = dict(tc.get("function") or {})
-                args = fn.get("arguments")
+                args = given = fn.get("arguments")
                 if isinstance(args, str):
                     try:
                         args = json.loads(args) if args.strip() else {}
                     except (ValueError, RecursionError):  # (not JSON, an integer past the digit limit, nested too deep)
-                        args = {}
+                        args = None
+                if not isinstance(args, dict) and given is not None:
+                    notes.append(("tool-call-arguments", f"a tool call's arguments in a request's history are not a JSON "
+                                  f"object ({str(given)[:40]!r}...): the call is rendered without arguments"))
                 fn["arguments"] = args if isinstance(args, dict) else {}
                 tc["function"] = fn
                 calls.append(tc)
@@ -108,6 +112,7 @@ class ToolCallParser:
         self.events, self.one = events, one
         self.text, self.pos, self.state = "", 0, "seek"
         self.calls = []
+        self.spans = []  # (start, end) of each complete call in text
         self.end = 0  # where the last complete call ends in text
         self.started = 0  # calls started in the stream
         self.open = []  # where the calls started in the stream that did not complete begin
@@ -133,6 +138,17 @@ class ToolCallParser:
             return ""
         cut = min((s for s in self.open if s >= u), default=len(self.text)) if streamed else len(self.text)
         return self.text[u:cut]
+
+    def stray(self):
+        """the text no reply carries: what lies outside the complete calls before the unparsed markup (between the calls,
+        after the last one), whitespace-only stretches aside"""
+        u = self.text.find(TOOL_OPEN, self.end)
+        bits, pos = [], 0
+        for s, e in self.spans:
+            bits.append(self.text[pos:s])
+            pos = e
+        bits.append(self.text[pos:u if u >= 0 else len(self.text)])
+        return [b.strip() for b in bits if b.strip()]
 
     def _seek(self, final, out):
         i = self.text.find(TOOL_OPEN, self.pos)
@@ -183,6 +199,7 @@ class ToolCallParser:
                 self._arg("}" if c["n"] else "{}", out)
                 self.calls.append({"id": c["id"], "type": "function", "function": {
                     "name": c["name"], "arguments": json.dumps(c["args"], ensure_ascii=False)}})
+                self.spans.append((c["start"], m.end()))
                 self.cur, self.end, self.pos, self.state = None, m.end(), m.end(), "seek"
                 return True
             k = SPACE_RE.match(t, j + 11).end()
@@ -414,6 +431,15 @@ def check_params(body):
                            "sampling, which the megakernel does not have")
     if body.get("tools") is not None and not isinstance(body["tools"], list):
         bad("tools", "an array of tools")
+    for t in body.get("tools") or []:  # (as ToolCallParser reads them: a function object, or the tool itself)
+        fn = t.get("function", t) if isinstance(t, dict) else None
+        if not isinstance(fn, dict):
+            bad("tools", f"each tool must be an object with an object as its function, not {str(t)[:80]!r}")
+        if not isinstance(fn.get("name"), str) or not fn["name"]:
+            bad("tools", f"each tool's function needs a name (a non-empty string), not {str(fn.get('name'))[:80]!r}")
+        if fn.get("parameters") is not None and not isinstance(fn["parameters"], dict):
+            bad("tools", f"{fn['name'][:80]}: parameters must be an object (a JSON Schema), not "
+                         f"{str(fn['parameters'])[:80]!r}")
     if body.get("functions") or body.get("function_call"):
         bad("functions", "the legacy function-calling fields are not supported: use tools")
     if body.get("ignore_eos"):
@@ -583,3 +609,7 @@ class OutputParser:
         a call the stream started (its client has it as a call whose arguments never became valid JSON)"""
         rest = self.tc.unparsed(streamed) if self.tc else ""
         return (self.tool_sep if self.content_seen else "") + rest if rest else ""
+
+    def stray(self):
+        """the text between or after the tool calls that no reply carries (ToolCallParser.stray)"""
+        return self.tc.stray() if self.tc else []
