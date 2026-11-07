@@ -13,6 +13,14 @@ from mk_errors import BadRequest
 # Claude Code's system prompt starts with a billing header whose cch= value changes on every request: normalized (as
 # llama-server does), or the prompt would differ from its first tokens on and no prefix could be reused
 BILLING_RE = re.compile(r"^(x-anthropic-billing-header:.*?cch=)[^;\s]{5};")
+# Anthropic request fields the server does not act on: accepted (clients send some on every request), each a one-time
+# console warning
+IGNORED_FIELDS = {
+    "output_format": "structured output needs constrained sampling, which the megakernel does not have: the reply is "
+                     "not held to the format",
+    "output_config": "its settings (effort, format) are not applied",
+    "context_management": "context editing is not done: the conversation is rendered as sent",
+    "container": "the server runs no code-execution container"}
 
 
 def _anthropic_image(src):
@@ -151,6 +159,12 @@ def anthropic_to_chat(body, notes=None, mid_system=True):
             if thinking:
                 nm["reasoning_content"] = thinking
             msgs.append(nm)
+    if body["messages"] and body["messages"][-1]["role"] == "assistant":
+        notes.append(("anthropic-prefill", "an Anthropic request that ends with an assistant message (a prefill) is not "
+                      "continued: the message is rendered as a finished turn and the reply starts a new one"))
+    for k, why in IGNORED_FIELDS.items():
+        if body.get(k) is not None:
+            notes.append((f"anthropic-field-{k}", f"Anthropic field {k!r} is ignored: {why}"))
     if not mid_system:  # (Claude Code sends its environment and skills list as a system message after the first one)
         for i, m in enumerate(msgs):
             if i and m["role"] == "system":

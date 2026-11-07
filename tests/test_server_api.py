@@ -268,6 +268,26 @@ class AnthropicBlockTests(_HttpCase):
             "anthropic-block-container_upload", "anthropic-block-search_result", "anthropic-block-server_tool_use",
             "anthropic-block-web_search_tool_result", "anthropic-doc-base64"])
 
+    def test_a_prefill_and_fields_the_server_ignores_are_warnings(self) -> None:
+        # (accepted, as before: Claude Code sends some of these fields; never silent)
+        body = {"max_tokens": 5, "messages": [{"role": "user", "content": "Q"}, {"role": "assistant", "content": "{"}],
+                "output_format": {"type": "json_schema", "schema": {"type": "object"}}, "output_config": {"effort": "high"},
+                "context_management": {"edits": [{"type": "clear_thinking_20251015"}]}, "container": "c1",
+                "metadata": {"user_id": "u"}, "service_tier": "auto"}
+        want = {"anthropic-prefill", "anthropic-field-output_format", "anthropic-field-output_config",
+                "anthropic-field-context_management", "anthropic-field-container"}
+        notes = []
+        self.mk.anthropic_to_chat(body, notes)
+        self.assertEqual({k for k, _ in notes}, want)
+        notes = []
+        self.mk.anthropic_to_chat({"messages": body["messages"][:1], "metadata": {"user_id": "u"}}, notes)
+        self.assertEqual(notes, [])
+        srv, http_ = self.serve(_ScriptEngine(["ok"]))
+        for path in ("/v1/messages", "/v1/messages/count_tokens"):
+            status, data = _post(http_.port, path, body)
+            self.assertEqual(status, 200, data)
+        self.assertTrue(want <= srv.warned)
+
     def test_system_messages_inside_the_conversation(self) -> None:
         # (Claude Code 2.1 sends its reminders as a system message after the first user message)
         body = {"system": [{"type": "text", "text": "S"}], "messages": [
