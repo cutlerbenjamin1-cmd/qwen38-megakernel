@@ -33,10 +33,12 @@ build, and its support for the low-bit KV presets is on the list.
   full 262,144 tokens on a 24 GB card).
 - **When a cycle takes the deep pass:** only when the MTP head's own probabilities expect at least 3 of the drafts past
   the 7th to be accepted (`MK_POLICY` key `tier`, [CONFIGURATION.md](CONFIGURATION.md#mk_policy-keys); `tier=0` drops
-  this condition) and its 16 positions lie in one attention partition, as the 8-row pass's 8 must; other cycles verify
-  up to 8 tokens, as the default build does. Parallel slots (`--agents`) that decode together in one batched pass verify
-  at most 8 tokens each in either build; a slot that decodes alone (one busy agent, or `--agents 1`) steps as a single
-  sequence and can take the deep pass.
+  this condition; with sampled drafts the estimate uses only the probabilities up to the 8th draft's since 2e64a2c:
+  deciding on the later ones biased sampled output, and the change's speed is not measured yet) and its 16 positions
+  lie in one attention partition, as the 8-row pass's 8 must; other cycles verify up to 8 tokens, as the default build
+  does. Parallel slots (`--agents`) that decode together in one batched pass verify at most 8 tokens each in either
+  build; a slot that decodes alone (one busy agent, or `--agents 1`) steps as a single sequence and can take the deep
+  pass.
 - **Output:** the default build's. Greedy output at 0, 7 and 15 drafts, and a seeded sampled run, matched the default
   build's at 7 drafts on short prompts and on a 40.5k-token prompt (512 tokens), also with every cycle forced through
   the 16-row pass (2026-11-03). `MK_POLICY=stop=0,drop=0,droplast=0,tier=0 scripts/exactness.py -m <gguf> --depths

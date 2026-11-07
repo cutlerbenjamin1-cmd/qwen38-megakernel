@@ -165,8 +165,10 @@ error naming the field. A tensor's byte size always comes from its type and dime
 loader then reads every tensor by the shape it expects (`File::get(name, dims)`, `gguf::shape_is`): each matrix is
 exactly [K, N] (further dimensions 1), `token_embd` exactly [5120, 248320], the norms and vectors their exact sizes, so
 a file with the right names but a short or reshaped tensor is refused, naming it, instead of being read past its end.
-The values compiled into the kernel are checked too: a file whose `qwen35.rope.freq_base` or
-`qwen35.attention.layer_norm_rms_epsilon` differs is refused, naming the key (without the key: a warning).
+The values compiled into the kernel are checked too: a file whose `qwen35.rope.freq_base`,
+`qwen35.attention.layer_norm_rms_epsilon`, `qwen35.rope.dimension_count` (64), `qwen35.rope.dimension_sections`
+([11, 11, 10, 0]: the image M-RoPE split) or `qwen35.full_attention_interval` (4) differs is refused, naming the key
+(without the key: a warning).
 `tests/gguf_fuzz.cpp` (`make tests/gguf_fuzz`) feeds it malformed and randomly corrupted files (size and offset lies
 included) under AddressSanitizer / UBSan, reads every byte of every tensor of the files that parse and tries the
 shape-checked reads; UD-Q4_K_XL, UD-Q4_K_M and Q4_K_M pass every check. The vision projector (mmproj) is read through
@@ -240,7 +242,10 @@ engine calls behind each feature under
   its pinned ones) and `unpark` makes the live engine that sequence again, bit for bit. `side_begin` / `side_end`
   keep the live sequence aside while a short request runs from position 0: the recurrent state is copied out at
   once, KV and window-ring rows only just before a launch would overwrite them (1024 rows at a time), and
-  everything is copied back afterwards.
+  everything is copied back afterwards. After `unpark` or `side_end` the sequence continues with a prefill, which
+  refeeds from the committed position and rebuilds what a decode reads but neither copies (the DeltaNet replay rows
+  of the last cycle's accepted drafts, the drafts' probabilities, the penalty counts); a `step` before it throws where
+  it would read them (`qwen38_mk.h`). The server always prefills.
 - **Keep-warm:** after each request `capi.cpp` runs a one-block, 32-thread polling kernel for `MK_KEEP_WARM_S`
   seconds, each launch ending itself after 50 ms, so the GPU's clocks are still up when the next request comes.
 
@@ -262,7 +267,8 @@ D', E and F: [CONFIGURATION.md](CONFIGURATION.md#kv-cache-presets); their accura
 
 A cache that takes more device memory than was free before it was allocated gets a warning at load, and the load goes
 on: a driver with the CUDA sysmem fallback (Windows, WSL2) puts the rest in system memory, read over PCIe and much
-slower. A smaller `-c`, a preset (`MK_KV`) or `--kv q8` fits.
+slower. Without the fallback (Linux) the allocation fails and the load stops with an error that names the cache's
+size, the free memory and what fits. A smaller `-c`, a preset (`MK_KV`) or `--kv q8` fits.
 
 Each layer's cache and the RoPE table hold 2 x MAXT rows (16, ~0.6 MB in all) past the
 context: with more than 5 drafts, the last cycles before "context full" write the MTP block's draft rows up to 4

@@ -165,7 +165,8 @@ what the driver keeps resident, and F stays inside it with the default prefill c
 - It needs the q8_0 cache: `--kv q8`, or `--kv auto`, which picks q8_0 whenever `MK_KV` is set; `--kv f16` refuses it.
 - `MK_KV_WIN=W` (only with a non-empty `MK_KV`) keeps every low-bit side's most recent W or more positions as q8_0 in
   a ring (sized in steps of 640 positions). With exact reuse, every checkpoint also holds the rings as of its position
-  in pinned host memory (preset D': +106 MiB per checkpoint slot).
+  in pinned host memory (preset D': +106 MiB per checkpoint slot), and a prefill chunk is at most the ring's length:
+  the engine lowers `MK_PF_CAP` to 1,280 for W up to 640 and to 1,920 up to 1,280 (the presets' 2,048 is not lowered).
 - With exact reuse on, a reused or restored conversation under a preset continues bit for bit as the same request sent
   fresh under that preset (`scripts/exactness.py` and the state digest of `scripts/capi_checks.py`, on q8_0, D and F).
 
@@ -257,7 +258,7 @@ limits in [SERVER.md](SERVER.md#limits).
 | `--allow-host NAME` | `MK_ALLOW_HOSTS` | none | host names clients may use besides localhost, IP addresses and `--host`'s (repeatable or comma-separated; `*` = any name, which turns the DNS-rebinding check off); other names get a 403 | - |
 | `--cors-origin`, `--cors-origins ORIGIN` | `MK_CORS_ORIGINS` | none | web origins (`scheme://host[:port]`) whose pages may call the server (CORS headers, preflights; `*` is refused); pages of other origins get a 403. Clients that are not web pages send no Origin and are not affected | - |
 | `--api-key KEY` | `MK_API_KEY` | none | every request but `/health` and CORS preflights must carry the key (`Authorization: Bearer KEY` or `x-api-key: KEY`); others get a 401 | - |
-| `-c`, `--ctx` | - | `32768` (launchers 120000); with `--agents` `0` (with `--parallel` 32768) | context in tokens, at most the model's full context of 262,144 (more: the engine refuses to start; a KV cache larger than the free device memory loads with a warning, [ENGINE.md](ENGINE.md#kv-cache)); with `--agents` each slot's, 0 = the most that fits | - |
+| `-c`, `--ctx` | - | `32768` (launchers 120000); with `--agents` `0` (with `--parallel` 32768) | context in tokens, at least 1 and at most the model's full context of 262,144 (else the engine refuses to start; a KV cache larger than the free device memory loads with a warning where the driver falls back to system memory, Windows and WSL2, and elsewhere stops the load with an error naming what fits: [ENGINE.md](ENGINE.md#kv-cache)); with `--agents` each slot's, 0 = the most that fits | - |
 | `-d`, `--draft` | - | `4` (launchers 7) | MTP drafts per cycle: 0-7, or 0-15 in a [deep-pass build](EXPERIMENTAL.md#the-deep-pass); more than 4 needs the q8_0 cache, more than 7 also no `MK_KV` | drafts only (8-15: [deep-pass build](EXPERIMENTAL.md#the-deep-pass)) |
 | `--draft-vocab` | - | `draft_vocab_32k.bin` in the repo | the draft head's vocabulary (the 32k most frequent tokens; tokens of the current conversation are added) | drafts only |
 | `--mtp FILE` | `MK_MTP` (engine) | the model file's MTP layer | the MTP draft layer from another GGUF of the same model (checked against it) | drafts only |
@@ -319,8 +320,8 @@ Read by the server only (there is no option for them):
 `MK_MAX_BODY_MB`, `MK_MAX_INFLIGHT_MB`, `MK_MAX_CONNECTIONS`, `MK_MAX_IMAGES`, `MK_MAX_VIDEO_FRAMES` and
 `MK_IMAGE_MAX_PIXELS` must be positive integers, the three `MK_PF_*` integers >= 0: anything else ends the server at
 startup with a message. `MK_SIDE_MAX`, `MK_PARK_MIB`, `MK_AGENTS`, `MK_TIMEOUT_S` and `MK_REQUEST_TIMEOUT_S` accept `0`
-(off). The server sets `MK_EXACT=1` for the engine when `--exact-reuse` is given, and with `--agents` sets `MK_EXACT=1`
-and `MK_PF_CAP=1024` unless they are set; it reports `MK_CK_SLOTS` in `/props`.
+(off). The server sets `MK_EXACT=1` for the engine when `--exact-reuse` is given, and with `--agents` sets `MK_EXACT=1`,
+`MK_PF_CAP=1024` and `MK_CK_SLOTS=1` unless they are set; it reports `MK_CK_SLOTS` in `/props`.
 llama-server's `LLAMA_ARG_*` variables are not read.
 
 ## Engine environment variables
@@ -335,7 +336,7 @@ on (even `0`). The measurement and test switches are in [their own section](#mea
 |---|---|---|---|---|
 | `MK_KV` | empty: q8_0 everywhere | per-layer K / V formats on top of the q8_0 cache ([presets, syntax](#kv-cache-presets)) | changes (lossy, KL-gated) | opt-in |
 | `MK_KV_WIN` | `0`: no window | with `MK_KV`: the most recent W positions of every low-bit side also kept as q8_0 in a ring | changes (closer to q8_0) | opt-in |
-| `MK_MTP_WIN` | `0`: off | the MTP layer's decode attention sees only the last N positions. Draft acceptance fell from 97% to 88-90% at 101.6k context for any window of 1k-16k, 5-7% fewer tok/s | drafts only | slower |
+| `MK_MTP_WIN` | `0`: off | the MTP layer's decode attention sees only the first 32 positions and the last N (up to N + 31: the window starts on a 32-position tile). Draft acceptance fell from 97% to 88-90% at 101.6k context for any window of 1k-16k, 5-7% fewer tok/s | drafts only | slower |
 
 ### Exact reuse and checkpoints
 
@@ -344,7 +345,7 @@ on (even `0`). The measurement and test switches are in [their own section](#mea
 | `MK_EXACT` | `0`; the server sets `1` with `--exact-reuse`, and with `--agents` unless set | exact reuse: every prefill row comes out the same however the sequence was cut into prefill calls and chunks, as long as a prefill starts on the absolute 32-token grid (the engine warns when one doesn't; the server's checkpoints are all on it) (prefill attention over absolute key segments, checkpoints on that grid, window rings saved with each checkpoint). The server then restores the last checkpoint at or before the point where a prompt diverges and prefills from there instead of appending to the reply's decoded rows. Cost: a 98k prefill from scratch +1.3%; a follow-up turn re-reads the previous reply (11.6k chat: 167 instead of 78 ms); edits cost the same | reuse = fresh, bit for bit; the prefill arithmetic differs from `0` (KL within noise: 98.662% / 0.00118 vs 98.654% / 0.00116) | served |
 | `MK_EXACT_SEG` | `4096` | exact mode: positions per absolute key segment of the prefill attention (rounded down to a multiple of 32). Against 8192 on a 98k prompt: the same time from scratch, faster for a restore plus 32 tokens | changes (another fold order); reuse stays exact at any value | option |
 | `MK_EXACT_SPLIT` | `1` | exact mode: the last wave of attention work is split into segment units to balance the GPU; `0`: whole items only | same (every split gives the same rows) | option |
-| `MK_CK_SLOTS` | `8`; the CLI keeps 1 unless set | DeltaNet checkpoint slots in pinned host memory (1-64; ~0.17 GB each). Pinned checkpoints (`--ck-pin`) take slots from this pool | same with exact reuse | served |
+| `MK_CK_SLOTS` | `8`; the CLI and `--agents` keep 1 unless set | DeltaNet checkpoint slots in pinned host memory (1-64; ~0.17 GB each). Pinned checkpoints (`--ck-pin`) take slots from this pool. With `--agents` the engine's own sequence only warms up: each slot has its own checkpoints (`MK_SLOT_CK`). When pinned host memory runs out, the pool keeps the slots it got (with none: one slot in device memory), with a warning | same with exact reuse | served |
 | `MK_CK_DEVICE` | `0` | `1`: a single checkpoint slot in device memory instead of the pinned-host pool (the original layout; refused when `MK_EXACT` and `MK_KV_WIN` are both set) | same | earlier path |
 
 ### Speculation (drafts)
@@ -374,7 +375,7 @@ keeps its distribution). The defaults were tuned on replayed logs and live A/B r
 | `droplast` | `0.4` | drop the deepest draft below this |
 | `g7` | `1` | the gates for depths above 5: stop after drafts 2-4 below 0.25, drop draft 5 below 0.3, stop after drafts 5-6 below 0.3, never drop the deepest draft. Any explicit `stop` / `drop` key turns it off. +2.0% at 38k and +4.1% at 101.6k greedy, together with `MK_MTP_KVC` |
 | `dstop` | `0.5` | [deep-pass build](EXPERIMENTAL.md#the-deep-pass) at depths above 7, with `g7`: stop after drafts 8 and later below this |
-| `tier` | `3` | deep-pass build: a cycle verifies its drafts past the 7th (the 16-row pass) only when the sum of the running products of their MTP probabilities, the MTP's own estimate of how many of them will be accepted, is at least this; else up to 7 drafts. `0`: no such condition |
+| `tier` | `3` | deep-pass build: a cycle verifies its drafts past the 7th (the 16-row pass) only when the sum of the running products of their MTP probabilities, the MTP's own estimate of how many of them will be accepted, is at least this; else up to 7 drafts. `0`: no such condition. With sampled drafts verified by sampling (`h1=1`), the sum uses only what is known before the 8th draft is drawn: the running product through the 8th draft's probability, then that probability again for each further draft up to the depth (choosing by the later drafts' own probabilities which drafts get verified would bias the output) |
 | `dctx` | off | from position N on, at most 4 drafts |
 | `chain` | `1` | what the gates compare: `1` the running product of the top-1 probabilities, `0` each draft's own top-1 probability, `2` with sampled drafts the product of the drafted tokens' own probabilities (drop gates off) |
 | `h1` | `1` | when sampling, draft by sampling the MTP head (`0`: its top-1 token) |
@@ -386,7 +387,7 @@ No gates: `depth=0,drop=0,stop=0,chain=0,h1=0` (adaptive depth, top-1 drafts), t
 
 | Variable | Default | What it does | Output | Status |
 |---|---|---|---|---|
-| `MK_PF_CAP` | `2048`; the launchers use `1024` above 96k context, `serve.bat` `512` above 240k with your own `MK_KV` | tokens per prefill chunk, 128-2048 in steps of 128. The scratch is ~0.33 MB per token: 1024 frees ~0.34 GB, and prefill was 4.5% slower on UD-Q4_K_XL | same with exact reuse; not checked without | served |
+| `MK_PF_CAP` | `2048`; the launchers use `1024` above 96k context, `serve.bat` `512` above 240k with your own `MK_KV` | tokens per prefill chunk, 128-2048 in steps of 128. The scratch is ~0.33 MB per token: 1024 frees ~0.34 GB, and prefill was 4.5% slower on UD-Q4_K_XL. With exact reuse and `MK_KV_WIN` up to 1,280 the engine lowers it to the window ring's length (1,280 or 1,920: a chunk must not wrap the rings a checkpoint saves) and says so at load | same with exact reuse; not checked without | served |
 | `MK_ATTN_S8` | `1` | q8_0 cache, prefill attention: `1` int8 Q K^T with one Q scale per 32 dims (+16.7% prefill at 101.6k); `2` one Q scale per row (+5% in the kernel, 1.6 times the Q rounding noise); `0` fp16 tensor cores | changes | served (`1`) |
 | `MK_ATTN_SPLIT` | `1` | `0`: no tail split of long rows in the prefill attention (exact mode never splits) | changes | earlier path |
 | `MK_ATTN_PV16` | `1` | `0`: the attention's P V accumulated in fp32 instead of fp16 | changes | earlier path |
@@ -517,7 +518,7 @@ it.
 | `MK_K6_DEF`, `MK_K8_DEF`, `MK_K8_NT` | `6`, `6`, `4` | same | the defaults of the `MK_K6`, `MK_K8`, `MK_K8_NT` environment variables | - | option |
 | `MK_PF_FRAG_G` | `-1` | `-1` | prefill GEMMs: the MMA group of a stage after which the next stage's scales and fragments are made (`-1`: the kernel's own) | not checked | option |
 | `MK_PF_NS_IQ4` | `4` | `4` | cp.async stages of the IQ4_XS prefill GEMMs (3 stages were 2-5% slower) | not checked | option |
-| `MK_PF_INFCHK` | `0` | `0` | debug build: counts fp16 overflows (inf / NaN, clamps) per prefill GEMM and layer, printed after each prefill; none on 38k and 101.6k prompts | same | debug |
+| `MK_PF_INFCHK` | `0` | `0` | debug build: counts fp16 overflows (inf / NaN, clamps) per prefill GEMM and layer, and the DeltaNet scan's fp16 MMA operands past 65504 (not clamped), printed after each prefill; none on 38k and 101.6k prompts (2026-10-17, before the scan's counters) | same | debug |
 | `MK_SPEC_LOG` | `0` | `0` | analysis build: with `MK_SPEC_LOG_FILE=path`, one JSON line per decode cycle (drafts, their MTP top logits, verify rows, outcome) | not checked | debug |
 | `MK_TEST_NAN` | `0` | `0` | test build: `MK_TEST_NAN_AT=N` writes NaN K scales into the first attention layer before decode launch N; the engine must stop with an error and the server answer HTTP 500 (or an error event in a started stream) and recover | - | debug |
 | `MK_TEST_SLOTS_FAIL` | `0` | `0` | test build: `MK_TEST_SLOTS_FAIL_AT=k` makes `slots_open` fail (an `MKCudaError`) once slot k is built, so its roll-back runs over real slots (an out-of-memory failure cannot be forced where allocations spill past the VRAM); the next open must succeed | - | debug |
@@ -557,7 +558,7 @@ Model and engine (one per process; in `--batch` mode these stay the command line
 | Option | Default | What it does |
 |---|---|---|
 | `-m FILE` | required | the GGUF |
-| `-c N` | `8192` | context (KV capacity) in tokens, at most the model's context length (262,144) |
+| `-c N` | `8192` | context (KV capacity) in tokens, at least 1 and at most the model's context length (262,144) |
 | `--kv f16\|q8\|auto` | `auto` | KV cache format; `auto`: q8_0 when fp16 does not fit, or when `MK_KV` is set |
 | `--draft-vocab FILE` | none: the full lm_head | the draft head's vocabulary (`draft_vocab_32k.bin`) |
 | `--mtp FILE`, `--no-mtp` | the model file's MTP layer | as the server's options (env `MK_MTP`, `MK_NO_MTP=1`) |
@@ -577,7 +578,7 @@ Generation job (the command line's job, and the defaults of every `--batch` line
 | `--temp T`, `--top-p P`, `--top-k K`, `--min-p P`, `--seed S` | `0` (greedy), `1`, `32`, `0`, `1` | sampling; top-k at most 32 |
 | `--presence-penalty P`, `--frequency-penalty F` | `0` | penalties on the generated tokens (vLLM's semantics; exact under speculation) |
 | `--policy SPEC` | `MK_POLICY` | the draft policy for this job ([keys](#mk_policy-keys)); in a batch it stays for the jobs after it |
-| `--state-dir DIR` | - | post-prefill state files: the first prompt's prefill is restored from DIR when a file of the same prompt, binary, model and settings is there, else saved there (`MK_STATE_WARM_MS` warms the GPU after a restore) |
+| `--state-dir DIR` | - | post-prefill state files: the first prompt's prefill is restored from DIR when a file of the same prompt, binary, GPU, model and settings is there, else saved there (`MK_STATE_WARM_MS` warms the GPU after a restore) |
 | `--digest` | off | print a hash of the sequence state after the first prefill (tests) |
 | `--ids` | off | print the prompt's and the generated token ids |
 | `--quiet` | off | no generated text, only the statistics |
@@ -598,11 +599,11 @@ Scoring and measurement:
 Exit codes: 1 for an error the engine reports (bad arguments, a prompt over the context), 3 for a watchdog timeout,
 4 for a sticky CUDA error.
 
-A `--state-dir` file is keyed by the binary, the model file, the context, the KV formats, the prompt, and every `MK_*`
-variable in the environment except those that only change decode, logging, timing or the load path: names starting
-with `MK_STATE`, `MK_POLICY`, `MK_PROFILE`, `MK_SPEC_LOG`, `MK_MEMLOG`, `MK_LOADLOG`, `MK_LOAD_`, `MK_WDIGEST`,
-`MK_WATCHDOG`, `MK_CK_SLOTS`, `MK_BENCH`, `MK_STACK_LIMIT`, `MK_GSB`, and `MK_K1`, `MK_K2`, `MK_K6`. Any other change
-saves a new file instead of restoring a stale one.
+A `--state-dir` file is keyed by the binary, the GPU (name, compute capability, SM count), the model file, the context,
+the KV formats, the prompt, and every `MK_*` variable in the environment except those that only change decode,
+logging, timing or the load path: names starting with `MK_STATE`, `MK_POLICY`, `MK_PROFILE`, `MK_SPEC_LOG`,
+`MK_MEMLOG`, `MK_LOADLOG`, `MK_LOAD_`, `MK_WDIGEST`, `MK_WATCHDOG`, `MK_CK_SLOTS`, `MK_BENCH`, `MK_STACK_LIMIT`,
+`MK_GSB`, and `MK_K1`, `MK_K2`, `MK_K6`. Any other change saves a new file instead of restoring a stale one.
 
 ## Tools and benchmarks
 

@@ -673,7 +673,8 @@ can change results.
 The prefill GEMMs add two 64-wide k stages (128 products) in fp16 before the fp32 accumulators, and store their inputs
 as fp16 clamped to +-65504. A debug build with `MK_PF_INFCHK=1` (73fd978; compiled out of the served build) counts,
 per layer and GEMM, the fp16 partial sums that are inf / NaN, the non-finite outputs, and the inputs the clamp
-saturates or turns from NaN into -65504.
+saturates or turns from NaN into -65504. Since 47f8b0d it also counts the DeltaNet scan's fp16 MMA operands (S, K S,
+U, U d) past 65504, which are not clamped; the runs below predate those counters.
 
 | prompt | result | date |
 |---|---|---|
