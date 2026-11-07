@@ -5,11 +5,6 @@
 
 namespace {
 
-uint16_t f2h_bits(float f) {
-    __half h = __float2half(f);
-    return *reinterpret_cast<uint16_t *>(&h);
-}
-
 // GGUF Q6_K block (210 B: ql[128] | qh[64] | int8 scales[16] | fp16 d) from 256 integers q in [-32, 31],
 // one scale per 16 of them and the bits of d.
 void put_q6k(uint8_t * blk, const int * q, const int8_t * sc, uint16_t dbits) {
