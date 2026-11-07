@@ -2499,10 +2499,11 @@ __device__ __forceinline__ void attn_dims(int L_ctx, int & nch, int & cs) {
 // MK_MTP_WIN=N (measurement knob, default off): the MTP slot's decode attention covers the first tile of positions
 // (sinks, StreamingLLM) and the last N ones; ws = the window start (0: everything, also when the window would start
 // inside the first two tiles). The chunk partition is attn_dims over [ws, L_ctx) plus one sink chunk [0, ATP).
+// ws is rounded down to a multiple of ATP: a window ring's tiles must start on one (kv_tile_src: a tile never wraps)
 __device__ __forceinline__ int mtp_ws(int slot, int n) {
     if (slot != N_ATT_SLOTS - 1 || cB.mtp_win <= 0) return 0;
     const int ws = n + 1 - cB.mtp_win;
-    return ws > 2 * ATP ? ws : 0;
+    return ws > 2 * ATP ? ws & ~(ATP - 1) : 0;
 }
 __device__ __forceinline__ void attn_dims_w(int L_ctx, int ws, int & nch, int & cs) {
     attn_dims(L_ctx - ws, nch, cs);
