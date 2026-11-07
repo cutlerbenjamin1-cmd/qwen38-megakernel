@@ -51,7 +51,7 @@ method are in [docs/BENCHMARKS.md](docs/BENCHMARKS.md). Every row is one session
 - **[A conversation cache](#picks-up-where-you-left-off)** that survives follow-ups, edits, new agent sessions and
   switching between conversations.
 - **[OpenAI, Anthropic and Responses APIs](#works-with-your-coding-agent)**, tested with 11 coding agents and chat UIs.
-- **Images and video**, encoded on the CPU, so they take no VRAM.
+- **Images and video**, encoded on the CPU, so the encoder takes no VRAM.
 - **Several agents at once:** `--agents 4` serves 424 tok/s in total on short prompts (Q4_K_M), 360 with ~23k tokens
   of context each, against 137 and 97 for llama.cpp's `llama-server --parallel 4` measured on 2026-11-02, sampled
   ([parallel agents](docs/BENCHMARKS.md#parallel-agents)).
@@ -193,7 +193,7 @@ same request sent fresh would.
   Claude Code session starts with 8,288 of its 11,850 prompt tokens already cached, a new Codex CLI session with 8,672
   of 8,847.
 - **Several conversations** take turns: the inactive ones are parked in host memory. A 120k-token conversation comes
-  back in 0.18 s instead of the 98 s it takes to read it again.
+  back in 0.18 s instead of the 98 s it took to read it again (2026-10-19).
 - **Title, tag and summary requests** run beside the session (side requests) instead of throwing its cache away.
 
 How it works and how to size it: [docs/SERVER.md](docs/SERVER.md#the-conversation-cache).
@@ -225,13 +225,13 @@ also need the context window set by hand, some the image flag or the thinking le
   build), lm_head, draft verification, the MTP catch-up and the next drafts (about 340 phases) run in one persistent
   cooperative kernel. The host only reads back the accepted tokens.
 - **Verification on int8 tensor cores.** The main pass runs as int8 GEMMs, so a cycle that verifies 8 tokens costs
-  about 29 ms against 22 ms for one.
+  about 29 ms against 22 ms for one (a 2026-10-16 build: [ENGINE.md](docs/ENGINE.md#how-it-works)).
 - **Weights stay in their GGUF k-quant encoding**, re-laid-out at load for aligned loads (values unchanged) and read
   once per cycle however many tokens are verified.
 - **DeltaNet rollback by lazy replay.** The recurrent state commits only through the surely-accepted token; rejected
   drafts cost no state snapshots.
 - **Attention straight from the q8_0 cache:** a software-pipelined decode kernel, and Q K^T on int8 tensor cores in
-  prefill. The batched tensor-core prefill reads 101.6k tokens in 75 s.
+  prefill. The batched tensor-core prefill reads a 101.6k-token prompt in 68.5 s.
 
 The full tour: [docs/ENGINE.md](docs/ENGINE.md).
 

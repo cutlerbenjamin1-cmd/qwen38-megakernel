@@ -136,13 +136,13 @@ model's full 262,144 tokens (below, and [BENCHMARKS.md](BENCHMARKS.md#the-full-c
 D' is D with the MTP layer's cache at 8 bits: ~70 MB more, and the drafts read q8_0 K / V (its speed against D:
 [BENCHMARKS.md](BENCHMARKS.md#c-d-and-e-side-by-side)).
 
-**Preset D** frees ~1.1 GB at 120k context and fits the model's full 262,144-token context on 24 GB. A prompt that
-fits in the window reads only q8_0 rows, so its output is q8_0's; past the window, KL at 32k is 0.00236 against
-q8_0's 0.00219, the 282 questions score the same 230, and prompts read about 4% slower. Decode tok/s also depends on
-the text: with D the reply differs from q8_0's, and with it the draft acceptance. At the full context a 260,896-token
-prompt was read in 326 s, decode at that depth ran at 66 tok/s, a follow-up turn took 1.28 s, the card held 23.5 GB,
-and 4 of 4 needle-in-a-haystack and 4 of 6 LongBench v2 questions at that length were right. Every number, with the
-fp16 cache's own KL floor: [BENCHMARKS.md](BENCHMARKS.md#kv-cache-presets).
+**Preset D** frees ~1.1 GB at 120k context and fits the model's full 262,144-token context on 24 GB. A prompt that fits
+in the window reads only q8_0 rows, so its output is q8_0's; past the window, KL at 32k is 0.00236 against q8_0's
+0.00219, the 282 questions score the same 230, and prompts read about 4% slower. Decode tok/s also depends on the text:
+with D the reply differs from q8_0's, and with it the draft acceptance. At the full context (2026-10-20, 7322fbd) a
+260,896-token prompt was read in 326 s, decode at that depth ran at 66 tok/s, a follow-up turn took 1.28 s, the card
+held 23.5 GB, and 4 of 4 needle-in-a-haystack and 4 of 6 LongBench v2 questions at that length were right. Every number,
+with the fp16 cache's own KL floor: [BENCHMARKS.md](BENCHMARKS.md#kv-cache-presets).
 
 **Preset F** stores K at 5 bits, Hadamard-rotated, and V at 5 bits, with the same window: 0.26 GB less KV cache than D
 at 120k context (2.99 against 3.25 GB) and 0.58 GB less at 262,144 (6.39 against 6.97 GB). Its KL equals q8_0's at 64k
