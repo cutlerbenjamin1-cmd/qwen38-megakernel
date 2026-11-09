@@ -3131,9 +3131,11 @@ __device__ __forceinline__ void aqx_conv(float (&acc)[MTA][4][4], const uint8_t 
 // ahead in the program text: a small module keeps that, in the engine ptxas moves each load back in front of its MMA (no effect
 // measured there; the stall is ~30% of the S warps' samples at 101k). KILL (MK_AQK, MK_W48Z 2): k-step ks's fragment slots are
 // zeroed after its last MMA, so they are dead in the rest of the block (exact: the warp's next aqx_conv rewrites every slot of
-// acc[0 .. 1] before its next aqx_mma, and only P V warps, which never run this, read acc as accumulators).
+// acc[0 .. 1] before its next aqx_mma, and only P V warps, which never run this, read acc as accumulators). PIN (MK_AQK bit 3, MK_W48Z
+// 3): k-step ks + 1's Q loads, then a __syncwarp, then k-step ks's MMAs: bar.warp.sync orders shared memory, so ptxas cannot sink
+// those loads below it (LA is not used; a warp barrier changes no value).
 constexpr int AQX_LA = 4;
-template <int MT, int MTA, int LDH, int LA = AQX_LA, bool KILL = false>
+template <int MT, int MTA, int LDH, int LA = AQX_LA, bool KILL = false, bool PIN = false>
 __device__ __forceinline__ void aqx_mma(float (&s)[MT][4], float (&acc)[MTA][4][4], unsigned qaddr) {
 #pragma unroll
     for (int i = 0; i < MT; i++)
@@ -3144,19 +3146,43 @@ __device__ __forceinline__ void aqx_mma(float (&s)[MT][4], float (&acc)[MTA][4][
                      : "=r"(a[0]), "=r"(a[1]), "=r"(a[2]), "=r"(a[3])
                      : "r"(qaddr + 2 * (16 * (q % MT) * LDH + 16 * (q / MT))));
     };
-    unsigned a[LA][4];
+    if constexpr (PIN) {
+        unsigned a[2][MT][4];
 #pragma unroll
-    for (int q = 0; q < LA; q++) ldq(q, a[q]);
+        for (int i = 0; i < MT; i++) ldq(i, a[0][i]);
 #pragma unroll
-    for (int q = 0; q < (HD / 16) * MT; q++) {
-        const int ks = q / MT, w = q % LA;
-        float (&b)[4] = acc[ks >> 3][(ks >> 1) & 3];
-        mma16816(s[q % MT], a[w][0], a[w][1], a[w][2], a[w][3], __float_as_uint(b[2 * (ks & 1)]), __float_as_uint(b[2 * (ks & 1) + 1]));
-        if (q + LA < (HD / 16) * MT) ldq(q + LA, a[w]);
-        if constexpr (KILL) {
-            if (q % MT == MT - 1) {
+        for (int ks = 0; ks < HD / 16; ks++) {
+            if (ks + 1 < HD / 16) {
+#pragma unroll
+                for (int i = 0; i < MT; i++) ldq((ks + 1) * MT + i, a[(ks + 1) & 1][i]);
+            }
+            __syncwarp();
+            float (&b)[4] = acc[ks >> 3][(ks >> 1) & 3];
+#pragma unroll
+            for (int i = 0; i < MT; i++) {
+                const unsigned (&x)[4] = a[ks & 1][i];
+                mma16816(s[i], x[0], x[1], x[2], x[3], __float_as_uint(b[2 * (ks & 1)]), __float_as_uint(b[2 * (ks & 1) + 1]));
+            }
+            if constexpr (KILL) {
                 b[2 * (ks & 1)] = 0.f;
                 b[2 * (ks & 1) + 1] = 0.f;
+            }
+        }
+    } else {
+        unsigned a[LA][4];
+#pragma unroll
+        for (int q = 0; q < LA; q++) ldq(q, a[q]);
+#pragma unroll
+        for (int q = 0; q < (HD / 16) * MT; q++) {
+            const int ks = q / MT, w = q % LA;
+            float (&b)[4] = acc[ks >> 3][(ks >> 1) & 3];
+            mma16816(s[q % MT], a[w][0], a[w][1], a[w][2], a[w][3], __float_as_uint(b[2 * (ks & 1)]), __float_as_uint(b[2 * (ks & 1) + 1]));
+            if (q + LA < (HD / 16) * MT) ldq(q + LA, a[w]);
+            if constexpr (KILL) {
+                if (q % MT == MT - 1) {
+                    b[2 * (ks & 1)] = 0.f;
+                    b[2 * (ks & 1) + 1] = 0.f;
+                }
             }
         }
     }
@@ -3576,8 +3602,8 @@ __device__ __forceinline__ void attn_core_q8_t(const LayerW & W, int slot, int n
                 } else if (sg >= 0) {
                     if (jt < ntl) {
                         float s[MT][4];
-#if MK_AQK // bit 0: consumed K fragments killed; bit 1: Q loads 1 MMA ahead in the source, bit 2: 2 (else AQX_LA)
-                        aqx_mma<MT, MTA, LDH, (MK_AQK & 2) ? 1 : (MK_AQK & 4) ? 2 : AQX_LA, (MK_AQK & 1) != 0>(
+#if MK_AQK // bit 0: consumed K fragments killed; bit 1 / 2: Q loads 1 / 2 MMAs ahead in the source (else AQX_LA); bit 3: PIN
+                        aqx_mma<MT, MTA, LDH, (MK_AQK & 2) ? 1 : (MK_AQK & 4) ? 2 : AQX_LA, (MK_AQK & 1) != 0, (MK_AQK & 8) != 0>(
                             s, acc, (unsigned) __cvta_generic_to_shared(sQ + (lane & 15) * LDH + (lane >> 4) * 8));
 #else
                         aqx_mma<MT, MTA, LDH>(s, acc, (unsigned) __cvta_generic_to_shared(sQ + (lane & 15) * LDH + (lane >> 4) * 8));
@@ -4272,8 +4298,8 @@ __device__ __forceinline__ void attn_core_w48(const LayerW & W, int slot, int n,
                 } else if (jt < ntl) {
                     {
                         float s[MT][4];
-#if MK_W48Z >= 2 // (and the consumed K fragments killed)
-                        aqx_mma<MT, MT, LDH, AQX_LA, true>(s, acc, (unsigned) __cvta_generic_to_shared(sQ + (lane & 15) * LDH + (lane >> 4) * 8));
+#if MK_W48Z >= 2 // (and the consumed K fragments killed; 3: + PIN)
+                        aqx_mma<MT, MT, LDH, AQX_LA, true, (MK_W48Z >= 3)>(s, acc, (unsigned) __cvta_generic_to_shared(sQ + (lane & 15) * LDH + (lane >> 4) * 8));
 #else
                         aqx_mma<MT, MT, LDH>(s, acc, (unsigned) __cvta_generic_to_shared(sQ + (lane & 15) * LDH + (lane >> 4) * 8));
 #endif
