@@ -5035,6 +5035,23 @@ __device__ __noinline__ bool lm_head(int t0, bool draft, uint8_t * /*sm*/, int *
             cB.blk_lse[blockIdx.x] = make_float2(M, S);
         }
     }
+#ifndef MK_FORMAL_SYNC
+#define MK_FORMAL_SYNC 0
+#endif
+#if MK_FORMAL_SYNC
+    // the ticket in the PTX model's terms (correct6 F4): the block's stores -> bar.sync -> thread 0's fence + ticket is a release
+    // pattern for every thread's stores (causality); thread 0's ticket + fence -> bar.sync an acquire for every reading lane
+    __syncthreads();
+    int * s_last = reinterpret_cast<int *>(m + LM_LAST);
+    if (tid == 0) {
+        __threadfence();
+        const bool last = atomicAdd(cB.cnt, 1u) == gridDim.x - 1;
+        if (last) __threadfence();
+        s_last[0] = last;
+    }
+    __syncthreads();
+    if (!s_last[0]) return false;
+#else
     __threadfence();
     __syncthreads();
     int * s_last = reinterpret_cast<int *>(m + LM_LAST);
@@ -5042,6 +5059,7 @@ __device__ __noinline__ bool lm_head(int t0, bool draft, uint8_t * /*sm*/, int *
     __syncthreads();
     if (!s_last[0]) return false;
     __threadfence();
+#endif
     if constexpr (LSE) { // the blocks' (max, sum of exp) -> shared memory in one parallel load; the sum stays in block order
         // On the last warp alone (warp syncs only): warp 0's argmax below runs alongside. The max and the sum stay chains in
         // block order (every lane chains the max, its loads batched ahead; lane l takes the exps of blocks l, l + 32, ..:
