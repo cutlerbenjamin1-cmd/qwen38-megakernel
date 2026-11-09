@@ -1699,12 +1699,21 @@ __device__ __forceinline__ void dn_inputs(const LayerW & W, int h, int kh, int n
 // DN_PF_ITEM bytes per item (1280 items, ~5 MB of the 6 MB L2): Q4_K 14 of 18 lines, Q5_K 10 of 22, Q6_K 5 of 27,
 // IQ4_XS 15 of 17, Q8_0 none. Normal priority. Issued here, after the commit, rather than by the 34 headless blocks at
 // the K5 release, so that its allocations displace the state lines. Hints only: no value changes
+#ifndef MK_DN6
+#define MK_DN6 0
+#endif
 __device__ __forceinline__ void dn_commit(float4 * Sg, const float4 (&S)[8], const Mat & sout, int h) {
     const unsigned long long pol = l2_evict_first();
 #pragma unroll
     for (int i = 0; i < 8; i++)
         asm volatile("st.global.L2::cache_hint.v4.f32 [%0], {%1, %2, %3, %4}, %5;" ::"l"(Sg + 32 * (i & 3) + 4 * (i >> 2)),
                      "f"(S[i].x), "f"(S[i].y), "f"(S[i].z), "f"(S[i].w), "l"(pol));
+#if MK_DN6 & 2
+    if (gridDim.x > NVH) { // (the prefetch: the headless blocks', dn_headless, once every head has counted its commit)
+        if (threadIdx.x == 0) asm volatile("red.relaxed.gpu.global.add.u32 [%0], %1;" ::"l"(cB.cnt + 2), "r"(1u) : "memory");
+        return;
+    }
+#endif
     const int ty = sout.type, nsb = sout.K >> 8, ch = nsb / WV_S;
     // (wv.cuh's wv_ubytes, defined after this point: keep the two in step)
     const int ub = ty == T_Q6K ? Q6F_UNIT
@@ -1721,6 +1730,43 @@ __device__ __forceinline__ void dn_commit(float4 * Sg, const float4 (&S)[8], con
         pf_l2s(sout.w + ((size_t) (it / WV_S) * nsb + ch * (it % WV_S) + 1) * ub + 128 * l);
     }
 }
+#if MK_DN6 & 2
+// MK_DN6 bit 2 (dn6 L4): a K5 dn_core's headless blocks (dn_proj's arrivals after the first NVH) issue dn_commit's resid_sout
+// prefetch, off the head blocks' path, once this layer's NVH commits are counted (cB.cnt[2]: a snapshot before the release, a
+// bounded relaxed poll after it), split over them by a per-layer ticket (cB.cnt[3] mod their count). Hints only: a wrong or
+// late count changes timing, never a value
+__shared__ int s_dnhl;
+__device__ __forceinline__ void dn_headless(const Mat & sout) {
+    const int nh = (int) gridDim.x - NVH;
+    unsigned base = 0;
+    if (threadIdx.x == 0) asm volatile("ld.relaxed.gpu.global.u32 %0, [%1];" : "=r"(base) : "l"(cB.cnt + 2) : "memory");
+    k5_wait();
+    if (threadIdx.x == 0) {
+        const unsigned long long t0 = gtimer();
+        unsigned v;
+        do {
+            asm volatile("ld.relaxed.gpu.global.u32 %0, [%1];" : "=r"(v) : "l"(cB.cnt + 2) : "memory");
+        } while (v - base < (unsigned) NVH && gtimer() - t0 < 40000);
+        s_dnhl = (int) (atomicAdd(cB.cnt + 3, 1u) % (unsigned) nh);
+    }
+    __syncthreads();
+    const int b = s_dnhl;
+    const int ty = sout.type, nsb = sout.K >> 8, ch = nsb / WV_S; // (dn_commit's lines)
+    const int ub = ty == T_Q6K ? Q6F_UNIT
+                               : 16 * (ty == T_Q5K ? 176 : ty == T_IQ4X ? 136 : ty == T_Q8_0 ? 256 : ty == T_Q3K || ty == T_IQ3S ? Q3_BLK : 144);
+#if MK_L2_TUNE
+    const int L = min(((ch - 1) * ub + 127) >> 7, (cL2.dn - ub) >> 7);
+#else
+    const int L = min((ub + 127) >> 7, (DN_PF_ITEM - ub) >> 7);
+#endif
+    if (!sout.fm || ch < 2 || L <= 0) return;
+    constexpr int NI = D / 16 * WV_S;
+    for (int j = (int) threadIdx.x * nh + b; j < NI * L; j += NT * nh) {
+        const int it = j % NI, l = j / NI;
+        pf_l2s(sout.w + ((size_t) (it / WV_S) * nsb + ch * (it % WV_S) + 1) * ub + 128 * l);
+    }
+}
+#endif
 
 // delta-net core: one block per value head (48 blocks).  conv1d+silu, l2-norm, gated delta
 // rule (with replay of pending accepted tokens), gated rms-norm, quantise for ssm_out.
@@ -1734,7 +1780,11 @@ __device__ __noinline__ void dn_core(const LayerW & W, int dl, int n, int dn_c, 
     if constexpr (K5) {
         h = s_k5h;
         if (h < 0) {
+#if MK_DN6 & 2
+            dn_headless(W.sout);
+#else
             k5_wait();
+#endif
             return;
         }
     } else
@@ -1770,6 +1820,11 @@ __device__ __noinline__ void dn_core(const LayerW & W, int dl, int n, int dn_c, 
     const int np = n - dn_c; // replayed (accepted, not yet committed) tokens
     float * ring = cB.kvgb + (size_t) dl * KV_RING * KVGB;
     const float * conv = cB.conv + (size_t) dl * CONV_RING * QKV;
+#if MK_DN6 & 1
+    // MK_DN6 bit 1 (dn6 L3): the gated rms-norm weight loaded before the release (K5), the ring save in float4s, and the K5
+    // loop's / ring save's v of the new tokens read from s_raw (no copy into s_v): the same values to the same addresses
+    float sn;
+#endif
 
     if constexpr (K5) {
         // ---- K5 Pre (before the dn_proj barrier completes): the replayed events' inputs come from earlier launches (kvgb
@@ -1797,6 +1852,9 @@ __device__ __noinline__ void dn_core(const LayerW & W, int dl, int n, int dn_c, 
             dn_kv2(S, k4, kv0, kv1);
             dn_upd2(S, k4, g, beta, *reinterpret_cast<const float2 *>(s_v + e * 128 + c0), kv0, kv1);
         }
+#if MK_DN6 & 1
+        sn = W.snorm[(warp & 3) * 32 + lane];
+#endif
         k5_wait(); // every block's dn_proj outputs (conv rows n .. n + T - 1, z, alpha / beta partials) are visible from here
 
         // ---- K5 Post: the new tokens' inputs ----
@@ -1825,10 +1883,29 @@ __device__ __noinline__ void dn_core(const LayerW & W, int dl, int n, int dn_c, 
         float * dst = (isk ? s_k : s_q) + (np + t) * QS + (lane >> 3) * 36 + (lane & 7) * 4;
         *reinterpret_cast<float4 *>(dst) = make_float4(v.x * sc, v.y * sc, v.z * sc, v.w * sc);
     }
+#if MK_DN6 & 1
+    if constexpr (!K5)
+#endif
     for (int i = tid; i < T * 128; i += NT) s_v[(np + (i >> 7)) * 128 + (i & 127)] = s_raw[(i >> 7) * 384 + 256 + (i & 127)];
     __syncthreads();
 
     // save the new tokens' (k, v, g, beta) for a possible replay next cycle
+#if MK_DN6 & 1
+    for (int i = tid; i < T * 32; i += NT) { // (float4 c4 .. c4 + 3 within one 32-float quarter of k: 16-byte aligned on both sides)
+        const int t = i >> 5, c4 = (i & 31) * 4;
+        float * slot = ring + (size_t) ((n + t) % KV_RING) * KVGB;
+        if (h < NKH)
+            *reinterpret_cast<float4 *>(slot + h * 128 + c4) = *reinterpret_cast<const float4 *>(s_k + (np + t) * QS + (c4 >> 5) * 36 + (c4 & 31));
+        *reinterpret_cast<float4 *>(slot + KVGB_V + h * 128 + c4) =
+            K5 ? *reinterpret_cast<const float4 *>(s_raw + t * 384 + 256 + c4) : *reinterpret_cast<const float4 *>(s_v + (np + t) * 128 + c4);
+    }
+    if (tid < T) {
+        float * slot = ring + (size_t) ((n + tid) % KV_RING) * KVGB;
+        slot[KVGB_G + h] = s_gb[2 * (np + tid)];
+        slot[KVGB_B + h] = s_gb[2 * (np + tid) + 1];
+    }
+    if constexpr (!K5) sn = W.snorm[(warp & 3) * 32 + lane];
+#else
     for (int i = tid; i < T * 128; i += NT) {
         const int t = i >> 7, c = i & 127;
         float * slot = ring + (size_t) ((n + t) % KV_RING) * KVGB;
@@ -1841,6 +1918,7 @@ __device__ __noinline__ void dn_core(const LayerW & W, int dl, int n, int dn_c, 
     }
 
     const float sn = W.snorm[(warp & 3) * 32 + lane]; // the gated rms-norm weight of this warp's output tasks (below)
+#endif
     if constexpr (K5) {
         // ---- gated delta rule over the new tokens' events (the replayed ones ran before the wait), pipelined:
         // step e applies event e, then forms o_e and the next event's kv from the new state together (independent dot
@@ -1858,7 +1936,11 @@ __device__ __noinline__ void dn_core(const LayerW & W, int dl, int n, int dn_c, 
             dn_kv2(S, kn, kv0, kv1);
             g = s_gb[2 * np];
             beta = s_gb[2 * np + 1];
+#if MK_DN6 & 1
+            v = *reinterpret_cast<const float2 *>(s_raw + 256 + c0); // (event np = new token 0)
+#else
             v = *reinterpret_cast<const float2 *>(s_v + np * 128 + c0);
+#endif
         }
         int e = np;
     #pragma unroll 1
@@ -1873,7 +1955,11 @@ __device__ __noinline__ void dn_core(const LayerW & W, int dl, int n, int dn_c, 
                 const float4 * kq = reinterpret_cast<const float4 *>(s_k + en * QS + r * 36 + 16 * hf);
                 g = s_gb[2 * en];
                 beta = s_gb[2 * en + 1];
+#if MK_DN6 & 1
+                v = *reinterpret_cast<const float2 *>(s_raw + (en - np) * 384 + 256 + c0);
+#else
                 v = *reinterpret_cast<const float2 *>(s_v + en * 128 + c0);
+#endif
                 float d[4][4], y[4]; // o_e of both columns, then the next kv of both
     #pragma unroll
                 for (int i = 0; i < 4; i++) {
