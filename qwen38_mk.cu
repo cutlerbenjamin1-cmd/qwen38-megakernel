@@ -4861,10 +4861,16 @@ __device__ __noinline__ bool lm_head(int t0, bool draft, uint8_t * /*sm*/, int *
     // loads waited on them (Nsight Compute, 8-row code prompt: ~1.3 us per draft step before the row loop, 2.5 MB of
     // local traffic)
     constexpr bool XS = H16 || LSE;
-    int xt[XS ? 1 : MAXD - 1];
+#ifndef MK_LMH8
+#define MK_LMH8 0
+#endif
+    // MK_LMH8 (TL = MAXT): the drafts in shared memory too, loaded into registers inside the pen block of each row pair: the
+    // MAXD - 1 registers are no longer live across the row loop (lm_head<8> spills 5 address offsets, reloaded per pair)
+    constexpr bool XR = MK_LMH8 && !XS && TL == MAXT;
+    int xt[XS || XR ? 1 : MAXD - 1];
     volatile int * const xts = reinterpret_cast<volatile int *>(m + LM_XT);
     if (pen) {
-        if constexpr (XS) {
+        if constexpr (XS || XR) {
             if (tid < MAXD - 1) xts[tid] = ((volatile Ctl *) cB.ctl)->tok[1 + tid];
             __syncthreads();
         } else {
@@ -4930,6 +4936,11 @@ __device__ __noinline__ bool lm_head(int t0, bool draft, uint8_t * /*sm*/, int *
                 a[0][0] = pen_logit(a[0][0], m[t], e0, pres, freq);
                 a[1][0] = pen_logit(a[1][0], m[t], e1, pres, freq);
             } else {
+                int xr[XR ? MAXD - 1 : 1];
+                if constexpr (XR) {
+#pragma unroll
+                    for (int i = 0; i < MAXD - 1; i++) xr[i] = xts[i];
+                }
 #pragma unroll
                 for (int t = 0; t < TL; t++) {
                     int e0 = c0, e1 = c1;
@@ -4938,6 +4949,7 @@ __device__ __noinline__ bool lm_head(int t0, bool draft, uint8_t * /*sm*/, int *
                         if (i < nx0 + t) {
                             int x;
                             if constexpr (XS) x = xts[i];
+                            else if constexpr (XR) x = xr[i];
                             else x = xt[i];
                             e0 += x == p0;
                             e1 += x == p1;
@@ -6053,7 +6065,15 @@ __device__ __noinline__ void mtp_m0_block(int r, int s, int tok, const float * h
 // __syncthreads / grid barrier publishes.
 // mtp_tail, per call: MS_LI .. MS_I (MS_ND: the draft passes' end, 0 without logits) and s_mtp_pl; mtp_pass, per pass
 // (written before its first barrier, the previous pass's last reads are before its last one): MS_POS0, MS_K, MS_LG.
-enum { MS_LI, MS_ND, MS_SMP, MS_PRES, MS_FREQ, MS_P, MS_I, MS_POS0, MS_K, MS_LG, MS_N };
+#ifndef MK_MTPPF
+#define MK_MTPPF 0
+#endif
+// MK_MTPPF: MS_EH = 1 if this block issued the next draft pass's eh prefetch in the previous pass's lm_head phase
+enum { MS_LI, MS_ND, MS_SMP, MS_PRES, MS_FREQ, MS_P, MS_I, MS_POS0, MS_K, MS_LG,
+#if MK_MTPPF
+       MS_EH,
+#endif
+       MS_N };
 __shared__ volatile int s_mtp[MS_N];
 __shared__ const Launch * volatile s_mtp_pl;
 static_assert(SM_TOTAL + 192 + 4 * MS_N + 8 <= 99 * 1024, "mk_cycle's dynamic + static shared memory (+ s_mtp, s_mtp_pl)");
@@ -6073,7 +6093,11 @@ __device__ __noinline__ void mtp_pass(int row0, int dtok, bool draft_row, int dr
     }
 
     // M0: concat(enorm(embed(tok)), hnorm(h_prev)) -> qe (mtp_m0_block, M0_NB blocks per row)
+#if MK_MTPPF
+    if (!draft_row || !s_mtp[MS_EH]) mtp_pf_m0eh(); // (a draft pass: the blocks that issued it before skip it here)
+#else
     mtp_pf_m0eh();
+#endif
     if (blockIdx.x < R * M0_NB) {
         const int r = blockIdx.x / M0_NB, s = blockIdx.x - r * M0_NB;
         const int pos = pos0 + r;
@@ -6203,6 +6227,14 @@ __device__ __noinline__ void mtp_pass(int row0, int dtok, bool draft_row, int dr
             }
             if (threadIdx.x >> 5 == 1) mtp_pf_embd(s_tok[1]); // (the next draft's token_embd row to L2)
         }
+#if MK_MTPPF
+        { // the next draft pass's eh lines (M0's prefetch) from the blocks that wait for the last block's decision here, not
+          // from M0, where they slowed the M0 blocks' latency chain (S3); a hint: wasted if the drafts stop
+            const bool pf = !lastb && s_mtp[MS_K] + 1 < s_mtp[MS_ND];
+            if (pf) mtp_pf_m0eh();
+            if (threadIdx.x == 0) s_mtp[MS_EH] = pf;
+        }
+#endif
         gsync(epoch, PH_MTP_LMHEAD);
     }
 }
