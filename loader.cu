@@ -1405,7 +1405,9 @@ MKEngine::Impl::Impl(const std::string & path, int ctx_, int ndraft_, const std:
             }
             const double MiB = 1048576.0;
             const char * mg = getenv("MK_VRAM_MARGIN");
-            const long long margin = (long long) ((mg ? std::max(0.0, atof(mg)) : 256.0) * MiB);
+            // (384: the pool reserves ~100 MiB over the cache's bytes, and the free figure moves by up to ~150 MiB between processes
+            // with the desktop's use; D at the -c a 256 MiB margin printed dropped to 4.7 MiB free in one of four processes)
+            const long long margin = (long long) ((mg ? std::max(0.0, atof(mg)) : 384.0) * MiB);
             const long long avail = (long long) fr + (long long) (res > used ? res - used : 0);
             const long long left = avail - (long long) (fit_b + post);
             fprintf(stderr, "[mk] KV fit (MK_RESERVE_EARLY): %.1f MiB free (+ %.1f in the pool), the cache %.1f MiB (rings %.1f), after it "
