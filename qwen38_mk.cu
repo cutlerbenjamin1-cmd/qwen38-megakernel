@@ -3129,7 +3129,7 @@ __device__ __forceinline__ void aqx_conv(float (&acc)[MTA][4][4], const uint8_t 
 }
 // S = Q K^T from the fragments above (the same MMAs in the same order: k-step ks, then row tile i). The Q loads go out LA MMAs
 // ahead in the program text: a small module keeps that, in the engine ptxas moves each load back in front of its MMA (no effect
-// measured there; the stall is ~30% of the S warps' samples at 101k). KILL (MK_AQK, MK_W48Z 2): k-step ks's fragment slots are
+// measured there; the stall is ~30% of the S warps' samples at 101k). KILL (MK_AQK bit 0, MK_W48Z 2): k-step ks's fragment slots are
 // zeroed after its last MMA, so they are dead in the rest of the block (exact: the warp's next aqx_conv rewrites every slot of
 // acc[0 .. 1] before its next aqx_mma, and only P V warps, which never run this, read acc as accumulators). PIN (MK_AQK bit 3, MK_W48Z
 // 3): k-step ks + 1's Q loads, then a __syncwarp, then k-step ks's MMAs: bar.warp.sync orders shared memory, so ptxas cannot sink
@@ -4299,8 +4299,8 @@ __device__ __forceinline__ void attn_core_w48(const LayerW & W, int slot, int n,
                 } else if (jt < ntl) {
                     {
                         float s[MT][4];
-#if MK_W48Z >= 2 // (and the consumed K fragments killed; 3: + PIN)
-                        aqx_mma<MT, MT, LDH, AQX_LA, true, (MK_W48Z >= 3)>(s, acc, (unsigned) __cvta_generic_to_shared(sQ + (lane & 15) * LDH + (lane >> 4) * 8));
+#if MK_W48Z >= 2 // 2: and the consumed K fragments killed; 3: PIN instead of the kill
+                        aqx_mma<MT, MT, LDH, AQX_LA, (MK_W48Z == 2), (MK_W48Z >= 3)>(s, acc, (unsigned) __cvta_generic_to_shared(sQ + (lane & 15) * LDH + (lane >> 4) * 8));
 #else
                         aqx_mma<MT, MT, LDH>(s, acc, (unsigned) __cvta_generic_to_shared(sQ + (lane & 15) * LDH + (lane >> 4) * 8));
 #endif
