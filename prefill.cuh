@@ -387,12 +387,27 @@ __global__ void __launch_bounds__(256) pk_dn_prep_t(int T, int n0, int dl, const
     }
 }
 
-// raw qkv rows of the chunk's last positions -> conv ring (after pk_dn_prep consumed the old ones)
+// raw qkv rows of the chunk's last positions -> conv ring (after pk_dn_prep consumed the old ones). F4 (MK_PFX bit 128 off, 256
+// threads): a row as QKV / 1024 float4 per thread, every load issued before the first store (the float loop: ~40 dependent
+// round trips per thread); the same bytes to the same slots.
+template <bool F4>
 __global__ void pk_conv_ring(int T, int n0, int dl) { MK_VIEW_INIT();
     float * ring = cB.conv + (size_t) dl * CONV_RING * QKV;
     const int nt = min(T, CONV_RING), t = T - nt + blockIdx.x;
-    for (int c = threadIdx.x; c < QKV; c += blockDim.x)
-        ring[(size_t) ((n0 + t) % CONV_RING) * QKV + c] = __ldg(cP.y0 + (size_t) t * QKV + c);
+    if constexpr (F4) {
+        static_assert(QKV % 1024 == 0, "pk_conv_ring F4");
+        constexpr int NV = QKV / 1024;
+        const float4 * src = reinterpret_cast<const float4 *>(cP.y0 + (size_t) t * QKV) + threadIdx.x;
+        float4 * dst = reinterpret_cast<float4 *>(ring + (size_t) ((n0 + t) % CONV_RING) * QKV) + threadIdx.x;
+        float4 v[NV];
+#pragma unroll
+        for (int i = 0; i < NV; i++) v[i] = __ldg(src + 256 * i);
+#pragma unroll
+        for (int i = 0; i < NV; i++) dst[256 * i] = v[i];
+    } else {
+        for (int c = threadIdx.x; c < QKV; c += blockDim.x)
+            ring[(size_t) ((n0 + t) % CONV_RING) * QKV + c] = __ldg(cP.y0 + (size_t) t * QKV + c);
+    }
 }
 
 // Checkpoint at position P inside the chunk at n0 (pf_run): the conv ring as it is after position P - 1, i.e. slot

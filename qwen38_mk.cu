@@ -6930,7 +6930,10 @@ template <int NT> void pk_dn_prep_t(int T, int n0, int dl, const float * convw, 
 }
 template void pk_dn_prep_t<4>(int, int, int, const float *, const float *, const float *);
 template void pk_dn_prep_t<8>(int, int, int, const float *, const float *, const float *);
-void pk_conv_ring(int T, int n0, int dl) { ::pk_conv_ring<<<std::min(T, CONV_RING), 256>>>(T, n0, dl); }
+void pk_conv_ring(int T, int n0, int dl, bool old) {
+    if (old) ::pk_conv_ring<false><<<std::min(T, CONV_RING), 256>>>(T, n0, dl); // MK_PFX bit 128
+    else ::pk_conv_ring<true><<<std::min(T, CONV_RING), 256>>>(T, n0, dl);
+}
 void pk_ck_conv(int n0, int P, int dl, float * dst) { ::pk_ck_conv<<<CONV_RING, 256>>>(n0, P, dl, dst); }
 void pk_ck_hist(dim3 grid, int lo, int n0, int from_ring, float * dst) { ::pk_ck_hist<<<grid, 256>>>(lo, n0, from_ring, dst); }
 void pk_dn_scan(int T, int t0, const float * st_in, float * st_out) { ::pk_dn_scan<<<dim3(NVH, 2), 256>>>(T, t0, st_in, st_out); }

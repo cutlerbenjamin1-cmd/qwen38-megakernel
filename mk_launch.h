@@ -54,7 +54,7 @@ void pk_ab(const float * Wab, const int8_t * abq, const __half * abd, const floa
 void pk_ab2(const float * Wab, const int8_t * abq, const __half * abd, const float * fn, int T, cudaStream_t st = 0);
 void pk_dn_prep(int T, int n0, int dl, const float * convw, const float * dt, const float * A);
 template <int NT> void pk_dn_prep_t(int T, int n0, int dl, const float * convw, const float * dt, const float * A);
-void pk_conv_ring(int T, int n0, int dl);
+void pk_conv_ring(int T, int n0, int dl, bool old = false);
 void pk_ck_conv(int n0, int P, int dl, float * dst);
 void pk_ck_hist(dim3 grid, int lo, int n0, int from_ring, float * dst);
 void pk_dn_scan(int T, int t0, const float * st_in, float * st_out);
