@@ -5022,11 +5022,13 @@ __device__ __noinline__ bool lm_head(int t0, bool draft, uint8_t * /*sm*/, int *
                 a[0][0] = pen_logit(a[0][0], m[t], e0, pres, freq);
                 a[1][0] = pen_logit(a[1][0], m[t], e1, pres, freq);
             } else {
+#if MK_LMH8
                 int xr[XR ? MAXD - 1 : 1];
                 if constexpr (XR) {
 #pragma unroll
                     for (int i = 0; i < MAXD - 1; i++) xr[i] = xts[i];
                 }
+#endif
 #pragma unroll
                 for (int t = 0; t < TL; t++) {
                     int e0 = c0, e1 = c1;
@@ -5035,7 +5037,9 @@ __device__ __noinline__ bool lm_head(int t0, bool draft, uint8_t * /*sm*/, int *
                         if (i < nx0 + t) {
                             int x;
                             if constexpr (XS) x = xts[i];
+#if MK_LMH8
                             else if constexpr (XR) x = xr[i];
+#endif
                             else x = xt[i];
                             e0 += x == p0;
                             e1 += x == p1;
