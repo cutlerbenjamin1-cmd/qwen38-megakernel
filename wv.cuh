@@ -1267,7 +1267,13 @@ __device__ __noinline__ void ffn_gu_wv(const LayerW & W, bool c1 = false) {
             for (int c = 0; c < 4; c++) {
                 const int t = 2 * (lane & 3) + (c & 1);
                 const float s = t < T ? s_rs[t] : 0.f;
+#if MK_SILUPAD
+                // (padding column t >= T, never read by wv_to_lane<T>: silu(1), not silu(0 * g), whose zero dividend sends the
+                // warp's IEEE division to its slow path at every T < 8)
+                a.v[0][c] = silu(t < T ? g.v[0][c] * s : 1.f) * (u.v[0][c] * s);
+#else
                 a.v[0][c] = silu(g.v[0][c] * s) * (u.v[0][c] * s);
+#endif
             }
             const LaneT<T> l = wv_to_lane<T>(a, lane & 15);
 #pragma unroll
@@ -1310,6 +1316,37 @@ __device__ __forceinline__ unsigned wv_arrive(unsigned * c, int lane) {
     return __shfl_sync(0xffffffffu, old, 0);
 }
 __device__ __forceinline__ unsigned wv_arrive(unsigned * c) { return wv_arrive(c, threadIdx.x & 31); }
+// MK_FORMAL_SYNC 1: a __syncwarp after the last arrival's fence (lane 0's atom -> fence is the acquire; bar.warp.sync,
+// unlike the SHFL of the count, orders lanes 1-31's partial loads after it: PTX 9.7.13.2; correct6 F3)
+#ifndef MK_FORMAL_SYNC
+#define MK_FORMAL_SYNC 0
+#endif
+
+#if MK_Q32N
+// K2 combine of tokens t0 .. t0 + N - 1 at row `row` of 32-row group j (resid_wv / resid_ck_last): their partial and residual
+// loads, the sums (((p0 + p1) + p2) + p3) + x and x stores, then one q32_store_n. ss as an uncontracted FMUL (today's SASS)
+template <int N>
+__device__ __forceinline__ void k2_combine(float * x, int t0, int j, int row, float wn) {
+    float p[N][WV_S], xo[N], v[N], ss[N];
+#pragma unroll
+    for (int u = 0; u < N; u++) {
+#pragma unroll
+        for (int k = 0; k < WV_S; k++) p[u][k] = __ldcg(cB.wvpart + ((size_t) k * RMAX + t0 + u) * D + row);
+        xo[u] = __ldcg(x + (t0 + u) * D + row);
+    }
+#pragma unroll
+    for (int u = 0; u < N; u++) {
+        float s = p[u][0];
+#pragma unroll
+        for (int k = 1; k < WV_S; k++) s += p[u][k];
+        const float xv = s + xo[u];
+        x[(t0 + u) * D + row] = xv;
+        v[u] = xv * wn;
+        ss[u] = __fmul_rn(xv, xv);
+    }
+    q32_store_n<N>(cB.qn, t0, j, v, ss);
+}
+#endif
 
 // Output rows with the residual add (out: K = VD, ffn_down: K = FF, X16 = its per-16 activations), split-K WV_S chunks
 // (wv_chunk: each chunk's blocks deal all D / 16 tiles). Each chunk's partial sums go to cB.wvpart; the last of the 2 WV_S (tile, chunk)
@@ -1349,6 +1386,9 @@ __device__ __noinline__ void resid_wv(const Mat & Wm, const QBuf & in, const flo
         const unsigned old = wv_arrive(cnt + (tile >> 1), lane);
         if (old == 2 * WV_S - 1) { // last arrival at this 32-row group
             __threadfence();
+#if MK_FORMAL_SYNC
+            __syncwarp();
+#endif
             const int j = tile >> 1, row = 32 * j + lane;
             if (cB.k2) {
                 // K2: the K2-off loop below makes one dependent L2 round trip (+ q32_store's shuffle chains) per token,
@@ -1357,6 +1397,12 @@ __device__ __noinline__ void resid_wv(const Mat & Wm, const QBuf & in, const flo
                 // + x: bit-exact.
                 constexpr int TB = MK_K2_TB < T ? MK_K2_TB : T;
                 const float wn = wnext[row];
+#if MK_Q32N
+                constexpr int NB = T / TB, TL = T - NB * TB; // (TB-token batches, then a T % TB tail)
+#pragma unroll
+                for (int tb = 0; tb < NB * TB; tb += TB) k2_combine<TB>(x, tb, j, row, wn);
+                if constexpr (TL > 0) k2_combine<TL>(x, NB * TB, j, row, wn);
+#else
 #pragma unroll // (T, TB compile-time: no runtime guards; x stores keep the batches apart)
                 for (int tb = 0; tb < T; tb += TB) {
                     float p[TB][WV_S], xo[TB];
@@ -1378,6 +1424,7 @@ __device__ __noinline__ void resid_wv(const Mat & Wm, const QBuf & in, const flo
                             q32_store(cB.qn, tb + u, j, xv * wn, xv * xv, true);
                         }
                 }
+#endif
             } else {
 #pragma unroll 1
                 for (int t = 0; t < T; t++) {
@@ -2210,9 +2257,18 @@ __device__ __noinline__ void resid_ck_last(int tile, const float * wnext, int ro
     float * x = cB.x;
     if (wv_arrive(cnt + (tile >> 1)) != 2 * WV_S - 1) return;
     __threadfence();
+#if MK_FORMAL_SYNC
+    __syncwarp();
+#endif
     const int jj = tile >> 1, row = 32 * jj + lane;
     constexpr int TB = MK_K2_TB < 8 ? MK_K2_TB : 8;
     const float wn = wnext[row];
+#if MK_Q32N
+    constexpr int NB = T / TB, TL = T - NB * TB;
+#pragma unroll 1
+    for (int tb = 0; tb < NB * TB; tb += TB) k2_combine<TB>(x, tb, jj, row, wn);
+    if constexpr (TL > 0) k2_combine<TL>(x, NB * TB, jj, row, wn);
+#else
 #pragma unroll 1
     for (int tb = 0; tb < T; tb += TB) {
         float p[TB][WV_S], xo[TB];
@@ -2234,6 +2290,7 @@ __device__ __noinline__ void resid_ck_last(int tile, const float * wnext, int ro
                 q32_store(cB.qn, tb + u, jj, xv * wn, xv * xv, true);
             }
     }
+#endif
     if (lane == 0) cnt[jj] = 0;
 }
 
