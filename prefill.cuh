@@ -186,32 +186,28 @@ __global__ void __launch_bounds__(256) pk_ab(const float * Wab, const int8_t * a
 // a k step costs 2 x float4 + 3 x float2 shared loads per 48 FMAs (pk_ab: 1 + 3 per 24; it is bound by its shared-memory
 // wavefronts), the x tile is stored without bank conflicts, and the next tile's global loads are in flight during the
 // FMAs (pk_ab loads, stores, then computes). Thread (tg, rg): tokens 4 tg + {0..3} and 32 + 4 tg + {0..3} (8 lanes read 128
-// contiguous bytes), rows 6 rg + {0..5}. TPC 32 (MK_PFX bit 32 off): 32 tokens per block, thread = tokens 4 tg + {0..3} x the
-// same rows: twice the blocks (256 at T 1024), so the ones left after the DN in-projection GEMMs spread over more SMs. Which
-// thread or block computes an output does not enter its value (the same chain from 0 over the split's k, times rs).
-template <bool Q8, int TPC = 64>
+// contiguous bytes), rows 6 rg + {0..5}.
+template <bool Q8>
 __global__ void __launch_bounds__(128, 4) pk_ab2(const float * Wab, const int8_t * abq, const __half * abd, const float * fn, int T) { MK_VIEW_INIT();
-    static_assert(TPC == 64 || TPC == 32, "pk_ab2 TPC");
-    constexpr int NG = TPC / 32; // groups of 4 tokens per thread: 32 g + 4 tg + {0..3}
-    __shared__ __align__(16) float sx[32][TPC + 4]; // [k][token]
+    __shared__ __align__(16) float sx[32][64 + 4]; // [k][token]
     __shared__ __align__(16) float sw[32][96 + 4]; // [k][row]
     const int tid = threadIdx.x, tg = tid & 7, rg = tid >> 3;
-    const int t0 = blockIdx.x * TPC, k00 = blockIdx.y * AB_KS;
-    const int xt = tid & (TPC - 1), xk = 4 * (tid / TPC); // x fill: token xt, k quads xk + 512 / TPC m (lanes along tokens)
+    const int t0 = blockIdx.x * 64, k00 = blockIdx.y * AB_KS;
+    const int xt = tid & 63, xk = 4 * (tid >> 6); // x fill: token xt, k quads xk + 8 m (lanes along tokens)
     const int wk = 4 * (tid & 7), wr = tid >> 3;  // w fill: rows wr + 16 m, k quad wk (as pk_ab)
-    float acc[4 * NG][6];
+    float acc[8][6];
 #pragma unroll
-    for (int i = 0; i < 4 * NG; i++)
+    for (int i = 0; i < 8; i++)
 #pragma unroll
         for (int j = 0; j < 6; j++) acc[i][j] = 0.f;
-    float4 px[TPC / 16], pw[Q8 ? 1 : 6]; // Q8: pw[0] = fn of the quad
+    float4 px[4], pw[Q8 ? 1 : 6]; // Q8: pw[0] = fn of the quad
     int pq[Q8 ? 6 : 1];
     __half pd[Q8 ? 6 : 1];
     const bool xin = t0 + xt < T;
     auto load = [&](int k0) {
 #pragma unroll
-        for (int m = 0; m < TPC / 16; m++)
-            px[m] = xin ? __ldg(reinterpret_cast<const float4 *>(cP.x + (size_t) (t0 + xt) * D + k0 + xk + 512 / TPC * m))
+        for (int m = 0; m < 4; m++)
+            px[m] = xin ? __ldg(reinterpret_cast<const float4 *>(cP.x + (size_t) (t0 + xt) * D + k0 + xk + 8 * m))
                         : make_float4(0.f, 0.f, 0.f, 0.f);
 #pragma unroll
         for (int m = 0; m < 6; m++) {
@@ -227,8 +223,8 @@ __global__ void __launch_bounds__(128, 4) pk_ab2(const float * Wab, const int8_t
     };
     auto store = [&] {
 #pragma unroll
-        for (int m = 0; m < TPC / 16; m++) {
-            const int kk = xk + 512 / TPC * m;
+        for (int m = 0; m < 4; m++) {
+            const int kk = xk + 8 * m;
             sx[kk][xt] = px[m].x; sx[kk + 1][xt] = px[m].y; sx[kk + 2][xt] = px[m].z; sx[kk + 3][xt] = px[m].w;
         }
 #pragma unroll
@@ -256,25 +252,22 @@ __global__ void __launch_bounds__(128, 4) pk_ab2(const float * Wab, const int8_t
         if (k0 + 32 < k00 + AB_KS) load(k0 + 32);
 #pragma unroll 4
         for (int kk = 0; kk < 32; kk++) {
-            float xv[4 * NG];
-#pragma unroll
-            for (int g = 0; g < NG; g++) {
-                const float4 xa = *reinterpret_cast<const float4 *>(&sx[kk][32 * g + 4 * tg]);
-                xv[4 * g] = xa.x, xv[4 * g + 1] = xa.y, xv[4 * g + 2] = xa.z, xv[4 * g + 3] = xa.w;
-            }
+            const float4 xa = *reinterpret_cast<const float4 *>(&sx[kk][4 * tg]);
+            const float4 xb = *reinterpret_cast<const float4 *>(&sx[kk][32 + 4 * tg]);
             const float2 w0 = *reinterpret_cast<const float2 *>(&sw[kk][6 * rg]);
             const float2 w1 = *reinterpret_cast<const float2 *>(&sw[kk][6 * rg + 2]);
             const float2 w2 = *reinterpret_cast<const float2 *>(&sw[kk][6 * rg + 4]);
+            const float xv[8] = {xa.x, xa.y, xa.z, xa.w, xb.x, xb.y, xb.z, xb.w};
             const float wv[6] = {w0.x, w0.y, w1.x, w1.y, w2.x, w2.y};
 #pragma unroll
-            for (int i = 0; i < 4 * NG; i++)
+            for (int i = 0; i < 8; i++)
 #pragma unroll
                 for (int j = 0; j < 6; j++) acc[i][j] = fmaf(xv[i], wv[j], acc[i][j]);
         }
         __syncthreads();
     }
 #pragma unroll
-    for (int i = 0; i < 4 * NG; i++) {
+    for (int i = 0; i < 8; i++) {
         const int t = t0 + (i < 4 ? 4 * tg + i : 32 + 4 * tg + i - 4);
         if (t >= T) continue;
         const float rs = __ldg(cP.rs + t);

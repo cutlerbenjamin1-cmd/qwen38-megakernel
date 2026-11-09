@@ -6868,15 +6868,12 @@ void pk_ab(const float * Wab, const int8_t * abq, const __half * abd, const floa
     ::pk_ab<<<dim3((T + 63) / 64, AB_SPLITS), 256, 0, st>>>(Wab, abq, abd, fn, T);
 }
 void pk_ab2(const float * Wab, const int8_t * abq, const __half * abd, const float * fn, int T, cudaStream_t st, bool old) {
-    if (old) { // MK_PFX bit 32: 64 tokens per block
-        const dim3 grid((T + 63) / 64, AB_SPLITS);
-        if (abq) ::pk_ab2<true><<<grid, 128, 0, st>>>(Wab, abq, abd, fn, T);
-        else ::pk_ab2<false><<<grid, 128, 0, st>>>(Wab, abq, abd, fn, T);
-    } else {
-        const dim3 grid((T + 31) / 32, AB_SPLITS);
-        if (abq) ::pk_ab2<true, 32><<<grid, 128, 0, st>>>(Wab, abq, abd, fn, T);
-        else ::pk_ab2<false, 32><<<grid, 128, 0, st>>>(Wab, abq, abd, fn, T);
-    }
+    // 16 KB of unused dynamic shared memory per block (unless MK_PFX bit 32): at most 2 blocks per SM instead of 4, so the blocks
+    // that run beside the gate GEMM's last wave spread over twice the SMs (21.5 KB static + 16 + 1 reserved: 3 x 38.5 > 100 KB)
+    const dim3 grid((T + 63) / 64, AB_SPLITS);
+    const int pad = old ? 0 : 16 * 1024;
+    if (abq) ::pk_ab2<true><<<grid, 128, pad, st>>>(Wab, abq, abd, fn, T);
+    else ::pk_ab2<false><<<grid, 128, pad, st>>>(Wab, abq, abd, fn, T);
 }
 void pk_dn_prep(int T, int n0, int dl, const float * convw, const float * dt, const float * A) {
     ::pk_dn_prep<<<T, 256>>>(T, n0, dl, convw, dt, A);
