@@ -1285,15 +1285,47 @@ __device__ __forceinline__ void a9_k_rows(uint8_t * st, int r0, unsigned on) {
     }
 }
 
-template <bool QROW, bool KLOW, bool EXA = false, int KB = 0, int VB = 0>
+// pk_attn9's exact critical-path variants (wave 6, notes r1108prof/wave6/pfattn6.md section 5): compile-time, 0 = the kernel as
+// committed. The engine instantiates A9F = A9_FLAGS; bench/attn_bench also builds A9F = 0 (and A9_TV's values) to time them in
+// one process. Every variant keeps each output's floating-point operations, operands and order (exactness notes at each site).
+// A9_RS 1 (A9F 1): half 1's row-sum chain (LDS, adds, two shuffle rounds, l update) in every warp, without a branch, inside the
+// P V block; the result is kept by half 1 only. A9_CP bit 1 (A9F 2): the fast-path copies spread over the S loop instead of all
+// at the barrier; bit 2 (A9F 4): a copy's source = its slot's base + tile offset x stride (one IMAD.WIDE into a fresh pair), no
+// running pointer. A9_MX 1 (A9F 16): row maxima without the shuffle rounds (each lane reads its row's 8 lane maxima of the pair
+// after the pair sync; half 0's partial row sums move to the exchange's free tail). A9_EX 1 (A9F 32): the plain ex2.approx.ftz
+// for the tile's exponentials when no argument of the warp is below -126 (exp2f's subnormal path), else exp2f again.
+#ifndef A9_RS
+#define A9_RS 0
+#endif
+#ifndef A9_CP
+#define A9_CP 0
+#endif
+#ifndef A9_MX
+#define A9_MX 0
+#endif
+#ifndef A9_EX
+#define A9_EX 0
+#endif
+constexpr int A9_FLAGS = (A9_RS ? 1 : 0) | ((A9_CP & 3) << 1) | (A9_MX ? 16 : 0) | (A9_EX ? 32 : 0);
+// = exp2f(x) for x >= -126 and NaN (exp2f is this MUFU.EX2 there; it scales only below -126)
+__device__ __forceinline__ float a9_ex2(float x) {
+    float y;
+    asm("ex2.approx.ftz.f32 %0, %1;" : "=f"(y) : "f"(x));
+    return y;
+}
+
+template <bool QROW, bool KLOW, bool EXA = false, int KB = 0, int VB = 0, int A9F = A9_FLAGS>
 __global__ void __launch_bounds__(A2_NT, 1) pk_attn9(int T, int n0, int slot, int nfull, int S, float * __restrict__ part, int r0 = 0,
                                                      int segt = 0, int exh = 0, float * __restrict__ part2 = nullptr, int exa = 0) { MK_VIEW_INIT();
     static_assert(KB == 0 || (KLOW && KB >= 4 && KB <= 7), "pk_attn9 KB");
     static_assert(VB == 0 || VB == 8 || (VB >= 4 && VB <= 7), "pk_attn9 VB");
+    constexpr bool A9RS = A9F & 1, A9CS = A9F & 2, A9CW = A9F & 4, A9MX = A9F & 16, A9EX = A9F & 32;
     extern __shared__ __align__(16) uint8_t asm_[];
     __half * sV0 = reinterpret_cast<__half *>(asm_ + A8_NS * A8_STG); // [2][32][A2_LD] fp16 V(it) / V(it + 1)
     float2 * xmax = reinterpret_cast<float2 *>(sV0 + 2 * A2_K * A2_LD); // [6][2][32] row maxima (finally: l)
     uint4 * xp = reinterpret_cast<uint4 *>(xmax + 6 * 2 * 32);       // [6][2][32] P fragments
+    float2 * xps = reinterpret_cast<float2 *>(xp + 6 * 2 * 32);     // [6][32] A9_MX: half 0's partial row sums (A2_XCH's tail)
+    (void) xps;
     const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5, g8 = lane >> 2, t4 = lane & 3;
     const int hq = warp >> 1, hf = warp & 1;
     const int nqt = (T + A2_Q - 1) / A2_Q;
@@ -1414,13 +1446,23 @@ __global__ void __launch_bounds__(A2_NT, 1) pk_attn9(int T, int n0, int slot, in
             }
         }
     }
-    auto issue_fast = [&](unsigned sto) {
-        cp_async16_to(smem0 + sto + cpd[0], cps[0]);
-        cps[0] += cpi[0];
+    // A9_CP bit 2: slot k's source for tile it0 + n (cps stays the tile-it0 base; the same address the running pointer has
+    // wherever a copy is issued: a fast tile's predecessors from it0 on are all fast tiles)
+    auto cp_src = [&](int k, int n) { return cps[k] + (size_t) (unsigned) n * (unsigned) cpi[k]; };
+    (void) cp_src;
+    auto issue_fast = [&](unsigned sto, int n) { // (n = tile - it0)
+        if constexpr (A9CW) {
+            cp_async16_to(smem0 + sto + cpd[0], cp_src(0, n));
 #pragma unroll
-        for (int k = 1; k < A9_NSL; k++) {
-            a9_cp16p(tid + A2_NT * k < cpn, smem0 + sto + cpd[k], cps[k]);
-            cps[k] += cpi[k];
+            for (int k = 1; k < A9_NSL; k++) a9_cp16p(tid + A2_NT * k < cpn, smem0 + sto + cpd[k], cp_src(k, n));
+        } else {
+            cp_async16_to(smem0 + sto + cpd[0], cps[0]);
+            cps[0] += cpi[0];
+#pragma unroll
+            for (int k = 1; k < A9_NSL; k++) {
+                a9_cp16p(tid + A2_NT * k < cpn, smem0 + sto + cpd[k], cps[k]);
+                cps[k] += cpi[k];
+            }
         }
         pf::cpa_commit();
     };
@@ -1432,7 +1474,7 @@ __global__ void __launch_bounds__(A2_NT, 1) pk_attn9(int T, int n0, int slot, in
         uint8_t * st = asm_ + (it % A8_NS) * A8_STG;
         if (it < it1) {
             if (it < itf) {
-                issue_fast((it % A8_NS) * A8_STG);
+                issue_fast((it % A8_NS) * A8_STG, j);
             } else {
                 const int kb = it * A2_K, np = min(A2_K, pmax + 1 - kb);
                 a8_st_ks(st, issue_tile(st, it, np));
@@ -1612,14 +1654,31 @@ __global__ void __launch_bounds__(A2_NT, 1) pk_attn9(int T, int n0, int slot, in
         const int ia = it + A8_NS - 1; // refill the stage of tile it - 1 with tile ia
         uint8_t * sta = asm_ + st_c;
         const unsigned cpok = ia < itf && ia < it1;
-        a9_cp16p(cpok, smem0 + st_c + cpd[0], cps[0]);
-        cps[0] += cpi[0];
+        auto cp_slot = [&](int k) { // copy slot k of tile ia (A9_CP)
+            const unsigned p = k ? cpok & (tid + A2_NT * k < cpn) : cpok;
+            if constexpr (A9CW) {
+                a9_cp16p(p, smem0 + st_c + cpd[k], cp_src(k, ia - it0));
+            } else {
+                a9_cp16p(p, smem0 + st_c + cpd[k], cps[k]);
+                cps[k] += cpi[k];
+            }
+        };
+        (void) cp_slot;
+        if constexpr (!A9CS) {
+            if constexpr (A9CW) {
 #pragma unroll
-        for (int k = 1; k < A9_NSL; k++) {
-            a9_cp16p(cpok & (tid + A2_NT * k < cpn), smem0 + st_c + cpd[k], cps[k]);
-            cps[k] += cpi[k];
+                for (int k = 0; k < A9_NSL; k++) cp_slot(k);
+            } else {
+                a9_cp16p(cpok, smem0 + st_c + cpd[0], cps[0]);
+                cps[0] += cpi[0];
+#pragma unroll
+                for (int k = 1; k < A9_NSL; k++) {
+                    a9_cp16p(cpok & (tid + A2_NT * k < cpn), smem0 + st_c + cpd[k], cps[k]);
+                    cps[k] += cpi[k];
+                }
+            }
+            pf::cpa_commit();
         }
-        pf::cpa_commit();
         const uint8_t * st = asm_ + st_a;
         const unsigned ka = smem0 + st_a + kofs;
         // K(it + 1), V(it + 1) in the main format (their stage landed before this tile's barrier; a tile past it1 converts a stale stage
@@ -1662,6 +1721,12 @@ __global__ void __launch_bounds__(A2_NT, 1) pk_attn9(int T, int n0, int slot, in
                 s[1][2] = fmaf(a8_i2f(d1[2]), q1 * k1.x, s[1][2]);
                 s[1][3] = fmaf(a8_i2f(d1[3]), q1 * k1.y, s[1][3]);
             }
+            // A9_CP bit 1: slot k after block 2 k + 1 (its fragment and scale loads are issued), off the barrier's load burst;
+            // the stage is free from barrier(it) on and the group must land by barrier(it + 1): it does, it is committed here
+            if constexpr (A9CS) {
+                if (b % 2 == 1 && b / 2 < A9_NSL) cp_slot(b / 2);
+                if (b == 2 * A9_NSL - 1) pf::cpa_commit();
+            }
         }
         if constexpr (QROW) {
 #pragma unroll
@@ -1684,25 +1749,64 @@ __global__ void __launch_bounds__(A2_NT, 1) pk_attn9(int T, int n0, int slot, in
             }
         }
         float mx0 = fmaxf(fmaxf(s[0][0], s[0][1]), fmaxf(s[1][0], s[1][1])), mx1 = fmaxf(fmaxf(s[0][2], s[0][3]), fmaxf(s[1][2], s[1][3]));
-        mx0 = fmaxf(mx0, __shfl_xor_sync(0xffffffffu, mx0, 1));
-        mx0 = fmaxf(mx0, __shfl_xor_sync(0xffffffffu, mx0, 2));
-        mx1 = fmaxf(mx1, __shfl_xor_sync(0xffffffffu, mx1, 1));
-        mx1 = fmaxf(mx1, __shfl_xor_sync(0xffffffffu, mx1, 2));
+        if constexpr (!A9MX) {
+            mx0 = fmaxf(mx0, __shfl_xor_sync(0xffffffffu, mx0, 1));
+            mx0 = fmaxf(mx0, __shfl_xor_sync(0xffffffffu, mx0, 2));
+            mx1 = fmaxf(mx1, __shfl_xor_sync(0xffffffffu, mx1, 1));
+            mx1 = fmaxf(mx1, __shfl_xor_sync(0xffffffffu, mx1, 2));
+        }
         xmax[tid] = make_float2(mx0, mx1);
         a2_pair_sync(hq);
-        {
+        if constexpr (A9MX) {
+            // the lane maxima of the row's quad in this warp and in the partner: the max of the same 32 scores (fmaxf is
+            // order-free here: NaN is dropped in any order, and no score is -0, so there is no signed-zero tie). Read by both
+            // halves until pair sync 2: half 0's partial sums go to xps, not into these slots.
+            const float4 * qo = reinterpret_cast<const float4 *>(xmax + (tid & ~3)), * qp = reinterpret_cast<const float4 *>(xmax + ((tid ^ 32) & ~3));
+            const float4 a = qo[0], b = qo[1], c = qp[0], d = qp[1];
+            mx0 = fmaxf(fmaxf(fmaxf(a.x, a.z), fmaxf(b.x, b.z)), fmaxf(fmaxf(c.x, c.z), fmaxf(d.x, d.z)));
+            mx1 = fmaxf(fmaxf(fmaxf(a.y, a.w), fmaxf(b.y, b.w)), fmaxf(fmaxf(c.y, c.w), fmaxf(d.y, d.w)));
+        } else {
             const float2 t = xmax[tid ^ 32];
             mx0 = fmaxf(mx0, t.x);
             mx1 = fmaxf(mx1, t.y);
         }
         const float mn0 = fmaxf(m0, mx0), mn1 = fmaxf(m1, mx1);
         float pv[2][4];
+        float al0, al1;
+        if constexpr (A9EX) {
+            // A9_EX: exp2f(x) is the bare MUFU.EX2 for x >= -126 and NaN, so with every argument of the warp there (min ignores
+            // NaN; any -inf or all-NaN argument sends the warp to exp2f) the plain ex2.approx.ftz gives exp2f's bits; else
+            // exp2f again. Same arguments (the same FADDs) either way.
+            float xa[2][4];
 #pragma unroll
-        for (int ni = 0; ni < 2; ni++)
+            for (int ni = 0; ni < 2; ni++)
 #pragma unroll
-            for (int j = 0; j < 4; j++) pv[ni][j] = exp2f(s[ni][j] - (j < 2 ? mn0 : mn1));
-        // mn < -inf can only happen in a warp with a row not yet finite: exp2f(NaN) -> 0 there (a8_ex2's selection); P above, al below
-        float al0 = exp2f(m0 - mn0), al1 = exp2f(m1 - mn1);
+                for (int j = 0; j < 4; j++) xa[ni][j] = s[ni][j] - (j < 2 ? mn0 : mn1);
+            const float xb0 = m0 - mn0, xb1 = m1 - mn1;
+#pragma unroll
+            for (int ni = 0; ni < 2; ni++)
+#pragma unroll
+                for (int j = 0; j < 4; j++) pv[ni][j] = a9_ex2(xa[ni][j]);
+            al0 = a9_ex2(xb0);
+            al1 = a9_ex2(xb1);
+            const float lo = fminf(fminf(fminf(fminf(xa[0][0], xa[0][1]), fminf(xa[1][0], xa[1][1])), fminf(fminf(xa[0][2], xa[0][3]), fminf(xa[1][2], xa[1][3]))),
+                                   fminf(xb0, xb1));
+            if (!__all_sync(0xffffffffu, lo >= -126.f)) {
+#pragma unroll
+                for (int ni = 0; ni < 2; ni++)
+#pragma unroll
+                    for (int j = 0; j < 4; j++) pv[ni][j] = exp2f(xa[ni][j]);
+                al0 = exp2f(xb0);
+                al1 = exp2f(xb1);
+            }
+        } else {
+#pragma unroll
+            for (int ni = 0; ni < 2; ni++)
+#pragma unroll
+                for (int j = 0; j < 4; j++) pv[ni][j] = exp2f(s[ni][j] - (j < 2 ? mn0 : mn1));
+            // mn < -inf can only happen in a warp with a row not yet finite: exp2f(NaN) -> 0 there (a8_ex2's selection); P above, al below
+            al0 = exp2f(m0 - mn0), al1 = exp2f(m1 - mn1);
+        }
         if (mnf == 0) {
             al0 = mn0 == -INFINITY ? 1.f : al0;
             al1 = mn1 == -INFINITY ? 1.f : al1;
@@ -1730,12 +1834,26 @@ __global__ void __launch_bounds__(A2_NT, 1) pk_attn9(int T, int n0, int slot, in
             ps0 += x0[1];
             ps1 += x1[0];
             ps1 += x1[1];
-            xmax[tid | 32] = make_float2(ps0, ps1);
+            if constexpr (A9MX) xps[hq * 32 + lane] = make_float2(ps0, ps1);
+            else xmax[tid | 32] = make_float2(ps0, ps1);
         }
         a2_pair_sync(hq);
         const uint4 P0 = xp[tid & ~32], P1 = xp[tid | 32];
-        if (hf == 1) {
-            const float2 t = xmax[tid];
+        // A9_RS: half 1's row-sum chain in every warp, finished in the P V block. Half 0 reads its own slot (xmax[tid]: its maxima,
+        // read-only until its next maxima store; xps: its own partial sums, rewritten only by itself after the next pair sync 1)
+        // and drops the result. Half 1: the same adds and shuffles in the same order as below.
+        float rs0 = 0.f, rs1 = 0.f;
+        (void) rs0, (void) rs1;
+        if constexpr (A9RS) {
+            const float2 t = A9MX ? xps[hq * 32 + lane] : xmax[tid];
+            rs0 = t.x;
+            rs1 = t.y;
+            rs0 += x0[0];
+            rs0 += x0[1];
+            rs1 += x1[0];
+            rs1 += x1[1];
+        } else if (hf == 1) {
+            const float2 t = A9MX ? xps[hq * 32 + lane] : xmax[tid];
             float ps0 = t.x, ps1 = t.y;
             ps0 += x0[0];
             ps0 += x0[1];
@@ -1771,6 +1889,16 @@ __global__ void __launch_bounds__(A2_NT, 1) pk_attn9(int T, int n0, int slot, in
                     if (j == 3) a9_cv<VB>(stv, sVc, 0, vbs);
                     if (j == 6) a9_cv<VB>(stv, sVc, 1, vbs);
                 }
+                if constexpr (A9RS) { // the two shuffle rounds between the first HMMA groups
+                    if (j == 1) {
+                        rs0 += __shfl_xor_sync(0xffffffffu, rs0, 1);
+                        rs1 += __shfl_xor_sync(0xffffffffu, rs1, 1);
+                    }
+                    if (j == 2) {
+                        rs0 += __shfl_xor_sync(0xffffffffu, rs0, 2);
+                        rs1 += __shfl_xor_sync(0xffffffffu, rs1, 2);
+                    }
+                }
                 a2_ldsm_t(b, va + 32 * j);
                 pf::hmma16z(h0, A0, b[0], b[1]);
                 pf::hmma16z(h1, A0, b[2], b[3]);
@@ -1788,6 +1916,10 @@ __global__ void __launch_bounds__(A2_NT, 1) pk_attn9(int T, int n0, int slot, in
                 o[2 * j + 1][2] = o[2 * j + 1][2] * al1 + w1.x;
                 o[2 * j + 1][3] = o[2 * j + 1][3] * al1 + w1.y;
             }
+        }
+        if constexpr (A9RS) { // the hf == 1 block's l * al + ps compiles to this FFMA (contracted); half 0 keeps its l
+            l0 = hf ? __fmaf_rn(l0, al0, rs0) : l0;
+            l1 = hf ? __fmaf_rn(l1, al1, rs1) : l1;
         }
         if (ia < it1 && ia >= itf) { // not on the copy plan
             const int kba = ia * A2_K, npa = min(A2_K, pmax + 1 - kba);
