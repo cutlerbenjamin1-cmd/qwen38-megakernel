@@ -1234,6 +1234,7 @@ MKEngine::Impl::Impl(const std::string & path, int ctx_, int ndraft_, const std:
     }
     fprintf(stderr, "[mk] K5: split dn_proj -> dn_core barrier, delta-net heads in dn_proj arrival order\n");
     fprintf(stderr, "[mk] C1: ffn_gu -> ffn_down per-chunk waits instead of a grid barrier\n");
+    CK(mkl::wv_deal_init(nsm)); // (MK_FFNA builds; every mk_cycle launch that runs a wv phase has nsm blocks)
     hb.ctx = ctx + KV_PAD; // rows per kv head (KV_PAD: the MTP draft rows written past the last admitted position)
     // the device buffers after the KV cache (MK_RESERVE_EARLY: before it, so that its fit check sees them)
     auto dev_bufs = [&] {

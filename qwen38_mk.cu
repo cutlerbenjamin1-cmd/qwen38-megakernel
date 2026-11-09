@@ -5598,8 +5598,8 @@ __device__ void main_forward(const Launch & P, uint8_t * /*sm*/, unsigned & epoc
         if (ml_W().attn) {
             {
                 const LayerW & W = ml_W();
-                if constexpr (WIDE) attn_proj_wv<T>(W, ml_L() / 4, ml_n());
-                else if (W.q.fm || W.k.fm || W.v.fm) attn_proj_wv<T>(W, ml_L() / 4, ml_n());
+                if constexpr (WIDE) attn_proj_wv<T>(WV_LAYER_ARG(W, ml_L()), ml_L() / 4, ml_n());
+                else if (W.q.fm || W.k.fm || W.v.fm) attn_proj_wv<T>(WV_LAYER_ARG(W, ml_L()), ml_L() / 4, ml_n());
                 else attn_proj<T>(W, ml_L() / 4, ml_n(), sm);
             }
             gsync(epoch, PH_ATTN_PROJ);
@@ -5616,8 +5616,8 @@ __device__ void main_forward(const Launch & P, uint8_t * /*sm*/, unsigned & epoc
         } else {
             {
                 const LayerW & W = ml_W();
-                if constexpr (WIDE) dn_proj_wv<T>(W, ml_dl(), ml_n(), ml_dnc());
-                else if (W.qkv.fm || W.gate.fm) dn_proj_wv<T>(W, ml_dl(), ml_n(), ml_dnc());
+                if constexpr (WIDE) dn_proj_wv<T>(WV_LAYER_ARG(W, ml_L()), ml_dl(), ml_n(), ml_dnc());
+                else if (W.qkv.fm || W.gate.fm) dn_proj_wv<T>(WV_LAYER_ARG(W, ml_L()), ml_dl(), ml_n(), ml_dnc());
                 else dn_proj<T>(W, ml_dl(), ml_n(), ml_dnc(), sm);
             }
             k5_arrive(epoch, PH_DN_PROJ); // split barrier: dn_core waits after its replay (k5_wait)
@@ -6263,7 +6263,7 @@ __device__ __noinline__ void main_forward_b(const Launch & P, unsigned & epoch) 
             if constexpr (CK) attn_proj_ck<RT>(W);
             else
 #endif
-                attn_proj_wv<RT>(W, L / 4, 0, false);
+                attn_proj_wv<RT>(WV_LAYER_ARG(W, L), L / 4, 0, false);
             gsync(epoch, PH_ATTN_PROJ);
             int ab0 = 0; // lane i's items start on the block after lane i - 1's last one (att_rank)
             for (int i = 0; i < P.nl; i++) {
@@ -6297,7 +6297,7 @@ __device__ __noinline__ void main_forward_b(const Launch & P, unsigned & epoch) 
             if constexpr (CK) dn_proj_ck<RT>(W, dl, row_tab(P));
             else
 #endif
-                dn_proj_wv<RT, true>(W, dl, 0, 0, row_tab(P));
+                dn_proj_wv<RT, true>(WV_LAYER_ARG(W, L), dl, 0, 0, row_tab(P));
             gsync(epoch, PH_DN_PROJ);
             for (int it = blockIdx.x; it < P.nl * NVH; it += gridDim.x) {
                 const int i = it / NVH;
@@ -6494,7 +6494,7 @@ __device__ void bench_phase(int which, int layer, uint8_t * /*sm*/, unsigned & e
             else resid_any<T, 17>(W.fd, cB.qa, cB.x, true, W.attn_norm, sm);
         } else if (which == 2) {
             if (!W.attn) {
-                if (W.qkv.fm || W.gate.fm) dn_proj_wv<T>(W, 0, 0, 0);
+                if (W.qkv.fm || W.gate.fm) dn_proj_wv<T>(WV_LAYER_ARG(W, L), 0, 0, 0);
                 else dn_proj<T>(W, 0, 0, 0, sm);
             }
         }
@@ -6968,6 +6968,46 @@ cudaError_t set_cView(const void * src, size_t count, size_t offset) { return cu
 #if MK_L2_TUNE
 cudaError_t set_cL2(const void * src, size_t count, size_t offset) { return cudaMemcpyToSymbol(::cL2, src, count, offset); }
 #endif
+// MK_FFNA (wv.cuh WvDeal): the wv phase tops' per-block dealing for nsm blocks with the old prologues' integer formulas,
+// then k_deal_check compares every entry with the device formulas (a difference: a message and cudaErrorInvalidValue)
+cudaError_t wv_deal_init(int nsm) {
+#if MK_FFNA & 9
+    if (nsm < 1 || nsm > MK_MAX_GRID) return cudaErrorInvalidValue;
+    WvDeal h[MK_MAX_GRID] = {};
+    const unsigned nb = (unsigned) nsm, NJ = FF / 16, NTILE = D / 16, NTL = QKV / 16 + VD / 16, NQ = QKV / 16, NAB = AB_SPLIT * 2 * NVH,
+                   NJC = C1_NJC;
+    const auto pk = [](unsigned t0, unsigned t1) { return t0 | t1 << 16; };
+    for (unsigned b = 0; b < nb; b++) {
+        const unsigned kc = (WV_S * b + WV_S - 1) / nb, c0 = nb * kc / WV_S, G = nb * (kc + 1) / WV_S - c0, bi = b - c0;
+        h[b].c1 = pk(NJC * kc + NJC * bi / G, NJC * kc + NJC * (bi + 1) / G);
+        h[b].ff = pk(NJ * b / nb, NJ * (b + 1) / nb);
+        h[b].rt = pk(NTILE * bi / G, NTILE * (bi + 1) / G);
+        h[b].dn = pk(NTL * b / nb, NTL * (b + 1) / nb);
+        h[b].qk = pk(NQ * b / nb, NQ * (b + 1) / nb);
+        h[b].ab = pk(NAB * b / nb, NAB * (b + 1) / nb);
+        h[b].kc = (int) kc;
+    }
+    const int zero = 0;
+    int bad = 0;
+    cudaError_t e = cudaMemcpyToSymbol(::cDeal, h, sizeof h);
+    if (e == cudaSuccess) e = cudaMemcpyToSymbol(::g_deal_bad, &zero, sizeof zero);
+    if (e == cudaSuccess) {
+        ::k_deal_check<<<nsm, 32>>>();
+        e = cudaGetLastError();
+    }
+    if (e == cudaSuccess) e = cudaMemcpyFromSymbol(&bad, ::g_deal_bad, sizeof bad);
+    if (e != cudaSuccess) return e;
+    if (bad) {
+        fprintf(stderr, "[mk] MK_FFNA: %d of %d blocks' dealing table entries differ from the device formulas\n", bad, nsm);
+        return cudaErrorInvalidValue;
+    }
+    fprintf(stderr, "[mk] MK_FFNA: wv phase-top dealing table, %d blocks (checked)\n", nsm);
+    return cudaSuccess;
+#else
+    (void) nsm;
+    return cudaSuccess;
+#endif
+}
 cudaError_t set_cP(const void * src, size_t count, size_t offset) { return cudaMemcpyToSymbol(::cP, src, count, offset); }
 cudaError_t set_g_iq3s_grid(const void * src, size_t count, size_t offset) {
     return cudaMemcpyToSymbol(::g_iq3s_grid, src, count, offset);
