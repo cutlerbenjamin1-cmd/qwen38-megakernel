@@ -450,14 +450,16 @@ __host__ __device__ constexpr int wv_smem() {
     return 2 * C::NTOKP * (US + 2) * 16 + T * (US + 2) * 8 + US * C::NG * 4 * (!X16 ? 40 : 24);
 }
 
-// MK_FFNA bits (wave 6, top6; exact: integer bookkeeping and load order only; 7 = all, 0 = the old prologues):
-// 1 the wv phase tops without run-time divisions (cDeal, the per-block dealing table: ffn_gu_wv, c1_arrive_mine, resid_wv,
-//   dn_proj_wv; attn_proj_wv's row-half split by a shift) and ffn_gu_wv's loop state in one word;
-// 2 wv_fill's ssq loads ahead of its copies; 4 wv_fill's meta group first (md / mx / mx4 while xa / xb land, as wv_fill_ckp)
+// MK_FFNA bits (wave 6, top6; exact: integer bookkeeping and load order only; 15 = all, 0 = the old prologues):
+// 1 ffn_gu_wv / c1_arrive_mine / resid_wv without run-time divisions (cDeal, the per-block dealing table) and ffn_gu_wv's
+//   loop state in one word; 2 wv_fill's ssq loads ahead of its copies; 4 wv_fill's meta group first (md / mx / mx4 while
+//   xa / xb land, as wv_fill_ckp); 8 dn_proj_wv / attn_proj_wv without run-time divisions (cDeal; the row-half split by a
+//   shift). (8 apart: with every bit on, their T = 8 instances kept more values in stack slots and their tile parts ran
+//   ~1 us longer per call; 8 is the suspect)
 #ifndef MK_FFNA
 #define MK_FFNA 0
 #endif
-#if MK_FFNA & 1
+#if MK_FFNA & 9
 // The wv phase tops' dealing per block b of the engine's grid (nsm blocks: every mk_cycle launch that runs a wv phase),
 // each range [t0, t1) as t0 | t1 << 16: the old prologues' integer formulas evaluated on the host (mkl::wv_deal_init) and
 // compared with the device formulas once at init (k_deal_check). One LDC instead of the two division chains (gridDim, the
@@ -889,7 +891,7 @@ __device__ __forceinline__ void pf_l2n(const void * p) { asm volatile("prefetch.
 constexpr int WV_PFD = MK_PFW > 1 ? MK_PFW : 1, WV_PFD_C1 = MK_C1PF > 1 ? MK_C1PF : 1;
 template <int NU = 1>
 __device__ __forceinline__ void wv_pf_unit(const Mat & m, int tile, int sb, int part = 0, int nparts = 1) {
-#if MK_FFNA & 1
+#if MK_FFNA & 8
     const int lane = threadIdx.x & 31, ub = wv_ubytes(m.type), pb = ub >> (nparts - 1); // (nparts 1 or 2: no division)
 #else
     const int lane = threadIdx.x & 31, ub = wv_ubytes(m.type), pb = ub / nparts;
@@ -1006,7 +1008,7 @@ __device__ __noinline__ void dn_proj_wv(const LayerW & W, int dl, int n, int dn_
     const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
     const int nt_q = W.qkv.fm && W.gate.fm ? -1 : W.qkv.fm ? QKV / 16 : 0; // (dn_tile)
     const int ntile = (W.qkv.fm ? QKV / 16 : 0) + (W.gate.fm ? VD / 16 : 0);
-#if MK_FFNA & 1
+#if MK_FFNA & 8
     // (the range of ntile b / G: both in the wv layout dn, qkv only qk, gate only ab (n_ab == VD / 16), neither empty; selects,
     // no branch: a branch's two definitions of t0 / t1 met in stack slots)
     static_assert(AB_SPLIT * 2 * NVH == VD / 16, "dn_proj_wv: the gate-only range is the K1 alpha / beta range");
@@ -1050,7 +1052,7 @@ __device__ __noinline__ void dn_proj_wv(const LayerW & W, int dl, int n, int dn_
     // with upstream's dealing: bit-exact.
     int ab0 = gwarp(), ab1 = n_ab, astep = nwarps();
     if (cB.k1 && W.qkv.fm && W.gate.fm) {
-#if MK_FFNA & 1
+#if MK_FFNA & 8
         const unsigned da = cDeal[blockIdx.x].ab;
         const int nb = t1 - t0; // (both FM: t0 / t1 are the table's NTL range)
         const int nl = NW - nb % NW; // warps 0 .. nl - 1 carry nb / NW tiles, the others one more
@@ -1211,7 +1213,7 @@ __device__ __noinline__ void attn_proj_wv(const LayerW & W, int slot, int n, boo
     if (i0 < i1) { // (the warp's first item, below)
         const int w = i0 < nq ? 0 : i0 < nq + nkk ? 1 : 2;
         const int j = i0 - (w == 0 ? 0 : w == 1 ? nq : nq + nkk), ns = w == 0 ? 1 : w == 1 ? sk : sv;
-#if MK_FFNA & 1
+#if MK_FFNA & 8
         const int lt = j >> (ns - 1); // (ns 1 or 2, j >= 0: j / ns without a division)
         wv_pf_unit(w == 0 ? W.q : w == 1 ? W.k : W.v, lt, 0, j - lt * ns, ns);
 #else
@@ -1233,7 +1235,7 @@ __device__ __noinline__ void attn_proj_wv(const LayerW & W, int slot, int n, boo
     for (int it = i0; it < i1; it += istep) {
         const int w = it < nq ? 0 : it < nq + nkk ? 1 : 2;
         const int j = it - (w == 0 ? 0 : w == 1 ? nq : nq + nkk), ns = w == 0 ? 1 : w == 1 ? sk : sv;
-#if MK_FFNA & 1
+#if MK_FFNA & 8
         const int lt = j >> (ns - 1); // (as above)
 #else
         const int lt = j / ns;
@@ -1335,7 +1337,7 @@ __device__ __forceinline__ void c1_wait(int kc) {
 __device__ __forceinline__ int c1_t0(const WvChunk & ch) { return C1_NJC * ch.kc + C1_NJC * ch.bi / ch.G; }
 __device__ __forceinline__ int c1_t1(const WvChunk & ch) { return C1_NJC * ch.kc + C1_NJC * (ch.bi + 1) / ch.G; }
 
-#if MK_FFNA & 1
+#if MK_FFNA & 9
 // MK_FFNA's init check of cDeal (mkl::wv_deal_init, one launch of nsm blocks): every entry against the device formulas
 __global__ void k_deal_check() {
     if (threadIdx.x != 0) return;

@@ -6799,7 +6799,7 @@ cudaError_t set_cL2(const void * src, size_t count, size_t offset) { return cuda
 // MK_FFNA (wv.cuh WvDeal): the wv phase tops' per-block dealing for nsm blocks with the old prologues' integer formulas,
 // then k_deal_check compares every entry with the device formulas (a difference: a message and cudaErrorInvalidValue)
 cudaError_t wv_deal_init(int nsm) {
-#if MK_FFNA & 1
+#if MK_FFNA & 9
     if (nsm < 1 || nsm > MK_MAX_GRID) return cudaErrorInvalidValue;
     WvDeal h[MK_MAX_GRID] = {};
     const unsigned nb = (unsigned) nsm, NJ = FF / 16, NTILE = D / 16, NTL = QKV / 16 + VD / 16, NQ = QKV / 16, NAB = AB_SPLIT * 2 * NVH,
