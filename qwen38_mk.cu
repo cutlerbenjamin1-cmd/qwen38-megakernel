@@ -305,6 +305,56 @@ __device__ __forceinline__ void q32_store(const QBuf & q, int t, int j, float v,
     }
 }
 
+#ifndef MK_Q32N
+#define MK_Q32N 0 // 1: resid_wv / resid_ck_last's K2 combine runs a batch's q32_store chains interleaved (q32_store_n)
+#endif
+#if MK_Q32N
+// q32_store(q, t0 + i, j, v[i], ss[i], true) for the N tokens i, one warp: the tokens' shuffle chains and divisions
+// interleaved, each token's ops and stores those of q32_store (dn_q32_store's form plus the ssq sum; keep the three in step)
+template <int N>
+__device__ __forceinline__ void q32_store_n(const QBuf & q, int t0, int j, const float (&v)[N], const float (&ss)[N]) {
+    const int lane = threadIdx.x & 31;
+    const int b = j >> 3, p = (j >> 1) & 3, part = j & 1, hh = lane >> 4, byte = lane & 15;
+    float am[N], s[N];
+    int qs[N];
+#pragma unroll
+    for (int i = 0; i < N; i++) am[i] = fabsf(v[i]);
+#pragma unroll
+    for (int o = 16; o > 0; o >>= 1) // wmax
+#pragma unroll
+        for (int i = 0; i < N; i++) am[i] = fmaxf(am[i], __shfl_xor_sync(0xffffffffu, am[i], o));
+#pragma unroll
+    for (int i = 0; i < N; i++) {
+        const float d = am[i] / 127.0f;
+        qs[i] = am[i] == 0.0f ? 0 : (int) roundf(v[i] / d);
+        am[i] = d;
+        (part ? q.xb : q.xa)[((t0 + i) * q.U + 8 * b + 2 * p + hh) * 16 + byte] = (int8_t) qs[i];
+    }
+#pragma unroll
+    for (int o = 8; o > 0; o >>= 1)
+#pragma unroll
+        for (int i = 0; i < N; i++) qs[i] += __shfl_xor_sync(0xffffffffu, qs[i], o);
+    if (byte == 0) {
+#pragma unroll
+        for (int i = 0; i < N; i++) {
+            const int gi = (t0 + i) * q.U + 8 * b + 2 * p + hh;
+            reinterpret_cast<__half *>(q.meta + gi)[part] = __float2half_rn(am[i]);
+            reinterpret_cast<short *>(q.meta + gi)[2 + part] = (short) qs[i];
+        }
+    }
+#pragma unroll
+    for (int i = 0; i < N; i++) s[i] = ss[i];
+#pragma unroll
+    for (int o = 16; o > 0; o >>= 1) // wsum
+#pragma unroll
+        for (int i = 0; i < N; i++) s[i] += __shfl_xor_sync(0xffffffffu, s[i], o);
+    if (lane == 0) {
+#pragma unroll
+        for (int i = 0; i < N; i++) q.ssq[(t0 + i) * q.U + j] = s[i];
+    }
+}
+#endif
+
 struct SX {
     int4 * xa;
     int4 * xb;
