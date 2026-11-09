@@ -998,14 +998,20 @@ __device__ __forceinline__ bool dn_tile(int p, int nt_q, int & lt) {
     return p < nt_q;
 }
 
-// MK_WVREMAT 1 (wave 6, top6; exact: integer bookkeeping only): dn_proj_wv and attn_proj_wv keep only a packed loop word (and
-// n / dn_c) across their tile calls and rebuild W (an element of cW.L, as every caller passes), the dealing range (cDeal) and
-// the derived counts after each call. 0: the old loops
+// MK_WVREMAT 1 (wave 6, top6; exact: integer bookkeeping only): dn_proj_wv and attn_proj_wv take the layer's index li (W =
+// cW.L[li]) instead of W, keep only a packed loop word (and n / dn_c) across their tile calls and rebuild W, the dealing range
+// (cDeal) and the derived counts after each call. 0: the old loops and signatures. Callers pass WV_LAYER_ARG(W, L): L under
+// MK_WVREMAT, W otherwise (W == cW.L[L] at every call site)
 #ifndef MK_WVREMAT
 #define MK_WVREMAT 0
 #endif
 #if MK_WVREMAT && !(MK_FFNA & 9)
 #error "MK_WVREMAT reads the dealing table: build it with MK_FFNA bit 1 or 8"
+#endif
+#if MK_WVREMAT
+#define WV_LAYER_ARG(W, L) (L)
+#else
+#define WV_LAYER_ARG(W, L) (W)
 #endif
 
 // delta-net input projections: alpha / beta (fp32 path, as dn_proj), qkv -> conv ring and z (wv tiles, or dp4a pairs
@@ -1014,7 +1020,12 @@ __device__ __forceinline__ bool dn_tile(int p, int nt_q, int & lt) {
 // each row its lane, the conv-ring rows are looked up at the start (s_cvp); orphan rows (past the lanes) are not stored.
 // No L2 warm-up of dn_core's inputs (they are per lane). Every matrix of the phase must be in the wv layout (host check).
 template <int T, bool BAT = false>
+#if MK_WVREMAT
+__device__ __noinline__ void dn_proj_wv(int li, int dl, int n, int dn_c, RowTab rt = RowTab{}) {
+    const LayerW & W = cW.L[li];
+#else
 __device__ __noinline__ void dn_proj_wv(const LayerW & W, int dl, int n, int dn_c, RowTab rt = RowTab{}) {
+#endif
     const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
     const int nt_q = W.qkv.fm && W.gate.fm ? -1 : W.qkv.fm ? QKV / 16 : 0; // (dn_tile)
     const int ntile = (W.qkv.fm ? QKV / 16 : 0) + (W.gate.fm ? VD / 16 : 0);
@@ -1128,7 +1139,7 @@ __device__ __noinline__ void dn_proj_wv(const LayerW & W, int dl, int n, int dn_
     // to park in stack slots, whatever the whole-program allocation
     static_assert(QKV / 16 + VD / 16 + NW <= 2048 && NLA <= 128 && NL <= 64, "dn_proj_wv's loop word");
     static_assert(AB_SPLIT * 2 * NVH == VD / 16, "dn_proj_wv: the gate-only range is the table's alpha / beta range");
-    unsigned lw = (unsigned) (t0 + (NW - 1 - warp)) | (unsigned) (&W - cW.L) << 11 | (unsigned) dl << 18;
+    unsigned lw = (unsigned) (t0 + (NW - 1 - warp)) | (unsigned) li << 11 | (unsigned) dl << 18;
     asm volatile("" : "+r"(lw));
     for (;; lw += NW) {
         const LayerW & W = cW.L[lw >> 11 & 127u];
@@ -1225,7 +1236,12 @@ __device__ __noinline__ void attn_kv_rh(const Mat m, int w, int lt, int rh, cons
 // attention q / k / v projections (wv tiles of the wv-layout matrices, dp4a pairs of the hybrid's)
 // pf false (batched launches): no L2 warm-up of attn_core's inputs (they are per lane)
 template <int T>
+#if MK_WVREMAT
+__device__ __noinline__ void attn_proj_wv(int li, int slot, int n, bool pf = true) {
+    const LayerW & W = cW.L[li];
+#else
 __device__ __noinline__ void attn_proj_wv(const LayerW & W, int slot, int n, bool pf = true) {
+#endif
     const int warp = threadIdx.x >> 5;
     const int nq = W.q.fm ? QG / 16 : 0, nk = W.k.fm ? KVD / 16 : 0, nv = W.v.fm ? KVD / 16 : 0;
     // K6: items = the q tiles, then the k tiles, then the v tiles; with bit 4 a Q8_0 k / v tile (87 KB vs 56 KB for a
@@ -1270,7 +1286,7 @@ __device__ __noinline__ void attn_proj_wv(const LayerW & W, int slot, int n, boo
     // MK_WVREMAT: across the tile calls only the loop word lw = it | layer << 12 | slot << 19 | pf << 24 | K6 bit 2 << 25 |
     // K6 bit 4 << 26 (and n); W, the item counts, i1 and the step are rebuilt from it after each call (as dn_proj_wv)
     static_assert(QG / 16 + 4 * (KVD / 16) + MK_MAX_GRID * NW <= 4096 && NLA <= 128 && N_ATT_SLOTS <= 32, "attn_proj_wv's loop word");
-    unsigned lw = (unsigned) i0 | (unsigned) (&W - cW.L) << 12 | (unsigned) slot << 19 | (unsigned) pf << 24 |
+    unsigned lw = (unsigned) i0 | (unsigned) li << 12 | (unsigned) slot << 19 | (unsigned) pf << 24 |
                   (unsigned) ((k6 & 2) != 0) << 25 | (unsigned) ((k6 & 4) != 0) << 26;
     asm volatile("" : "+r"(lw));
     for (;; lw += (lw >> 25 & 1u) ? gridDim.x * NW : NW) {

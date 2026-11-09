@@ -5438,8 +5438,8 @@ __device__ void main_forward(const Launch & P, uint8_t * /*sm*/, unsigned & epoc
         if (ml_W().attn) {
             {
                 const LayerW & W = ml_W();
-                if constexpr (WIDE) attn_proj_wv<T>(W, ml_L() / 4, ml_n());
-                else if (W.q.fm || W.k.fm || W.v.fm) attn_proj_wv<T>(W, ml_L() / 4, ml_n());
+                if constexpr (WIDE) attn_proj_wv<T>(WV_LAYER_ARG(W, ml_L()), ml_L() / 4, ml_n());
+                else if (W.q.fm || W.k.fm || W.v.fm) attn_proj_wv<T>(WV_LAYER_ARG(W, ml_L()), ml_L() / 4, ml_n());
                 else attn_proj<T>(W, ml_L() / 4, ml_n(), sm);
             }
             gsync(epoch, PH_ATTN_PROJ);
@@ -5456,8 +5456,8 @@ __device__ void main_forward(const Launch & P, uint8_t * /*sm*/, unsigned & epoc
         } else {
             {
                 const LayerW & W = ml_W();
-                if constexpr (WIDE) dn_proj_wv<T>(W, ml_dl(), ml_n(), ml_dnc());
-                else if (W.qkv.fm || W.gate.fm) dn_proj_wv<T>(W, ml_dl(), ml_n(), ml_dnc());
+                if constexpr (WIDE) dn_proj_wv<T>(WV_LAYER_ARG(W, ml_L()), ml_dl(), ml_n(), ml_dnc());
+                else if (W.qkv.fm || W.gate.fm) dn_proj_wv<T>(WV_LAYER_ARG(W, ml_L()), ml_dl(), ml_n(), ml_dnc());
                 else dn_proj<T>(W, ml_dl(), ml_n(), ml_dnc(), sm);
             }
             k5_arrive(epoch, PH_DN_PROJ); // split barrier: dn_core waits after its replay (k5_wait)
@@ -6091,7 +6091,7 @@ __device__ __noinline__ void main_forward_b(const Launch & P, unsigned & epoch) 
             if constexpr (CK) attn_proj_ck<RT>(W);
             else
 #endif
-                attn_proj_wv<RT>(W, L / 4, 0, false);
+                attn_proj_wv<RT>(WV_LAYER_ARG(W, L), L / 4, 0, false);
             gsync(epoch, PH_ATTN_PROJ);
             int ab0 = 0; // lane i's items start on the block after lane i - 1's last one (att_rank)
             for (int i = 0; i < P.nl; i++) {
@@ -6125,7 +6125,7 @@ __device__ __noinline__ void main_forward_b(const Launch & P, unsigned & epoch) 
             if constexpr (CK) dn_proj_ck<RT>(W, dl, row_tab(P));
             else
 #endif
-                dn_proj_wv<RT, true>(W, dl, 0, 0, row_tab(P));
+                dn_proj_wv<RT, true>(WV_LAYER_ARG(W, L), dl, 0, 0, row_tab(P));
             gsync(epoch, PH_DN_PROJ);
             for (int it = blockIdx.x; it < P.nl * NVH; it += gridDim.x) {
                 const int i = it / NVH;
@@ -6322,7 +6322,7 @@ __device__ void bench_phase(int which, int layer, uint8_t * /*sm*/, unsigned & e
             else resid_any<T, 17>(W.fd, cB.qa, cB.x, true, W.attn_norm, sm);
         } else if (which == 2) {
             if (!W.attn) {
-                if (W.qkv.fm || W.gate.fm) dn_proj_wv<T>(W, 0, 0, 0);
+                if (W.qkv.fm || W.gate.fm) dn_proj_wv<T>(WV_LAYER_ARG(W, L), 0, 0, 0);
                 else dn_proj<T>(W, 0, 0, 0, sm);
             }
         }
