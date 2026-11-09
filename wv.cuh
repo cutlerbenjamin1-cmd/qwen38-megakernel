@@ -1192,7 +1192,8 @@ __device__ __forceinline__ void glu_store(int j, const float (&act)[T], int lane
         q16_store(cB.qa, t + (lane >> 4), j, v, lane < 16 || t + 1 < T);
     }
 }
-// MK_GLUN 1: ffn_gu_wv's GLU epilogue interleaved (its 4 silu's exponentials before the divisions; glu_store_n). MK_SILUPAD 1:
+// MK_GLUN 1: ffn_gu_wv's GLU epilogue interleaved (its 4 silu's exponentials before the divisions; glu_store_n); 2: glu_store_n
+// only, 3: the silu order only. MK_SILUPAD 1:
 // silu of the padding columns t >= T (s = 0: a zero dividend sends the warp's division to the slow path) on x = 1 instead
 #if MK_GLUN
 // glu_store with the token pairs' q16_store chains interleaved: per pair the ops and stores of q16_store (keep the two in step)
@@ -1340,7 +1341,7 @@ __device__ __noinline__ void ffn_gu_wv(const LayerW & W, bool c1 = false) {
             const WvAcc<1> u = wv_tile_any<T, false>(W.fu, j, 0, D / 256, xs);
             lane = tid_x() & 31;
             WvAcc<1> a;
-#if MK_GLUN
+#if MK_GLUN == 1 || MK_GLUN == 3
             // the 4 silu: exponentials and denominators first, then the divisions (per value silu's ops)
             float x[4], dn[4];
 #pragma unroll
@@ -1394,7 +1395,7 @@ __device__ __noinline__ void ffn_gu_wv(const LayerW & W, bool c1 = false) {
 #pragma unroll
             for (int t = 0; t < T; t++) act[t] = lane < 16 ? silu(g.v[t]) * u.v[t] : 0.f;
         }
-#if MK_GLUN
+#if MK_GLUN == 1 || MK_GLUN == 2
         glu_store_n<T>(j, act, lane);
 #else
         glu_store<T>(j, act, lane);
