@@ -1001,17 +1001,7 @@ __device__ __noinline__ void dn_proj_wv(const LayerW & W, int dl, int n, int dn_
         }
 #pragma unroll
         for (int t = 0; t < T; t++) acc[t] = wsum(acc[t]) * s_rs[t];
-#if MK_SCR_Z
-        { // (store_lane_t's stores, L2 evict_last: the ab partials stay resident, rewritten in place)
-            const unsigned long long pol = scr_pol();
-            float * const base = cB.ab + ch * RMAX * 2 * NVH;
-#pragma unroll
-            for (int t = 0; t < T; t++)
-                if ((int) (threadIdx.x & 31) == t) scr_st(base + t * (2 * NVH) + row, acc[t], pol);
-        }
-#else
         store_lane_t<T>(cB.ab + ch * RMAX * 2 * NVH, 2 * NVH, row, acc);
-#endif
     }
     if (!W.qkv.fm) gemv_pairs_dp<T, 5>(W.qkv, n_ab, n_ab + QKV / 2, PairOut{conv, QKV, n});
     if (!W.gate.fm) { // (lo from W, not carried across the call above: it was a spill store per warp and layer)
@@ -1036,16 +1026,7 @@ __device__ __noinline__ void dn_proj_wv(const LayerW & W, int dl, int n, int dn_
                 }
             }
         } else {
-#if MK_SCR_Z
-            const unsigned long long pol = scr_pol(); // (wv_store's stores, L2 evict_last: z stays resident)
-#pragma unroll
-            for (int c = 0; c < 4; c++) {
-                const int t = 2 * tq + (c & 1);
-                if (t < T) scr_st(cB.z + t * VD + 16 * lt + g + 8 * (c >> 1), a.v[0][c] * s_rs[t], pol);
-            }
-#else
             wv_store<T>(cB.z, VD, lt, a, s_rs, ln);
-#endif
         }
     }
     // Warm L2 with what dn_core will read (as dn_proj)
@@ -1192,65 +1173,6 @@ __device__ __forceinline__ void glu_store(int j, const float (&act)[T], int lane
         q16_store(cB.qa, t + (lane >> 4), j, v, lane < 16 || t + 1 < T);
     }
 }
-// MK_GLUN 1: ffn_gu_wv's GLU epilogue interleaved (its 4 silu's exponentials before the divisions; glu_store_n); 2: glu_store_n
-// only, 3: the silu order only. MK_SILUPAD 1:
-// silu of the padding columns t >= T (s = 0: a zero dividend sends the warp's division to the slow path) on x = 1 instead
-#if MK_GLUN
-// glu_store with the token pairs' q16_store chains interleaved: per pair the ops and stores of q16_store (keep the two in step)
-template <int T>
-__device__ __forceinline__ void glu_store_n(int j, const float (&act)[T], int lane) {
-    constexpr int NP = (T + 1) / 2;
-    const QBuf & q = cB.qa;
-    const int b = j >> 4, p = (j >> 2) & 3, part = (j >> 1) & 1, hh = j & 1, byte = lane & 15;
-    float v[NP], am[NP];
-    int qs[NP];
-#if MK_HEL
-    const unsigned long long pol = scr_pol(); // (q16_store's)
-#endif
-#pragma unroll
-    for (int k = 0; k < NP; k++) {
-        const int t = 2 * k;
-        const float other = __shfl_sync(0xffffffffu, act[t + 1 < T ? t + 1 : t], lane & 15);
-        v[k] = lane < 16 ? act[t] : other;
-        am[k] = fabsf(v[k]);
-    }
-#pragma unroll
-    for (int o = 8; o > 0; o >>= 1)
-#pragma unroll
-        for (int k = 0; k < NP; k++) am[k] = fmaxf(am[k], __shfl_xor_sync(0xffffffffu, am[k], o));
-#pragma unroll
-    for (int k = 0; k < NP; k++) {
-        const float d = am[k] / 127.0f;
-        qs[k] = am[k] == 0.0f ? 0 : (int) roundf(v[k] / d);
-        am[k] = d;
-        if (lane < 16 || 2 * k + 1 < T) {
-#if MK_HEL
-            scr_st8((part ? q.xb : q.xa) + ((2 * k + (lane >> 4)) * q.U + 8 * b + 2 * p + hh) * 16 + byte, qs[k], pol);
-#else
-            (part ? q.xb : q.xa)[((2 * k + (lane >> 4)) * q.U + 8 * b + 2 * p + hh) * 16 + byte] = (int8_t) qs[k];
-#endif
-        }
-    }
-#pragma unroll
-    for (int o = 8; o > 0; o >>= 1)
-#pragma unroll
-        for (int k = 0; k < NP; k++) qs[k] += __shfl_xor_sync(0xffffffffu, qs[k], o);
-    if (byte == 0) {
-#pragma unroll
-        for (int k = 0; k < NP; k++)
-            if (lane < 16 || 2 * k + 1 < T) {
-                const int gi = (2 * k + (lane >> 4)) * q.U + 8 * b + 2 * p + hh;
-#if MK_HEL
-                scr_st16(reinterpret_cast<__half *>(q.meta + gi) + part, __half_as_ushort(__float2half_rn(am[k])), pol);
-                scr_st16(reinterpret_cast<short *>(q.meta + gi) + 2 + part, (unsigned short) qs[k], pol);
-#else
-                reinterpret_cast<__half *>(q.meta + gi)[part] = __float2half_rn(am[k]);
-                reinterpret_cast<short *>(q.meta + gi)[2 + part] = (short) qs[k];
-#endif
-            }
-    }
-}
-#endif
 
 // Split-K chunk dealing (resid_wv, resid_wv_ck, the c1 ffn_gu_wv, ffn_gu_ck): chunk kc is the blocks
 // [nb kc / WV_S, nb (kc + 1) / WV_S) of the nb = gridDim.x blocks (82: 20, 21, 20, 21; every block works). The dealing
@@ -1341,35 +1263,18 @@ __device__ __noinline__ void ffn_gu_wv(const LayerW & W, bool c1 = false) {
             const WvAcc<1> u = wv_tile_any<T, false>(W.fu, j, 0, D / 256, xs);
             lane = tid_x() & 31;
             WvAcc<1> a;
-#if MK_GLUN == 1 || MK_GLUN == 3
-            // the 4 silu: exponentials and denominators first, then the divisions (per value silu's ops)
-            float x[4], dn[4];
 #pragma unroll
             for (int c = 0; c < 4; c++) {
                 const int t = 2 * (lane & 3) + (c & 1);
                 const float s = t < T ? s_rs[t] : 0.f;
 #if MK_SILUPAD
-                x[c] = t < T ? g.v[0][c] * s : 1.f; // (padding column, never read: off the division's slow path)
-#else
-                x[c] = g.v[0][c] * s;
-#endif
-                dn[c] = 1.0f + expf(-x[c]);
-                a.v[0][c] = u.v[0][c] * s;
-            }
-#pragma unroll
-            for (int c = 0; c < 4; c++) a.v[0][c] = x[c] / dn[c] * a.v[0][c];
-#else
-#pragma unroll
-            for (int c = 0; c < 4; c++) {
-                const int t = 2 * (lane & 3) + (c & 1);
-                const float s = t < T ? s_rs[t] : 0.f;
-#if MK_SILUPAD
-                a.v[0][c] = silu(t < T ? g.v[0][c] * s : 1.f) * (u.v[0][c] * s); // (padding column t >= T: never read)
+                // (padding column t >= T, never read by wv_to_lane<T>: silu(1), not silu(0 * g), whose zero dividend sends the
+                // warp's IEEE division to its slow path at every T < 8)
+                a.v[0][c] = silu(t < T ? g.v[0][c] * s : 1.f) * (u.v[0][c] * s);
 #else
                 a.v[0][c] = silu(g.v[0][c] * s) * (u.v[0][c] * s);
 #endif
             }
-#endif
             const LaneT<T> l = wv_to_lane<T>(a, lane & 15);
 #pragma unroll
             for (int t = 0; t < T; t++) act[t] = lane < 16 ? l.v[t] : 0.f;
@@ -1395,11 +1300,7 @@ __device__ __noinline__ void ffn_gu_wv(const LayerW & W, bool c1 = false) {
 #pragma unroll
             for (int t = 0; t < T; t++) act[t] = lane < 16 ? silu(g.v[t]) * u.v[t] : 0.f;
         }
-#if MK_GLUN == 1 || MK_GLUN == 2
-        glu_store_n<T>(j, act, lane);
-#else
         glu_store<T>(j, act, lane);
-#endif
     }
     if (c1) c1_arrive_mine();
 }
@@ -1474,19 +1375,12 @@ __device__ __noinline__ void resid_wv(const Mat & Wm, const QBuf & in, const flo
         const int lane = tid_x() & 31, g = lane >> 2, tq = lane & 3; // (read afresh after the call, as dn_proj_wv)
         float * part = cB.wvpart + (size_t) kc * RMAX * D;
         if (!X16 || tq < 2) {
-#if MK_SCR_WV
-            const unsigned long long pol = scr_pol(); // (evict_last: wvpart stays resident, rewritten in place)
-#endif
 #pragma unroll
             for (int n = 0; n < C::NG; n++)
 #pragma unroll
                 for (int c = 0; c < 4; c++) {
                     const int t = X16 ? 4 * n + 2 * tq + (c & 1) : 8 * n + 2 * tq + (c & 1);
-#if MK_SCR_WV
-                    if (t < T) scr_stcg(part + (size_t) t * D + 16 * tile + g + 8 * (c >> 1), a.v[n][c], pol);
-#else
                     if (t < T) __stcg(part + (size_t) t * D + 16 * tile + g + 8 * (c >> 1), a.v[n][c]);
-#endif
                 }
         }
         const unsigned old = wv_arrive(cnt + (tile >> 1), lane);

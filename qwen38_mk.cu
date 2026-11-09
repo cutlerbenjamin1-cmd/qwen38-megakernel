@@ -355,31 +355,6 @@ __device__ __forceinline__ void q32_store_n(const QBuf & q, int t0, int j, const
 }
 #endif
 
-// Dead-scratch stores (buffers rewritten in place every layer, dead after their reader), each buffer behind its own macro
-// (MK_SCR_WV: wvpart, MK_HEL: h = cB.qa, MK_SCR_Z: z / ab): L2 evict_last, so the buffer stays resident and its dirty
-// lines are not written back between uses (dn6 REQ dn6-2: 0 of 33 rounds). Cache policy only: the same values / addresses
-#if MK_SCR_WV || MK_HEL || MK_SCR_Z
-__device__ __forceinline__ unsigned long long scr_pol() {
-    unsigned long long pol;
-    asm("createpolicy.fractional.L2::evict_last.b64 %0, 1.0;" : "=l"(pol));
-    return pol;
-}
-// __stcg's st.global.cg with the policy
-__device__ __forceinline__ void scr_stcg(float * p, float v, unsigned long long pol) {
-    asm volatile("st.global.cg.L2::cache_hint.f32 [%0], %1, %2;" ::"l"(p), "f"(v), "l"(pol));
-}
-// plain (weak) global stores with the policy: f32, the low 8 / 16 bits of v
-__device__ __forceinline__ void scr_st(float * p, float v, unsigned long long pol) {
-    asm volatile("st.global.L2::cache_hint.f32 [%0], %1, %2;" ::"l"(p), "f"(v), "l"(pol));
-}
-__device__ __forceinline__ void scr_st8(void * p, int v, unsigned long long pol) {
-    asm volatile("st.global.L2::cache_hint.b8 [%0], %1, %2;" ::"l"(p), "r"(v), "l"(pol));
-}
-__device__ __forceinline__ void scr_st16(void * p, unsigned short v, unsigned long long pol) {
-    asm volatile("st.global.L2::cache_hint.b16 [%0], %1, %2;" ::"l"(p), "h"(v), "l"(pol));
-}
-#endif
-
 struct SX {
     int4 * xa;
     int4 * xb;
@@ -1071,20 +1046,11 @@ __device__ __forceinline__ void q16_store(const QBuf & q, int t, int c, float v,
     if (!valid) return;
     const int b = c >> 4, p = (c >> 2) & 3, part = (c >> 1) & 1, hh = c & 1, byte = lane & 15;
     const int gi = t * q.U + 8 * b + 2 * p + hh;
-#if MK_HEL
-    const unsigned long long pol = scr_pol(); // (h = cB.qa, every caller's q: evict_last, rewritten in place)
-    scr_st8((part ? q.xb : q.xa) + gi * 16 + byte, qi, pol);
-    if (byte == 0) {
-        scr_st16(reinterpret_cast<__half *>(q.meta + gi) + part, __half_as_ushort(__float2half_rn(d)), pol);
-        scr_st16(reinterpret_cast<short *>(q.meta + gi) + 2 + part, (unsigned short) qs, pol);
-    }
-#else
     (part ? q.xb : q.xa)[gi * 16 + byte] = (int8_t) qi;
     if (byte == 0) {
         reinterpret_cast<__half *>(q.meta + gi)[part] = __float2half_rn(d);
         reinterpret_cast<short *>(q.meta + gi)[2 + part] = (short) qs;
     }
-#endif
 }
 
 template <int T>
@@ -1258,23 +1224,6 @@ __device__ __noinline__ void embed_prologue(RowTab rt = RowTab{}) {
 // T = 5 ffn_down K-half, out of line: inlined, resid32<5,17,*> spills 136-188 B into this loop. The sums go in and out
 // by value (registers): by reference, resid32's a lives in local memory.
 template <int T> struct PairT { float a[2][T]; };
-#if MK_R32P
-// MK_R32P 1: resid32<1, IT, T_Q4K> (the MTP T = 1 phases) runs a block's two 32-row groups in one 4-row pass (mrows_pair).
-// mrows' rows r0, r0 + 1 (acc[0], acc[1]) and r1, r1 + 1 (acc[2], acc[3]) in one rows_t pass: mrows' row pointers (u0 = 0);
-// rows_t keeps one accumulator chain per row over the same units in the same order whatever R is
-template <int T, int IT, int TYPE>
-__device__ __forceinline__ void mrows_pair(const Mat & m, int r0, int r1, const SX & s, float (&acc)[4][T]) {
-    const uint8_t * rp[4];
-    const __half * dp[4];
-#pragma unroll
-    for (int k = 0; k < 4; k++) {
-        const int row = (k < 2 ? r0 : r1) + (k & 1);
-        rp[k] = m.w + (size_t) row * m.rb;
-        dp[k] = m.d + (size_t) row * m.nd;
-    }
-    rows_t<T, IT, 4, TYPE>(rp, dp, s, acc);
-}
-#endif
 template <int T, int IT, int TYPE>
 __device__ __noinline__ PairT<T> half_rows(const Mat W, int row0, const SX s, PairT<T> b, int u0) {
     mrows<T, IT, 2, TYPE>(W, row0, s, b.a, u0);
@@ -1358,33 +1307,6 @@ __device__ __noinline__ void resid32(const Mat W, const QBuf in, float * x, bool
     } else {
         const SX sx = make_sx(sm, in.U);
         fill_xs<T>(in, 0, false, sx, s_rs);
-#if MK_R32P
-        if constexpr (T == 1 && TYPE == T_Q4K) { // (the MTP phases: the block's groups j, j + G in one 4-row pass, no hole between)
-            for (int j = blockIdx.x; j < D / 32; j += 2 * gridDim.x) {
-                const int j1 = j + gridDim.x;
-                if (j1 < D / 32) {
-                    float a4[4][T], a0[2][T], a1[2][T];
-                    zero_acc<T, 4>(a4);
-                    mrows_pair<T, IT, TYPE>(W, 32 * j + 2 * warp, 32 * j1 + 2 * warp, sx, a4);
-#pragma unroll
-                    for (int t = 0; t < T; t++) {
-                        a0[0][t] = a4[0][t];
-                        a0[1][t] = a4[1][t];
-                        a1[0][t] = a4[2][t];
-                        a1[1][t] = a4[3][t];
-                    }
-                    epilogue(j, a0);
-                    epilogue(j1, a1);
-                } else {
-                    float a[2][T];
-                    zero_acc<T, 2>(a);
-                    mrows<T, IT, 2, TYPE>(W, 32 * j + 2 * warp, sx, a);
-                    epilogue(j, a);
-                }
-            }
-            return;
-        }
-#endif
         for (int j = blockIdx.x; j < D / 32; j += gridDim.x) {
             PairT<T> p;
             float (&a)[2][T] = p.a;
