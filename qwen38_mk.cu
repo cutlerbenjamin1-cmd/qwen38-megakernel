@@ -3127,16 +3127,14 @@ __device__ __forceinline__ void aqx_conv(float (&acc)[MTA][4][4], const uint8_t 
         a[2 * (ks & 1) + 1] = __uint_as_float(aq_q8x2(*reinterpret_cast<const unsigned short *>(krow + 16 * ks + 2 * tig + 8), dd, kxm, ksub));
     }
 }
-// S = Q K^T from the fragments above (the same MMAs in the same order: k-step ks, then row tile i). The Q loads go out LA MMAs
+// S = Q K^T from the fragments above (the same MMAs in the same order: k-step ks, then row tile i). The Q loads go out AQX_LA MMAs
 // ahead in the program text: a small module keeps that, in the engine ptxas moves each load back in front of its MMA (no effect
-// measured there; the stall is ~30% of the S warps' samples at 101k). KILL (MK_AQK bit 0, MK_W48Z 2): k-step ks's fragment slots are
-// zeroed after its last MMA, so they are dead in the rest of the block (exact: the warp's next aqx_conv rewrites every slot of
-// acc[0 .. 1] before its next aqx_mma, and only P V warps, which never run this, read acc as accumulators). PIN (MK_AQK bit 3, MK_W48Z
-// 3): k-step ks + 1's Q loads, then a __syncwarp, then k-step ks's MMAs (LA is not used; a warp barrier changes no value). ptxas elides
-// the barrier but keeps a convergence check in the critical warp (r4: +3.9% at T5); PIN 2 (MK_W48Z 4): the same order, no barrier.
+// measured there; the stall is ~30% of the S warps' samples at 101k). PIN (MK_W48Z 3 / 4): k-step ks + 1's Q loads before k-step ks's
+// MMAs, two k-steps of fragments; 1 with a __syncwarp between them (elided by ptxas, but it leaves a convergence check in the S warp:
+// +3.9% at T5 in wave 6's r4), 2 without (the order alone).
 constexpr int AQX_LA = 4;
-template <int MT, int MTA, int LDH, int LA = AQX_LA, bool KILL = false, int PIN = 0>
-__device__ __forceinline__ void aqx_mma(float (&s)[MT][4], float (&acc)[MTA][4][4], unsigned qaddr) {
+template <int MT, int MTA, int LDH, int PIN = 0>
+__device__ __forceinline__ void aqx_mma(float (&s)[MT][4], const float (&acc)[MTA][4][4], unsigned qaddr) {
 #pragma unroll
     for (int i = 0; i < MT; i++)
 #pragma unroll
@@ -3157,33 +3155,23 @@ __device__ __forceinline__ void aqx_mma(float (&s)[MT][4], float (&acc)[MTA][4][
                 for (int i = 0; i < MT; i++) ldq((ks + 1) * MT + i, a[(ks + 1) & 1][i]);
             }
             if constexpr (PIN == 1) __syncwarp();
-            float (&b)[4] = acc[ks >> 3][(ks >> 1) & 3];
+            const float (&b)[4] = acc[ks >> 3][(ks >> 1) & 3];
 #pragma unroll
             for (int i = 0; i < MT; i++) {
                 const unsigned (&x)[4] = a[ks & 1][i];
                 mma16816(s[i], x[0], x[1], x[2], x[3], __float_as_uint(b[2 * (ks & 1)]), __float_as_uint(b[2 * (ks & 1) + 1]));
             }
-            if constexpr (KILL) {
-                b[2 * (ks & 1)] = 0.f;
-                b[2 * (ks & 1) + 1] = 0.f;
-            }
         }
     } else {
-        unsigned a[LA][4];
+        unsigned a[AQX_LA][4];
 #pragma unroll
-        for (int q = 0; q < LA; q++) ldq(q, a[q]);
+        for (int q = 0; q < AQX_LA; q++) ldq(q, a[q]);
 #pragma unroll
         for (int q = 0; q < (HD / 16) * MT; q++) {
-            const int ks = q / MT, w = q % LA;
-            float (&b)[4] = acc[ks >> 3][(ks >> 1) & 3];
+            const int ks = q / MT, w = q % AQX_LA;
+            const float (&b)[4] = acc[ks >> 3][(ks >> 1) & 3];
             mma16816(s[q % MT], a[w][0], a[w][1], a[w][2], a[w][3], __float_as_uint(b[2 * (ks & 1)]), __float_as_uint(b[2 * (ks & 1) + 1]));
-            if (q + LA < (HD / 16) * MT) ldq(q + LA, a[w]);
-            if constexpr (KILL) {
-                if (q % MT == MT - 1) {
-                    b[2 * (ks & 1)] = 0.f;
-                    b[2 * (ks & 1) + 1] = 0.f;
-                }
-            }
+            if (q + AQX_LA < (HD / 16) * MT) ldq(q + AQX_LA, a[w]);
         }
     }
 }
@@ -3385,11 +3373,6 @@ __device__ __forceinline__ void attn_core_q8_t(const LayerW & W, int slot, int n
         // stored phases before) holds the same bytes before and after the prologue: its first copies go out right after
         // the q loads and land under the prologue (MIX: after the prologue)
         const bool kv0 = !MIX && c1 <= n;
-#if (MK_AQB & 1) && MK_W48X
-        // MK_AQB: MIX's ring-prologue copies {K(0) .. K(3), V(0)} go out at kv0's place when all their positions are below n (this
-        // call writes rows >= n only; every chunk at depth): the same copies, landing under the prologue
-        const bool kvb = MIX && min(c1, c0 + 4 * TP) <= n;
-#endif
         // ---- item prologue, attn_core_t's (q rows -> sQ, this cycle's K / V rows -> cache, m / l init)
         // the q rows' loads first, then the q-norm and RoPE ones (Nsight Compute, 40k context, T5: the q loads went out
         // last, behind those at lg throttle, and the first row's math waited on them: ~4% of attn_core_q8<5>)
@@ -3416,17 +3399,6 @@ __device__ __forceinline__ void attn_core_q8_t(const LayerW & W, int slot, int n
             }
         }
         if (kv0) issue012();
-#if (MK_AQB & 1) && MK_W48X
-        if constexpr (MIX) {
-            if (kvb) {
-                issue(tid, kring, 0, vring, -1, NT);
-                issue(tid, kring + AQ_STG, 1, vring, -1, NT);
-                issue(tid, kring + 2 * AQ_STG, 2, vring, -1, NT);
-                issue(tid, kring + 3 * AQ_STG, 3, vring, 0, NT);
-                asm volatile("cp.async.commit_group;" ::: "memory");
-            }
-        }
-#endif
 #pragma unroll
         for (int k2 = 0; k2 < 2; k2++) {
             if (k2 >= MT) continue;
@@ -3503,9 +3475,6 @@ __device__ __forceinline__ void attn_core_q8_t(const LayerW & W, int slot, int n
             sL(tid) = 0.f;
         }
         if (kv0) asm volatile("cp.async.wait_group 2;" ::: "memory"); // (one barrier for the prologue and K(0))
-#if (MK_AQB & 1) && MK_W48X
-        if (kvb) asm volatile("cp.async.wait_group 0;" ::: "memory"); // (likewise: no ring-prologue barrier)
-#endif
         __threadfence_block();
         __syncthreads();
 
@@ -3521,19 +3490,12 @@ __device__ __forceinline__ void attn_core_q8_t(const LayerW & W, int slot, int n
             // in t - 1, landed by the end of t, to bytes in t + 1, read in t + 2. So S's conversion runs under the other group's
             // MMAs and each copy has at least one interval to land. Prologue: K(0) .. K(3) and V(0) landed, K(0) and K(1) -> bytes
             // (all warps), K(0) converted.
-#if MK_AQB & 1
-            if (!kvb) {
-#endif
             issue(tid, kring, 0, vring, -1, NT);
             issue(tid, kring + AQ_STG, 1, vring, -1, NT);
             issue(tid, kring + 2 * AQ_STG, 2, vring, -1, NT);
             issue(tid, kring + 3 * AQ_STG, 3, vring, 0, NT);
             asm volatile("cp.async.commit_group;" ::: "memory");
             asm volatile("cp.async.wait_group 0;" ::: "memory");
-#if MK_AQB & 1
-            __syncthreads();
-            }
-#endif
 #else
             issue(tid, kring, 0, vring, -1, NT);
             issue(tid, kring + AQ_STG, 1, vring, -1, NT);
@@ -3542,9 +3504,7 @@ __device__ __forceinline__ void attn_core_q8_t(const LayerW & W, int slot, int n
             asm volatile("cp.async.commit_group;" ::: "memory");
             asm volatile("cp.async.wait_group 1;" ::: "memory");
 #endif
-#if !(MK_W48X && (MK_AQB & 1))
             __syncthreads();
-#endif
             const int kb0 = kbt(0); // K(0) -> bytes now (all warps); K(1) in interval 0
 #if MK_W48X
             const int kb1 = ntl > 1 ? kbt(1) : 8;
@@ -3602,13 +3562,7 @@ __device__ __forceinline__ void attn_core_q8_t(const LayerW & W, int slot, int n
                 } else if (sg >= 0) {
                     if (jt < ntl) {
                         float s[MT][4];
-#if MK_AQK // T3-T5: bit 0 consumed K fragments killed; bit 1 / 2 Q loads 1 / 2 MMAs ahead in the source (else AQX_LA); bit 3 PIN
-                        constexpr bool AQK = T >= 3;
-                        aqx_mma<MT, MTA, LDH, AQK && (MK_AQK & 2) ? 1 : AQK && (MK_AQK & 4) ? 2 : AQX_LA, AQK && (MK_AQK & 1), AQK && (MK_AQK & 8)>(
-                            s, acc, (unsigned) __cvta_generic_to_shared(sQ + (lane & 15) * LDH + (lane >> 4) * 8));
-#else
                         aqx_mma<MT, MTA, LDH>(s, acc, (unsigned) __cvta_generic_to_shared(sQ + (lane & 15) * LDH + (lane >> 4) * 8));
-#endif
 #pragma unroll
                         for (int i = 0; i < MT; i++) {
                             float * so = sS + (jt & 1) * 32 * LDS + (16 * i + g8) * LDS + 8 * (warp & 3) + 2 * tig;
@@ -4043,26 +3997,6 @@ __device__ __forceinline__ void attn_core_w48(const LayerW & W, int slot, int n,
                 load8(qb + (r % T) * QG + (g * 6 + r / T) * 512 + lane * 8, qv[k2]);
             }
         }
-#if (MK_AQB & 2) && MK_W48X
-        // MK_AQB: MIX's ring-prologue copies K(0) .. K(2) go out here (after the q rows' loads, before the q-norm / RoPE ones: few
-        // registers live) when all their positions are below the first row this call writes: the ring prologue's aq_issue calls
-        // (issue(): tnp, kbt; V side empty), landing under the prologue
-        const bool kvb = MIX && min(c1, c0 + 3 * TP) <= W48_NW;
-        if constexpr (MIX) {
-            if (kvb) {
-                const int jk = kv_ring_tile(kf.kr, wsr, c0, TP);
-#pragma unroll
-                for (int t = 0; t < 3; t++) {
-                    const int8_t * kq;
-                    const __half * ks;
-                    kv_tile_src(0, slot, g, c0 + t * TP, wsr, wsm, kf.kb, t >= jk, kq, ks);
-                    const int kn = c1 - c0 - t * TP;
-                    aq_issue<NT, true>(tid, kring + t * AQ_STG, kq, ks, kn > 0 ? min(TP, kn) : -1, vring, kq, ks, -1, t >= jk ? 8 : kf.kb, 8);
-                    asm volatile("cp.async.commit_group;" ::: "memory");
-                }
-            }
-        }
-#endif
         float qw[8];
         load8_ro(W.qn + lane * 8, qw);
         // T = 8: the warp's q rows warp + 16 k2 are all token warp % 8, one RoPE row for the three (rope_row)
@@ -4154,9 +4088,6 @@ __device__ __forceinline__ void attn_core_w48(const LayerW & W, int slot, int n,
             sM(tid) = -INFINITY;
             sL(tid) = 0.f;
         }
-#if (MK_AQB & 2) && MK_W48X
-        if (kvb) asm volatile("cp.async.wait_group 0;" ::: "memory"); // (one barrier for the prologue and K(0) .. K(2))
-#endif
         __threadfence_block();
         __syncthreads();
 
@@ -4185,31 +4116,19 @@ __device__ __forceinline__ void attn_core_w48(const LayerW & W, int slot, int n,
             if (nth_tid == NT) aq_issue<NT, MIX>(t_, dk, kq, ks, tnp(tk), dv, vq, vs, tv < 0 ? -1 : tnp(tv), kb_, vb_);
             else aq_issue<NT - 128, MIX>(t_, dk, kq, ks, tnp(tk), dv, vq, vs, tv < 0 ? -1 : tnp(tv), kb_, vb_);
         };
-#if (MK_AQB & 2) && MK_W48X
-        if (!kvb) {
-#endif
         issue(tid, kring, 0, vring, -1, NT);
         asm volatile("cp.async.commit_group;" ::: "memory");
         issue(tid, kring + AQ_STG, 1, vring, -1, NT);
         asm volatile("cp.async.commit_group;" ::: "memory");
-#if (MK_AQB & 2) && MK_W48X
-        }
-#endif
 #if MK_W48X
         // MIX: attn_core_q8_t's warp groups, in the same three K and three V stages, so one interval for a copy to land: K(t + 3)
         // goes into K(t)'s stage at the start of interval t (K(t) was converted in t - 1), V(t) into V(t - 3)'s (read in t - 1).
         // Prologue: K(0) .. K(2) landed, K(0) and K(1) -> bytes, K(0) converted.
         if constexpr (MIX) {
-#if MK_AQB & 2
-            if (!kvb) {
-#endif
             issue(tid, kring + 2 * AQ_STG, 2, vring, -1, NT);
             asm volatile("cp.async.commit_group;" ::: "memory");
             asm volatile("cp.async.wait_group 0;" ::: "memory");
             __syncthreads();
-#if MK_AQB & 2
-            }
-#endif
             const int kb0 = kbt(0), kb1 = ntl > 1 ? kbt(1) : 8;
             if (kb0 != 8) kv_tile_expand<false>(kring, kb0, TP, warp, NW, KVQ_ROW);
             if (kb1 != 8) kv_tile_expand<false>(kring + AQ_STG, kb1, TP, warp, NW, KVQ_ROW);
@@ -4299,9 +4218,8 @@ __device__ __forceinline__ void attn_core_w48(const LayerW & W, int slot, int n,
                 } else if (jt < ntl) {
                     {
                         float s[MT][4];
-#if MK_W48Z >= 2 // 2: and the consumed K fragments killed; 3: PIN instead of the kill; 4: PIN's order without its __syncwarp
-                        aqx_mma<MT, MT, LDH, AQX_LA, (MK_W48Z == 2), (MK_W48Z == 3 ? 1 : MK_W48Z == 4 ? 2 : 0)>(
-                            s, acc, (unsigned) __cvta_generic_to_shared(sQ + (lane & 15) * LDH + (lane >> 4) * 8));
+#if MK_W48Z >= 3 // 3: and PIN with its __syncwarp, 4: PIN's order alone
+                        aqx_mma<MT, MT, LDH, (MK_W48Z == 3 ? 1 : 2)>(s, acc, (unsigned) __cvta_generic_to_shared(sQ + (lane & 15) * LDH + (lane >> 4) * 8));
 #else
                         aqx_mma<MT, MT, LDH>(s, acc, (unsigned) __cvta_generic_to_shared(sQ + (lane & 15) * LDH + (lane >> 4) * 8));
 #endif
