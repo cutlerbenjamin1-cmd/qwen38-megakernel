@@ -4255,7 +4255,11 @@ __device__ __forceinline__ void attn_core_w48(const LayerW & W, int slot, int n,
                     }
                     if (jt + 2 < ntl) {
                         const int kbx = kbt(jt + 2);
+#if MK_K6X
+                        if (kbx != 8 && kbx != 6) kvx_tile<8>(kring + ((jt + 2) % NSK) * AQ_STG, kbx, 8 * (warp & 3)); // (6: the P V warps)
+#else
                         if (kbx != 8) kvx_tile<8>(kring + ((jt + 2) % NSK) * AQ_STG, kbx, 8 * (warp & 3));
+#endif
                     }
 #if MK_W48S
                     aqx_zero(acc[2]);
@@ -4419,6 +4423,11 @@ __device__ __forceinline__ void attn_core_w48(const LayerW & W, int slot, int n,
                         }
                     }
                 }
+#if MK_K6X && MK_W48X
+                if constexpr (MIX) { // MK_K6X: a 6-bit K(jt + 2) -> bytes here, not on the converting group (after the MMAs, as T <= 5)
+                    if (jt + 2 < ntl && kbt(jt + 2) == 6) kvx_rows<6, 4>(kring + ((jt + 2) % NSK) * AQ_STG, 4 * (warp - 4));
+                }
+#endif
 #if MK_W48X
             } else if (!MIX || rC) {
                 const int sn_ = MIX ? warp & 3 : warp - 12;
