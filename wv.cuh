@@ -998,6 +998,16 @@ __device__ __forceinline__ bool dn_tile(int p, int nt_q, int & lt) {
     return p < nt_q;
 }
 
+// MK_WVREMAT 1 (wave 6, top6; exact: integer bookkeeping only): dn_proj_wv and attn_proj_wv keep only a packed loop word (and
+// n / dn_c) across their tile calls and rebuild W (an element of cW.L, as every caller passes), the dealing range (cDeal) and
+// the derived counts after each call. 0: the old loops
+#ifndef MK_WVREMAT
+#define MK_WVREMAT 0
+#endif
+#if MK_WVREMAT && !(MK_FFNA & 9)
+#error "MK_WVREMAT reads the dealing table: build it with MK_FFNA bit 1 or 8"
+#endif
+
 // delta-net input projections: alpha / beta (fp32 path, as dn_proj), qkv -> conv ring and z (wv tiles, or dp4a pairs
 // for a hybrid-type matrix)
 // BAT (batched launches): row t's qkv goes to the conv ring of its own lane at its own position: rt (the pass's lanes) gives
@@ -1112,7 +1122,26 @@ __device__ __noinline__ void dn_proj_wv(const LayerW & W, int dl, int n, int dn_
     }
     // (the lane read afresh after the tile call, tid_x: its ring rows / offsets hoisted before the loop had no register to
     // live in across the tile functions and were spilled)
+#if MK_WVREMAT
+    // MK_WVREMAT: across the tile calls only the loop word lw = tile | layer << 11 | dl << 18 (and n, dn_c); W, t1 (the dealing
+    // table), nt_q and conv are rebuilt from it after each call (the shadowing declarations below), so ptxas has no W / t0 / t1
+    // to park in stack slots, whatever the whole-program allocation
+    static_assert(QKV / 16 + VD / 16 + NW <= 2048 && NLA <= 128 && NL <= 64, "dn_proj_wv's loop word");
+    static_assert(AB_SPLIT * 2 * NVH == VD / 16, "dn_proj_wv: the gate-only range is the table's alpha / beta range");
+    unsigned lw = (unsigned) (t0 + (NW - 1 - warp)) | (unsigned) (&W - cW.L) << 11 | (unsigned) dl << 18;
+    asm volatile("" : "+r"(lw));
+    for (;; lw += NW) {
+        const LayerW & W = cW.L[lw >> 11 & 127u];
+        const int tile = lw & 2047u, dl = lw >> 18;
+        const WvDeal & dr = cDeal[ctaid_x()];
+        const int t1 = (W.qkv.fm ? (W.gate.fm ? dr.dn : dr.qk) : (W.gate.fm ? dr.ab : 0u)) >> 16; // (ntile (b + 1) / G)
+        if (tile >= t1) break;
+        const int nt_q = W.qkv.fm && W.gate.fm ? -1 : W.qkv.fm ? QKV / 16 : 0;
+        float * const conv = cB.conv + (size_t) dl * CONV_RING * QKV;
+        (void) conv;
+#else
     for (int tile = t0 + (NW - 1 - warp); tile < t1; tile += NW) {
+#endif
         int lt;
         const bool isq = dn_tile(tile, nt_q, lt);
         const WvAcc<1> a = wv_tile_any<T, false>(isq ? W.qkv : W.gate, lt, 0, D / 256, xs);
@@ -1133,6 +1162,11 @@ __device__ __noinline__ void dn_proj_wv(const LayerW & W, int dl, int n, int dn_
     }
     // Warm L2 with what dn_core will read (as dn_proj)
     if (!BAT && blockIdx.x < NVH) {
+#if MK_WVREMAT
+        const LayerW & W = cW.L[lw >> 11 & 127u];
+        const int dl = lw >> 18;
+        float * const conv = cB.conv + (size_t) dl * CONV_RING * QKV;
+#endif
         const int h = blockIdx.x, kh = h % NKH, tid = threadIdx.x;
         pf_l2(cB.dstate + ((size_t) dl * NVH + h) * 128 * 128 + tid * 32);
         if (tid == 0) {
@@ -1232,7 +1266,24 @@ __device__ __noinline__ void attn_proj_wv(const LayerW & W, int slot, int n, boo
         lo += KVD / 2;
     }
     if (!W.v.fm) gemv_pairs_dp<T, 5>(W.v, lo, lo + KVD / 2, PairOut{cB.vbuf, KVD, -1});
+#if MK_WVREMAT
+    // MK_WVREMAT: across the tile calls only the loop word lw = it | layer << 12 | slot << 19 | pf << 24 | K6 bit 2 << 25 |
+    // K6 bit 4 << 26 (and n); W, the item counts, i1 and the step are rebuilt from it after each call (as dn_proj_wv)
+    static_assert(QG / 16 + 4 * (KVD / 16) + MK_MAX_GRID * NW <= 4096 && NLA <= 128 && N_ATT_SLOTS <= 32, "attn_proj_wv's loop word");
+    unsigned lw = (unsigned) i0 | (unsigned) (&W - cW.L) << 12 | (unsigned) slot << 19 | (unsigned) pf << 24 |
+                  (unsigned) ((k6 & 2) != 0) << 25 | (unsigned) ((k6 & 4) != 0) << 26;
+    asm volatile("" : "+r"(lw));
+    for (;; lw += (lw >> 25 & 1u) ? gridDim.x * NW : NW) {
+        const LayerW & W = cW.L[lw >> 12 & 127u];
+        const int it = lw & 4095u, ks = (lw >> 26 & 1u) ? 2 : 1;
+        const int nq = W.q.fm ? QG / 16 : 0, nk = W.k.fm ? KVD / 16 : 0, nv = W.v.fm ? KVD / 16 : 0;
+        const int sk = W.k.type == T_Q8_0 ? ks : 1, sv = W.v.type == T_Q8_0 ? ks : 1;
+        const int nkk = nk * sk, ni = nq + nkk + nv * sv;
+        const int i1 = (lw >> 25 & 1u) ? ni : ni * (ctaid_x() + 1) / gridDim.x;
+        if (it >= i1) break;
+#else
     for (int it = i0; it < i1; it += istep) {
+#endif
         const int w = it < nq ? 0 : it < nq + nkk ? 1 : 2;
         const int j = it - (w == 0 ? 0 : w == 1 ? nq : nq + nkk), ns = w == 0 ? 1 : w == 1 ? sk : sv;
 #if MK_FFNA & 8
@@ -1249,6 +1300,12 @@ __device__ __noinline__ void attn_proj_wv(const LayerW & W, int slot, int n, boo
         wv_store<T>(w == 0 ? cB.qbuf : w == 1 ? cB.kbuf : cB.vbuf, w == 0 ? QG : KVD, lt, a, s_rs, tid_x() & 31);
     }
     // Warm L2 with what attn_core reads first (as attn_proj)
+#if MK_WVREMAT
+    {
+    const LayerW & W = cW.L[lw >> 12 & 127u];
+    const int slot = lw >> 19 & 31u;
+    const bool pf = lw >> 24 & 1u;
+#endif
     if (!pf) return;
     pf_block(W.qn, HD * 4);
     pf_block(W.kn, HD * 4);
@@ -1271,6 +1328,9 @@ __device__ __noinline__ void attn_proj_wv(const LayerW & W, int slot, int n, boo
             if (l < lv) pf_l2(Vc + pos * rv + l * 128);
         }
     }
+#if MK_WVREMAT
+    }
+#endif
 }
 
 // q16_store of chunk j from lane layout (lanes < 16: row r of each token); lane = threadIdx.x & 31, passed in (ffn_gu_wv
