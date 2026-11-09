@@ -1285,9 +1285,11 @@ __device__ __forceinline__ void a9_k_rows(uint8_t * st, int r0, unsigned on) {
     }
 }
 
-// pk_attn9's exact critical-path variants (wave 6, notes r1108prof/wave6/pfattn6.md section 5): compile-time, 0 = the kernel as
-// committed. The engine instantiates A9F = A9_FLAGS; bench/attn_bench also builds A9F = 0 (and A9_TV's values) to time them in
-// one process. Every variant keeps each output's floating-point operations, operands and order (exactness notes at each site).
+// pk_attn9's exact critical-path variants (wave 6, notes r1108prof/wave6/pfattn6.md section 5, code/pf6.md): compile-time; the
+// default A9_RS 1, A9_CP 1, A9_EX 2 (A9F 67: prefill attention -4.5% at 101k q8_0 / D, real prompt); -DA9_RS=0 -DA9_CP=0 -DA9_EX=0
+// (A9F 0) = 1ecb507's kernel, SASS for SASS. The engine instantiates A9F = A9_FLAGS; bench/attn_bench also builds A9F = 0 (and A9_TV's
+// values) to time them in one process. Every variant keeps each output's floating-point operations, operands and order (exactness
+// notes at each site).
 // A9_RS 1 (A9F 1): half 1's row-sum chain (LDS, adds, two shuffle rounds, l update) in every warp, without a branch, inside the
 // P V block; the result is kept by half 1 only. A9_CP bit 1 (A9F 2): the fast-path copies spread over the S loop instead of all
 // at the barrier; bit 2 (A9F 4): a copy's source = its slot's base + tile offset x stride (one IMAD.WIDE into a fresh pair), no
@@ -1296,16 +1298,16 @@ __device__ __forceinline__ void a9_k_rows(uint8_t * st, int r0, unsigned on) {
 // for the tile's exponentials when no argument of the warp is below -126 (exp2f's subnormal path), else exp2f again; A9_EX 2
 // (A9F 64): the same choice made before the exponentials, from each lane's row minima (no exponential computed twice).
 #ifndef A9_RS
-#define A9_RS 0
+#define A9_RS 1
 #endif
 #ifndef A9_CP
-#define A9_CP 0
+#define A9_CP 1
 #endif
 #ifndef A9_MX
 #define A9_MX 0
 #endif
 #ifndef A9_EX
-#define A9_EX 0
+#define A9_EX 2
 #endif
 constexpr int A9_FLAGS = (A9_RS ? 1 : 0) | ((A9_CP & 3) << 1) | (A9_MX ? 16 : 0) | (A9_EX == 1 ? 32 : A9_EX == 2 ? 64 : 0);
 // = exp2f(x) for x >= -126 and NaN (exp2f is this MUFU.EX2 there; it scales only below -126)
