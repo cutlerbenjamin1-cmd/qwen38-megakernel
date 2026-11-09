@@ -51,7 +51,7 @@ template <int ET> void pk_embed_img(int T);
 void pk_norm_quant(dim3 grid, const float * src, const float * w);
 void pk_norm_quant1(dim3 grid, const float * src, const float * w);
 void pk_ab(const float * Wab, const int8_t * abq, const __half * abd, const float * fn, int T, cudaStream_t st = 0);
-void pk_ab2(const float * Wab, const int8_t * abq, const __half * abd, const float * fn, int T, cudaStream_t st = 0, bool old = false);
+void pk_ab2(const float * Wab, const int8_t * abq, const __half * abd, const float * fn, int T, cudaStream_t st = 0);
 void pk_dn_prep(int T, int n0, int dl, const float * convw, const float * dt, const float * A);
 template <int NT> void pk_dn_prep_t(int T, int n0, int dl, const float * convw, const float * dt, const float * A);
 void pk_conv_ring(int T, int n0, int dl, bool old = false);

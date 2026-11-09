@@ -130,8 +130,8 @@ void MKEngine::Impl::pf_init() {
     }
     // MK_PFX (bits; a set bit keeps the old path): 1 pf_fork off, 2 pk_dn_scan (no pk_dn_tri / pk_dn_scan4), 4 pk_ab
     // after the DN in-projection join (not before it), 8 attention k on pf_s2 and v on pf_s3 next to q (not k then q on
-    // stream 0, v on pf_s2), 16 pk_ab (not pk_ab2), 32 pk_ab2 up to 4 blocks per SM (not 2), 64 pk_attn8 (not pk_attn9),
-    // 128 pk_conv_ring's float loop (not float4), 256 pk_attn2_comb with 12 rows per warp (not one)
+    // stream 0, v on pf_s2), 16 pk_ab (not pk_ab2), 64 pk_attn8 (not pk_attn9), 128 pk_conv_ring's float loop (not
+    // float4), 256 pk_attn2_comb with 12 rows per warp (not one)
     if (const char * e = getenv("MK_PFX")) pfx_bits = atoi(e);
     mkl::pk_attn_old = pfx_bits & 64 ? 1 : 0;
     pf_fork = !(pfx_bits & 1);
@@ -605,7 +605,7 @@ void MKEngine::Impl::pf_run(const std::vector<int> & toks, int n0, std::vector<i
                 const bool abj = !k8a && !(pfx_bits & 4);
                 auto ab = [&](cudaStream_t st) { // (MK_PFX bit 16: pk_ab, else pk_ab2: the same values)
                     if (pfx_bits & 16) mkl::pk_ab(W.ab, W.abq, W.abd, W.attn_norm, T, st);
-                    else mkl::pk_ab2(W.ab, W.abq, W.abd, W.attn_norm, T, st, pfx_bits & 32);
+                    else mkl::pk_ab2(W.ab, W.abq, W.abd, W.attn_norm, T, st);
                 };
                 if (k8a || fk) {
                     CK(cudaEventRecord(pf_e0, 0));
