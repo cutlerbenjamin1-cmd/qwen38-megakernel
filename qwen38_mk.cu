@@ -3129,7 +3129,7 @@ __device__ __forceinline__ void aqx_conv(float (&acc)[MTA][4][4], const uint8_t 
 }
 // S = Q K^T from the fragments above (the same MMAs in the same order: k-step ks, then row tile i). The Q loads go out LA MMAs
 // ahead in the program text: a small module keeps that, in the engine ptxas moves each load back in front of its MMA (no effect
-// measured there; the stall is ~30% of the S warps' samples at 101k). KILL (MK_AQK, MK_W48S 2): k-step ks's fragment slots are
+// measured there; the stall is ~30% of the S warps' samples at 101k). KILL (MK_AQK, MK_W48Z 2): k-step ks's fragment slots are
 // zeroed after its last MMA, so they are dead in the rest of the block (exact: the warp's next aqx_conv rewrites every slot of
 // acc[0 .. 1] before its next aqx_mma, and only P V warps, which never run this, read acc as accumulators).
 constexpr int AQX_LA = 4;
@@ -3161,7 +3161,7 @@ __device__ __forceinline__ void aqx_mma(float (&s)[MT][4], float (&acc)[MTA][4][
         }
     }
 }
-// MK_W48S: a row tile of acc that the S / softmax-group warps never read (attn_core_w48 MIX: acc[2]) re-zeroed at the end of their
+// MK_W48Z: a row tile of acc that the S / softmax-group warps never read (attn_core_w48 MIX: acc[2]) re-zeroed at the end of their
 // branches: its value (0 since the item start for those warps) is unchanged, its registers are dead inside the branches
 __device__ __forceinline__ void aqx_zero(float (&a)[4][4]) {
 #pragma unroll
@@ -4261,7 +4261,7 @@ __device__ __forceinline__ void attn_core_w48(const LayerW & W, int slot, int n,
                         if (kbx != 8) kvx_tile<8>(kring + ((jt + 2) % NSK) * AQ_STG, kbx, 8 * (warp & 3));
 #endif
                     }
-#if MK_W48S
+#if MK_W48Z
                     aqx_zero(acc[2]);
 #endif
                 } else if (sg < 0) { // V -> bytes before the P V MMAs: the S warps get the tensor pipe first, two warps share its tail
@@ -4272,7 +4272,7 @@ __device__ __forceinline__ void attn_core_w48(const LayerW & W, int slot, int n,
                 } else if (jt < ntl) {
                     {
                         float s[MT][4];
-#if MK_W48S >= 2 // (and the consumed K fragments killed)
+#if MK_W48Z >= 2 // (and the consumed K fragments killed)
                         aqx_mma<MT, MT, LDH, AQX_LA, true>(s, acc, (unsigned) __cvta_generic_to_shared(sQ + (lane & 15) * LDH + (lane >> 4) * 8));
 #else
                         aqx_mma<MT, MT, LDH>(s, acc, (unsigned) __cvta_generic_to_shared(sQ + (lane & 15) * LDH + (lane >> 4) * 8));
@@ -4286,7 +4286,7 @@ __device__ __forceinline__ void attn_core_w48(const LayerW & W, int slot, int n,
                             so[8 * LDS + 1] = s[i][3];
                         }
                     }
-#if MK_W48S
+#if MK_W48Z
                     aqx_zero(acc[2]);
 #endif
                 }
@@ -4489,7 +4489,7 @@ __device__ __forceinline__ void attn_core_w48(const LayerW & W, int slot, int n,
                         }
                     }
                 }
-#if MK_W48S && MK_W48X
+#if MK_W48Z && MK_W48X
                 if constexpr (MIX) aqx_zero(acc[2]);
 #endif
             }
