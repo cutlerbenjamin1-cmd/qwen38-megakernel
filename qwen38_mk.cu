@@ -3129,11 +3129,10 @@ __device__ __forceinline__ void aqx_conv(float (&acc)[MTA][4][4], const uint8_t 
 }
 // S = Q K^T from the fragments above (the same MMAs in the same order: k-step ks, then row tile i). The Q loads go out AQX_LA MMAs
 // ahead in the program text: a small module keeps that, in the engine ptxas moves each load back in front of its MMA (no effect
-// measured there; the stall is ~30% of the S warps' samples at 101k). PIN (MK_W48Z 3 / 4): k-step ks + 1's Q loads before k-step ks's
-// MMAs, two k-steps of fragments; 1 with a __syncwarp between them (elided by ptxas, but it leaves a convergence check in the S warp:
-// +3.9% at T5 in wave 6's r4), 2 without (the order alone).
+// measured there; the stall is ~30% of the S warps' samples at 101k). KS (MK_W48Z): k-step ks + 1's Q loads before k-step ks's MMAs,
+// two k-steps of fragments; with attn_core_w48's acc[2] relief ptxas then keeps w48m<8>'s loads a k-step ahead (wave 6, r5).
 constexpr int AQX_LA = 4;
-template <int MT, int MTA, int LDH, int PIN = 0>
+template <int MT, int MTA, int LDH, bool KS = false>
 __device__ __forceinline__ void aqx_mma(float (&s)[MT][4], const float (&acc)[MTA][4][4], unsigned qaddr) {
 #pragma unroll
     for (int i = 0; i < MT; i++)
@@ -3144,7 +3143,7 @@ __device__ __forceinline__ void aqx_mma(float (&s)[MT][4], const float (&acc)[MT
                      : "=r"(a[0]), "=r"(a[1]), "=r"(a[2]), "=r"(a[3])
                      : "r"(qaddr + 2 * (16 * (q % MT) * LDH + 16 * (q / MT))));
     };
-    if constexpr (PIN != 0) {
+    if constexpr (KS) {
         unsigned a[2][MT][4];
 #pragma unroll
         for (int i = 0; i < MT; i++) ldq(i, a[0][i]);
@@ -3154,7 +3153,6 @@ __device__ __forceinline__ void aqx_mma(float (&s)[MT][4], const float (&acc)[MT
 #pragma unroll
                 for (int i = 0; i < MT; i++) ldq((ks + 1) * MT + i, a[(ks + 1) & 1][i]);
             }
-            if constexpr (PIN == 1) __syncwarp();
             const float (&b)[4] = acc[ks >> 3][(ks >> 1) & 3];
 #pragma unroll
             for (int i = 0; i < MT; i++) {
@@ -3176,7 +3174,8 @@ __device__ __forceinline__ void aqx_mma(float (&s)[MT][4], const float (&acc)[MT
     }
 }
 // MK_W48Z: a row tile of acc that the S / softmax-group warps never read (attn_core_w48 MIX: acc[2]) re-zeroed at the end of their
-// branches: its value (0 since the item start for those warps) is unchanged, its registers are dead inside the branches
+// branches: its value (0 since the item start for those warps) is unchanged, its registers are dead inside the branches (with aqx_mma's
+// KS order: the S warp's Q-fragment loads a k-step ahead of their MMAs; 258k F T8 attn_core -0.8 ms in wave 6)
 __device__ __forceinline__ void aqx_zero(float (&a)[4][4]) {
 #pragma unroll
     for (int j = 0; j < 4; j++)
@@ -4218,8 +4217,8 @@ __device__ __forceinline__ void attn_core_w48(const LayerW & W, int slot, int n,
                 } else if (jt < ntl) {
                     {
                         float s[MT][4];
-#if MK_W48Z >= 3 // 3: and PIN with its __syncwarp, 4: PIN's order alone
-                        aqx_mma<MT, MT, LDH, (MK_W48Z == 3 ? 1 : 2)>(s, acc, (unsigned) __cvta_generic_to_shared(sQ + (lane & 15) * LDH + (lane >> 4) * 8));
+#if MK_W48Z
+                        aqx_mma<MT, MT, LDH, true>(s, acc, (unsigned) __cvta_generic_to_shared(sQ + (lane & 15) * LDH + (lane >> 4) * 8));
 #else
                         aqx_mma<MT, MT, LDH>(s, acc, (unsigned) __cvta_generic_to_shared(sQ + (lane & 15) * LDH + (lane >> 4) * 8));
 #endif
