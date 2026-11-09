@@ -3602,8 +3602,9 @@ __device__ __forceinline__ void attn_core_q8_t(const LayerW & W, int slot, int n
                 } else if (sg >= 0) {
                     if (jt < ntl) {
                         float s[MT][4];
-#if MK_AQK // bit 0: consumed K fragments killed; bit 1 / 2: Q loads 1 / 2 MMAs ahead in the source (else AQX_LA); bit 3: PIN
-                        aqx_mma<MT, MTA, LDH, (MK_AQK & 2) ? 1 : (MK_AQK & 4) ? 2 : AQX_LA, (MK_AQK & 1) != 0, (MK_AQK & 8) != 0>(
+#if MK_AQK // T3-T5: bit 0 consumed K fragments killed; bit 1 / 2 Q loads 1 / 2 MMAs ahead in the source (else AQX_LA); bit 3 PIN
+                        constexpr bool AQK = T >= 3;
+                        aqx_mma<MT, MTA, LDH, AQK && (MK_AQK & 2) ? 1 : AQK && (MK_AQK & 4) ? 2 : AQX_LA, AQK && (MK_AQK & 1), AQK && (MK_AQK & 8)>(
                             s, acc, (unsigned) __cvta_generic_to_shared(sQ + (lane & 15) * LDH + (lane >> 4) * 8));
 #else
                         aqx_mma<MT, MTA, LDH>(s, acc, (unsigned) __cvta_generic_to_shared(sQ + (lane & 15) * LDH + (lane >> 4) * 8));
