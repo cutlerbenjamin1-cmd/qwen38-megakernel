@@ -428,6 +428,9 @@ These switch single decode kernels back to an earlier form, for A/B measurements
 | `MK_STORE_CHUNK_MIB` | `32` | chunk size of the host store that holds parked conversations and side requests: pinned chunks allocated on first use and reused | - | option |
 | `MK_CUDAMALLOC` | `0` | `1`: one `cudaMalloc` per buffer instead of the stream-ordered memory pool, which packs the allocations (cudaMalloc rounds each to 2 MiB pages: ~0.5 GB over the ~900 weight tensors) | same | earlier path |
 | `MK_STACK_LIMIT` | `0` | the CUDA per-thread stack limit in bytes. The driver reserves local memory for every thread slot (1,536 per SM) by the larger of this and the kernels' own frames: on an RTX 3090 the megakernel's 704-byte frame (720 in the deep-pass build) reserves ~85 MiB, the driver's 1 KB default would reserve ~123 MiB | - | earlier path |
+| `MK_RESERVE_EARLY` | `0` | `1`: device memory placement for a nearly full GPU. The stack limit is set to the megakernel's frame right after the CUDA context is made (before the weights; `MK_STACK_LIMIT` raises it) and kept, and the kernels' code (loaded on first use) loads before the KV cache, so neither is placed last. The KV cache is then checked against the free memory: its bytes plus the RoPE table, the prefill scratch and `MK_VRAM_MARGIN` must fit, else the load stops with the `-c` that fits. At load end and after the first launch a full device is reported (the CUDA sysmem fallback of Windows / WSL2 then keeps part of the process in system memory: slower decode that varies per process) | same | option |
+| `MK_VRAM_MARGIN` | `256` | MiB that `MK_RESERVE_EARLY`'s KV fit check keeps free for what loads after it (kernels at the first prefill / launch, the driver's own use) | same | option |
+| `MK_VRAM_OVERCOMMIT` | `0` | `1`: `MK_RESERVE_EARLY`'s fit check warns instead of stopping the load | same | option |
 | `MK_EMBD_DEVICE` | `0` | `1`: token_embd in device memory (+0.72 GB of VRAM) instead of mapped pinned host memory, whose rows the kernels fetch over PCIe (no measurable time difference) | not checked (the same rows) | debug |
 
 ### Model load
@@ -605,7 +608,7 @@ A `--state-dir` file is keyed by the binary, the GPU (name, compute capability, 
 the KV formats, the prompt, and every `MK_*` variable in the environment except those that only change decode,
 logging, timing or the load path: names starting with `MK_STATE`, `MK_POLICY`, `MK_PROFILE`, `MK_SPEC_LOG`,
 `MK_MEMLOG`, `MK_LOADLOG`, `MK_LOAD_`, `MK_WDIGEST`, `MK_WATCHDOG`, `MK_CK_SLOTS`, `MK_BENCH`, `MK_STACK_LIMIT`,
-`MK_GSB`, and `MK_K1`, `MK_K2`, `MK_K6`. Any other change saves a new file instead of restoring a stale one.
+`MK_RESERVE_EARLY`, `MK_VRAM_`, `MK_GSB`, and `MK_K1`, `MK_K2`, `MK_K6`. Any other change saves a new file instead of restoring a stale one.
 
 ## Tools and benchmarks
 

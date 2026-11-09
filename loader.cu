@@ -844,6 +844,19 @@ MKEngine::Impl::Impl(const std::string & path, int ctx_, int ndraft_, const std:
                                      " only: rebuild for it (make ARCH=..., build.ps1 -Arch ...; docs/BUILDING.md)");
     }
 #endif
+    // MK_RESERVE_EARLY=1: the driver reserves local memory for every thread slot by the stack limit and grows it at the first
+    // launch whose frame needs more; set to mk_cycle's frame (the largest; prefill kernels' <= 40 B) here, before the weights,
+    // and kept, it no longer comes last, where a full device leaves it to system memory (Windows / WSL2 sysmem fallback)
+    reserve_early = getenv("MK_RESERVE_EARLY") && atoi(getenv("MK_RESERVE_EARLY")) != 0;
+    if (reserve_early) {
+        cudaFuncAttributes fa{};
+        CK(cudaFuncGetAttributes(&fa, mkl::k_mk_cycle));
+        const char * sl = getenv("MK_STACK_LIMIT");
+        stack_res = std::max((size_t) fa.localSizeBytes, sl ? (size_t) atol(sl) : (size_t) 0);
+        CK(cudaDeviceSetLimit(cudaLimitStackSize, stack_res));
+        fprintf(stderr, "[mk] MK_RESERVE_EARLY: stack limit %zu B per thread (mk_cycle's frame %zu B), kernel loads before the KV cache\n",
+                stack_res, (size_t) fa.localSizeBytes);
+    }
     upl.start(!(getenv("MK_LOAD_ASYNC") && atoi(getenv("MK_LOAD_ASYNC")) == 0));
     // token_embd's mapped pinned table (0.7 GB: ~0.8 s under WSL2) allocated by a helper thread while the weights load
     // (MK_LOAD_PINBG=0: at its turn)
@@ -1222,6 +1235,62 @@ MKEngine::Impl::Impl(const std::string & path, int ctx_, int ndraft_, const std:
     fprintf(stderr, "[mk] K5: split dn_proj -> dn_core barrier, delta-net heads in dn_proj arrival order\n");
     fprintf(stderr, "[mk] C1: ffn_gu -> ffn_down per-chunk waits instead of a grid barrier\n");
     hb.ctx = ctx + KV_PAD; // rows per kv head (KV_PAD: the MTP draft rows written past the last admitted position)
+    // the device buffers after the KV cache (MK_RESERVE_EARLY: before it, so that its fit check sees them)
+    auto dev_bufs = [&] {
+        hb.apart = dalloc<float>((size_t) NKV * MAX_CH * AR * 256);
+        hb.aml = dalloc<float2>((size_t) NKV * MAX_CH * AR);
+#if MK_MAXD > 8
+        if (n_draft_cap > MAXT - 1) {
+            apart_hi = dalloc<float>((size_t) NKV * MAX_CH * AR * 256);
+            aml_hi = dalloc<float2>((size_t) NKV * MAX_CH * AR);
+        }
+#endif
+        hb.h_hist = dalloc<float>((size_t) H_RING * D);
+        mem_mark("attn partials, h ring");
+        {
+            std::vector<float2> rt((size_t) hb.ctx * 32); // (rows past ctx: the MTP draft rows, KV_PAD)
+            for (int p = 0; p < hb.ctx; p++)
+                for (int i = 0; i < 32; i++) {
+                    const double th = (double) p * std::pow((double) ROPE_BASE, -2.0 * i / 64.0);
+                    rt[(size_t) p * 32 + i] = make_float2((float) std::cos(th), (float) std::sin(th));
+                }
+            float2 * d = dalloc<float2>(rt.size(), false);
+            CK(cudaMemcpy(d, rt.data(), rt.size() * sizeof(float2), cudaMemcpyHostToDevice));
+            hb.rope = d;
+            rope_base = std::move(rt); // (images: rope_sync gathers rewritten rows from it)
+        }
+        mem_mark("RoPE table");
+        hb.hm = dalloc<float>(D);
+        hb.blk_best = dalloc<float2>((size_t) nsm * LM_RB * TOPK_MAX);
+        // lm_head<16, true>'s logit lines, line k * nwarps + warp for a warp's k-th row pair (~16 MB; builds with a 16-row head)
+        hb.lmscr = (MAXD > MAXT || RMAX > MAXT) ? dalloc<float>((size_t) (VOCAB / 2 + nsm * NW) * 32) : nullptr;
+        hb.blk_lse = dalloc<float2>((size_t) nsm);
+        hb.dlog = dalloc<float2>((size_t) MAXD * (TOPK_MAX + 1));
+        hb.dq = dalloc<float2>((size_t) MAXD * TOPK_MAX);
+        hb.cand = dalloc<float2>((size_t) RMAX * TOPK_MAX);
+        hb.logits = nullptr; // 5 MB used by scoring launches only (score_logits): logits_alloc()
+        hb.pcnt = nullptr;   // 0.5 MB for the presence / frequency penalty, allocated by the first set_penalty
+        hb.bar = dalloc<unsigned>(C1_WORDS); // count word | go word | C1's per-chunk counters, each on its own line
+        hb.cnt = dalloc<unsigned>(4);
+        hb.ctl = dalloc<Ctl>(1);
+        hb.wvpart = dalloc<float>((size_t) WV_S * RMAX * D);
+        hb.wvcnt = dalloc<unsigned>(2 * (D / 32), DA_INIT0); // (starts at 0; the last arrival of each use resets it)
+        profiling = getenv("MK_PROFILE") != nullptr;
+        hb.prof = profiling ? dalloc<unsigned long long>(4096 + 1024 * 128) : nullptr;
+        mem_mark("logits, sampling, ctl");
+    };
+    size_t free_pre = 0; // (MK_RESERVE_EARLY: the free memory where the default order sizes the cache, for its auto type)
+    if (reserve_early) {
+        size_t t = 0;
+        CK(cudaMemGetInfo(&free_pre, &t));
+        // lazy module loading: a kernel's code loads at its first use; mk_cycle's and the prefill kernels' now
+        CK(cudaFuncSetAttribute(mkl::k_mk_cycle, cudaFuncAttributeMaxDynamicSharedMemorySize, SM_TOTAL));
+        pf_kernel_attrs();
+        mkl::pk_attn_attr();
+        if (getenv("MK_EXACT") ? atoi(getenv("MK_EXACT")) != 0 : exact) mkl::pk_attn8_exa_attr();
+        mem_mark("kernel loads (early)");
+        dev_bufs();
+    }
     {
         const size_t rows = (size_t) kv_slots * NKV * hb.ctx; // (no MTP block: no slot N_ATT_SLOTS - 1)
         size_t free_b = 0, total_b = 0;
@@ -1230,7 +1299,7 @@ MKEngine::Impl::Impl(const std::string & path, int ctx_, int ndraft_, const std:
         // A non-empty MK_KV picks the quantized cache in auto mode too.
         const char * kv_spec = getenv("MK_KV");
         const bool want_kv = kv_spec && kv_spec[0];
-        const bool q8 = kv_mode == 1 || (kv_mode < 0 && (want_kv || rows * HD * 4 + (size_t) 1536 * 1024 * 1024 > free_b));
+        const bool q8 = kv_mode == 1 || (kv_mode < 0 && (want_kv || rows * HD * 4 + (size_t) 1536 * 1024 * 1024 > (reserve_early ? free_pre : free_b)));
         hb.kvq8 = q8;
         hb.dattn = !(getenv("MK_DATTN") && atoi(getenv("MK_DATTN")) == 0);
         // MK_ATT_I8=1 (q8 cache, -DMK_ATT_I8=1 builds): int8 Q.K^T in the decode attention of the all-q8 slots, in every
@@ -1303,6 +1372,61 @@ MKEngine::Impl::Impl(const std::string & path, int ctx_, int ndraft_, const std:
                 vbytes[w] += srows * HD * hb.kvb[w][s] / 8;
                 n4 += hb.kvb[w][s] != 8 || (w == 0 ? hb.kvr[s] : hb.kvrv[s]);
             }
+        size_t fit_b = 0; // (MK_RESERVE_EARLY: the cache's device bytes, rings included, as its fit check counts them)
+        if (reserve_early) {
+            // MK_RESERVE_EARLY: the cache, its MK_KV_WIN rings and what is allocated after them (the prefill scratch, a device
+            // checkpoint) plus MK_VRAM_MARGIN MiB for what loads later (kernels at the first prefill / launch, the driver)
+            // against the device memory left now: under it, refuse with the -c that fits (MK_VRAM_OVERCOMMIT=1: warn, load)
+            size_t ring_b = 0;
+            if (want_kv && getenv("MK_KV_WIN") && atoi(getenv("MK_KV_WIN")) > 0) {
+                const int win = atoi(getenv("MK_KV_WIN"));
+                const size_t rc = (size_t) ((win + ATT_BUCKET - 1) / ATT_BUCKET + 1) * ATT_BUCKET + ATP; // (hb.kvrc below)
+                const bool all = getenv("MK_KV_WIN_ALL") && atoi(getenv("MK_KV_WIN_ALL")) != 0;
+                for (int w = 0; w < 2; w++)
+                    for (int s = 0; s < kv_slots; s++)
+                        if (hb.kvb[w][s] != 8 || all) ring_b += (size_t) NKV * rc * (HD + HD / 16) + 32;
+            }
+            // bytes per position: the cache's rows (every slot's K and V, the q8 scales) and the RoPE table's (32 float2)
+            const size_t row_b = (q8 ? (vbytes[0] + vbytes[1]) / hb.ctx + (size_t) kv_slots * NKV * (HD / 32) * 4
+                                     : (size_t) kv_slots * NKV * HD * 4) + 32 * sizeof(float2);
+            fit_b = (q8 ? vbytes[0] + vbytes[1] + (size_t) 2 * rows * (HD / 32) * 2 + 64 : rows * HD * 4 + 32) + ring_b;
+            const bool ex = getenv("MK_EXACT") ? atoi(getenv("MK_EXACT")) != 0 : exact;
+            const char * cd = getenv("MK_CK_DEVICE");
+            const size_t scr = pf_scratch_bytes(pf_cap_req(), ex), post = scr + (cd && cd[0] == '1' ? ck_block_bytes() + 16 : 0);
+            size_t fr = 0, tt = 0;
+            CK(cudaDeviceSynchronize());
+            CK(cudaMemGetInfo(&fr, &tt));
+            unsigned long long res = 0, used = 0; // (the pool's reserved but unused bytes: the next allocations take them first)
+            if (use_pool) {
+                cudaMemPool_t pool;
+                CK(cudaDeviceGetDefaultMemPool(&pool, cuda_dev));
+                CK(cudaMemPoolGetAttribute(pool, cudaMemPoolAttrReservedMemCurrent, &res));
+                CK(cudaMemPoolGetAttribute(pool, cudaMemPoolAttrUsedMemCurrent, &used));
+            }
+            const double MiB = 1048576.0;
+            const char * mg = getenv("MK_VRAM_MARGIN");
+            const long long margin = (long long) ((mg ? std::max(0.0, atof(mg)) : 256.0) * MiB);
+            const long long avail = (long long) fr + (long long) (res > used ? res - used : 0);
+            const long long left = avail - (long long) (fit_b + post);
+            fprintf(stderr, "[mk] KV fit (MK_RESERVE_EARLY): %.1f MiB free (+ %.1f in the pool), the cache %.1f MiB (rings %.1f), after it "
+                            "%.1f (prefill scratch %.1f): %.1f MiB left, margin %.1f (MK_VRAM_MARGIN)\n",
+                    fr / MiB, (avail - (long long) fr) / MiB, fit_b / MiB, ring_b / MiB, post / MiB, scr / MiB, left / MiB, margin / MiB);
+            if (left < margin) {
+                // the -c whose cache and RoPE table leave the margin (the table is allocated already, at this -c)
+                const long long room = avail + (long long) ((size_t) hb.ctx * 32 * sizeof(float2)) - (long long) (ring_b + post + 64) - margin;
+                const long long cf = std::max(0LL, (room > 0 ? room / (long long) row_b : 0) - KV_PAD) / 1024 * 1024;
+                const std::string fits = cf >= 1024 ? "-c " + std::to_string(cf) + " fits" : "no context fits next to the weights";
+                char msg[1024];
+                snprintf(msg, sizeof msg,
+                         "%.0f MiB of device memory are free for the KV cache of %d positions (%.0f MiB) and the prefill scratch (%.0f MiB): "
+                         "%.0f MiB short of the %.0f MiB margin for what loads later (MK_VRAM_MARGIN). The CUDA sysmem fallback (Windows, "
+                         "WSL2) would put the overflow in system memory (slower decode, varying per process); other drivers fail later. "
+                         "%s (MK_VRAM_OVERCOMMIT=1: load anyway)",
+                         avail / MiB, ctx, fit_b / MiB, post / MiB, (margin - left) / MiB, margin / MiB, fits.c_str());
+                if (!(getenv("MK_VRAM_OVERCOMMIT") && atoi(getenv("MK_VRAM_OVERCOMMIT")) != 0)) throw std::runtime_error(msg);
+                fprintf(stderr, "[mk] warning: %s\n", msg);
+            }
+        }
         const size_t ab0 = alloc_bytes; // (alloc_bytes - ab0: the cache's device bytes, rings included)
         // a driver without the CUDA sysmem fallback (Linux) fails the allocation where others get the warning below
         const double kv_gb = q8 ? (vbytes[0] + vbytes[1] + 2.0 * rows * (HD / 32) * 2) / 1e9 : rows * HD * 4.0 / 1e9;
@@ -1373,6 +1497,9 @@ MKEngine::Impl::Impl(const std::string & path, int ctx_, int ndraft_, const std:
                     kvwr - ATT_BUCKET + 1, kvwr, nr, hb.kvwin, hb.kvrc, ring_bytes / 1048576.0);
         }
         const double gb = q8 ? (vbytes[0] + vbytes[1] + 2.0 * rows * (HD / 32) * 2 + ring_bytes) / 1e9 : rows * HD * 4.0 / 1e9;
+        if (reserve_early && alloc_bytes - ab0 != fit_b)
+            fprintf(stderr, "[mk] warning: MK_RESERVE_EARLY's fit check counted %zu bytes for the KV cache, it took %zu: update the check\n",
+                    fit_b, alloc_bytes - ab0);
         fprintf(stderr, "[mk] KV cache %s, %.2f GB for %d positions\n", q8 ? (n4 ? "q8_0 + q4 (MK_KV)" : "q8_0") : "fp16", gb, ctx);
         // a sysmem-fallback driver puts a cache past the free memory in system memory instead of failing
         if (alloc_bytes - ab0 > free_b)
@@ -1393,47 +1520,7 @@ MKEngine::Impl::Impl(const std::string & path, int ctx_, int ndraft_, const std:
         }
     }
     mem_mark("KV cache");
-    hb.apart = dalloc<float>((size_t) NKV * MAX_CH * AR * 256);
-    hb.aml = dalloc<float2>((size_t) NKV * MAX_CH * AR);
-#if MK_MAXD > 8
-    if (n_draft_cap > MAXT - 1) {
-        apart_hi = dalloc<float>((size_t) NKV * MAX_CH * AR * 256);
-        aml_hi = dalloc<float2>((size_t) NKV * MAX_CH * AR);
-    }
-#endif
-    hb.h_hist = dalloc<float>((size_t) H_RING * D);
-    mem_mark("attn partials, h ring");
-    {
-        std::vector<float2> rt((size_t) hb.ctx * 32); // (rows past ctx: the MTP draft rows, KV_PAD)
-        for (int p = 0; p < hb.ctx; p++)
-            for (int i = 0; i < 32; i++) {
-                const double th = (double) p * std::pow((double) ROPE_BASE, -2.0 * i / 64.0);
-                rt[(size_t) p * 32 + i] = make_float2((float) std::cos(th), (float) std::sin(th));
-            }
-        float2 * d = dalloc<float2>(rt.size(), false);
-        CK(cudaMemcpy(d, rt.data(), rt.size() * sizeof(float2), cudaMemcpyHostToDevice));
-        hb.rope = d;
-        rope_base = std::move(rt); // (images: rope_sync gathers rewritten rows from it)
-    }
-    mem_mark("RoPE table");
-    hb.hm = dalloc<float>(D);
-    hb.blk_best = dalloc<float2>((size_t) nsm * LM_RB * TOPK_MAX);
-    // lm_head<16, true>'s logit lines, line k * nwarps + warp for a warp's k-th row pair (~16 MB; builds with a 16-row head)
-    hb.lmscr = (MAXD > MAXT || RMAX > MAXT) ? dalloc<float>((size_t) (VOCAB / 2 + nsm * NW) * 32) : nullptr;
-    hb.blk_lse = dalloc<float2>((size_t) nsm);
-    hb.dlog = dalloc<float2>((size_t) MAXD * (TOPK_MAX + 1));
-    hb.dq = dalloc<float2>((size_t) MAXD * TOPK_MAX);
-    hb.cand = dalloc<float2>((size_t) RMAX * TOPK_MAX);
-    hb.logits = nullptr; // 5 MB used by scoring launches only (score_logits): logits_alloc()
-    hb.pcnt = nullptr;   // 0.5 MB for the presence / frequency penalty, allocated by the first set_penalty
-    hb.bar = dalloc<unsigned>(C1_WORDS); // count word | go word | C1's per-chunk counters, each on its own line
-    hb.cnt = dalloc<unsigned>(4);
-    hb.ctl = dalloc<Ctl>(1);
-    hb.wvpart = dalloc<float>((size_t) WV_S * RMAX * D);
-    hb.wvcnt = dalloc<unsigned>(2 * (D / 32), DA_INIT0); // (starts at 0; the last arrival of each use resets it)
-    profiling = getenv("MK_PROFILE") != nullptr;
-    hb.prof = profiling ? dalloc<unsigned long long>(4096 + 1024 * 128) : nullptr;
-    mem_mark("logits, sampling, ctl");
+    if (!reserve_early) dev_bufs();
     if (const char * spec = getenv("MK_KV_EMU_SPEC")) kv_emu_parse(spec);
     {
         int * eh = nullptr;
@@ -1457,8 +1544,9 @@ MKEngine::Impl::Impl(const std::string & path, int ctx_, int ndraft_, const std:
     if (nb < 1) throw std::runtime_error("megakernel does not fit on an SM");
     // The driver reserves local memory for every thread slot of the device (1,536 per SM x 82 SMs), sized by
     // the larger of the stack-size limit (default 1 KB per thread = 123 MiB) and the launched kernels' own
-    // (static) frames. No kernel here needs a dynamic stack, so the limit only adds a floor: drop it.
-    {
+    // (static) frames. No kernel here needs a dynamic stack, so the limit only adds a floor: drop it. (MK_RESERVE_EARLY: set to
+    // mk_cycle's frame at the context and kept.)
+    if (!reserve_early) {
         const char * sl = getenv("MK_STACK_LIMIT");
         CK(cudaDeviceSetLimit(cudaLimitStackSize, sl ? (size_t) atol(sl) : 0));
     }
@@ -1482,7 +1570,11 @@ MKEngine::Impl::Impl(const std::string & path, int ctx_, int ndraft_, const std:
     }
     {
         auto _ = lc.scope("prefill scratch");
+        const size_t ab = alloc_bytes;
         pf_init();
+        if (reserve_early && alloc_bytes - ab != pf_scratch_bytes(hp.cap, exact))
+            fprintf(stderr, "[mk] warning: MK_RESERVE_EARLY's fit check counted %zu bytes for the prefill scratch, pf_init took %zu: update "
+                            "pf_scratch_bytes\n", pf_scratch_bytes(hp.cap, exact), alloc_bytes - ab);
     }
     ck_make_plan();
     if (exact && stg_n < 2)
@@ -1500,6 +1592,7 @@ MKEngine::Impl::Impl(const std::string & path, int ctx_, int ndraft_, const std:
     pfx.reset();
     load_report(pf_wait, pf_bytes);
     if (getenv("MK_WDIGEST")) weights_digest();
+    if (reserve_early) vram_check("load end");
     fprintf(stderr, "[mk] weights %.2f GB on device, %d SMs, ctx %d, n_draft %d\n", wbytes / 1e9, nsm, ctx, ndraft);
 }
 

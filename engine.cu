@@ -177,6 +177,21 @@ void MKEngine::Impl::mem_mark(const char * tag) {
     mark_free = fr;
     mark_alloc = alloc_bytes;
 }
+
+// MK_RESERVE_EARLY: a full device (cudaMemGetInfo's free ~0) means the CUDA sysmem fallback (Windows, WSL2) may have put part of
+// this process's memory in system memory; a stack limit above the one reserved at load means a kernel's frame was reserved late
+void MKEngine::Impl::vram_check(const char * where) {
+    size_t fr = 0, tot = 0, stk = 0;
+    CK(cudaMemGetInfo(&fr, &tot));
+    CK(cudaDeviceGetLimit(&stk, cudaLimitStackSize));
+    if (stk > stack_res)
+        fprintf(stderr, "[mk] warning: %s: the stack limit grew to %zu B per thread (%zu reserved at load): a kernel's local memory was "
+                        "reserved late\n", where, stk, stack_res);
+    if (fr < ((size_t) 1 << 20))
+        fprintf(stderr, "[mk] warning: %s: the device memory is full (%.2f MiB free): with the CUDA sysmem fallback (Windows, WSL2) part of "
+                        "this process's memory may now sit in system memory (slower decode, varying per process); a smaller context "
+                        "(-c) or a larger MK_VRAM_MARGIN avoids it\n", where, fr / 1048576.0);
+}
 #if MK_SPEC_LOG
 void MKEngine::Impl::slog_cycle(int n0, int T, const int * drafts, const Ctl & c) {
     if (!slog) return;
@@ -354,6 +369,7 @@ void MKEngine::Impl::launch(int mode, int T, int last, int score) {
     if (err_host[0] | err_host[1]) launch_failed();
     launches_seen++;
     if (memlog && launches_seen == 1) mem_mark("first mk_cycle launch");
+    if (reserve_early && launches_seen == 1) vram_check("first mk_cycle launch");
     if (profiling && mode == MODE_DECODE) prof_collect(T);
 
 }
