@@ -1293,7 +1293,8 @@ __device__ __forceinline__ void a9_k_rows(uint8_t * st, int r0, unsigned on) {
 // at the barrier; bit 2 (A9F 4): a copy's source = its slot's base + tile offset x stride (one IMAD.WIDE into a fresh pair), no
 // running pointer. A9_MX 1 (A9F 16): row maxima without the shuffle rounds (each lane reads its row's 8 lane maxima of the pair
 // after the pair sync; half 0's partial row sums move to the exchange's free tail). A9_EX 1 (A9F 32): the plain ex2.approx.ftz
-// for the tile's exponentials when no argument of the warp is below -126 (exp2f's subnormal path), else exp2f again.
+// for the tile's exponentials when no argument of the warp is below -126 (exp2f's subnormal path), else exp2f again; A9_EX 2
+// (A9F 64): the same choice made before the exponentials, from each lane's row minima (no exponential computed twice).
 #ifndef A9_RS
 #define A9_RS 0
 #endif
@@ -1306,7 +1307,7 @@ __device__ __forceinline__ void a9_k_rows(uint8_t * st, int r0, unsigned on) {
 #ifndef A9_EX
 #define A9_EX 0
 #endif
-constexpr int A9_FLAGS = (A9_RS ? 1 : 0) | ((A9_CP & 3) << 1) | (A9_MX ? 16 : 0) | (A9_EX ? 32 : 0);
+constexpr int A9_FLAGS = (A9_RS ? 1 : 0) | ((A9_CP & 3) << 1) | (A9_MX ? 16 : 0) | (A9_EX == 1 ? 32 : A9_EX == 2 ? 64 : 0);
 // = exp2f(x) for x >= -126 and NaN (exp2f is this MUFU.EX2 there; it scales only below -126)
 __device__ __forceinline__ float a9_ex2(float x) {
     float y;
@@ -1319,7 +1320,7 @@ __global__ void __launch_bounds__(A2_NT, 1) pk_attn9(int T, int n0, int slot, in
                                                      int segt = 0, int exh = 0, float * __restrict__ part2 = nullptr, int exa = 0) { MK_VIEW_INIT();
     static_assert(KB == 0 || (KLOW && KB >= 4 && KB <= 7), "pk_attn9 KB");
     static_assert(VB == 0 || VB == 8 || (VB >= 4 && VB <= 7), "pk_attn9 VB");
-    constexpr bool A9RS = A9F & 1, A9CS = A9F & 2, A9CW = A9F & 4, A9MX = A9F & 16, A9EX = A9F & 32;
+    constexpr bool A9RS = A9F & 1, A9CS = A9F & 2, A9CW = A9F & 4, A9MX = A9F & 16, A9EX = A9F & 32, A9EE = (A9F & 64) && !A9EX;
     extern __shared__ __align__(16) uint8_t asm_[];
     __half * sV0 = reinterpret_cast<__half *>(asm_ + A8_NS * A8_STG); // [2][32][A2_LD] fp16 V(it) / V(it + 1)
     float2 * xmax = reinterpret_cast<float2 *>(sV0 + 2 * A2_K * A2_LD); // [6][2][32] row maxima (finally: l)
@@ -1748,6 +1749,12 @@ __global__ void __launch_bounds__(A2_NT, 1) pk_attn9(int T, int n0, int slot, in
             }
         }
         float mx0 = fmaxf(fmaxf(s[0][0], s[0][1]), fmaxf(s[1][0], s[1][1])), mx1 = fmaxf(fmaxf(s[0][2], s[0][3]), fmaxf(s[1][2], s[1][3]));
+        float sn0 = 0.f, sn1 = 0.f; // A9_EX 2: this lane's row minima
+        (void) sn0, (void) sn1;
+        if constexpr (A9EE) {
+            sn0 = fminf(fminf(s[0][0], s[0][1]), fminf(s[1][0], s[1][1]));
+            sn1 = fminf(fminf(s[0][2], s[0][3]), fminf(s[1][2], s[1][3]));
+        }
         if constexpr (!A9MX) {
             mx0 = fmaxf(mx0, __shfl_xor_sync(0xffffffffu, mx0, 1));
             mx0 = fmaxf(mx0, __shfl_xor_sync(0xffffffffu, mx0, 2));
@@ -1795,6 +1802,27 @@ __global__ void __launch_bounds__(A2_NT, 1) pk_attn9(int T, int n0, int slot, in
                 for (int ni = 0; ni < 2; ni++)
 #pragma unroll
                     for (int j = 0; j < 4; j++) pv[ni][j] = exp2f(xa[ni][j]);
+                al0 = exp2f(xb0);
+                al1 = exp2f(xb1);
+            }
+        } else if constexpr (A9EE) {
+            // A9_EX 2: the same choice before the exponentials. fl(s - mn) >= fl(min s - mn) for every non-NaN s of the lane's row (IEEE
+            // rounding is monotonic; fminf skips NaN), so lo >= -126 means no argument of this lane is below -126 (a -inf one sends the
+            // warp to exp2f). A NaN min s - mn (fminf drops it from lo) means every argument of that row is NaN: the same MUFU in both forms.
+            const float xb0 = m0 - mn0, xb1 = m1 - mn1;
+            const float lo = fminf(fminf(sn0 - mn0, sn1 - mn1), fminf(xb0, xb1));
+            if (__all_sync(0xffffffffu, lo >= -126.f)) {
+#pragma unroll
+                for (int ni = 0; ni < 2; ni++)
+#pragma unroll
+                    for (int j = 0; j < 4; j++) pv[ni][j] = a9_ex2(s[ni][j] - (j < 2 ? mn0 : mn1));
+                al0 = a9_ex2(xb0);
+                al1 = a9_ex2(xb1);
+            } else {
+#pragma unroll
+                for (int ni = 0; ni < 2; ni++)
+#pragma unroll
+                    for (int j = 0; j < 4; j++) pv[ni][j] = exp2f(s[ni][j] - (j < 2 ? mn0 : mn1));
                 al0 = exp2f(xb0);
                 al1 = exp2f(xb1);
             }
