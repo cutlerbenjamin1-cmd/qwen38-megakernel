@@ -450,6 +450,33 @@ __host__ __device__ constexpr int wv_smem() {
     return 2 * C::NTOKP * (US + 2) * 16 + T * (US + 2) * 8 + US * C::NG * 4 * (!X16 ? 40 : 24);
 }
 
+// MK_FFNA bits (wave 6, top6; exact: integer bookkeeping and load order only; 15 = all, 0 = the old prologues):
+// 1 ffn_gu_wv / c1_arrive_mine / resid_wv without run-time divisions (cDeal, the per-block dealing table) and ffn_gu_wv's
+//   loop state in one word; 2 wv_fill's ssq loads ahead of its copies; 4 wv_fill's meta group first (md / mx / mx4 while
+//   xa / xb land, as wv_fill_ckp); 8 dn_proj_wv / attn_proj_wv without run-time divisions (cDeal; the row-half split by a
+//   shift). (8 apart: with every bit on, their T = 8 instances kept more values in stack slots and their tile parts ran
+//   ~1 us longer per call; 8 is the suspect)
+#ifndef MK_FFNA
+#define MK_FFNA 7 // (default: mk_shared.cuh)
+#endif
+#if MK_FFNA & 9
+// The wv phase tops' dealing per block b of the engine's grid (nsm blocks: every mk_cycle launch that runs a wv phase),
+// each range [t0, t1) as t0 | t1 << 16: the old prologues' integer formulas evaluated on the host (mkl::wv_deal_init) and
+// compared with the device formulas once at init (k_deal_check). One LDC instead of the two division chains (gridDim, the
+// chunk's G) ahead of every phase top's first prefetch.
+struct WvDeal {
+    unsigned c1; // ffn_gu_wv, c1: [c1_t0, c1_t1) of wv_chunk(b, nb)
+    unsigned ff; // ffn_gu_wv, no c1: [NJ b / nb, NJ (b + 1) / nb)
+    unsigned rt; // resid_wv: [NTILE bi / G, NTILE (bi + 1) / G) of its chunk
+    unsigned dn; // dn_proj_wv, qkv and gate both in the wv layout: [NTL b / nb, NTL (b + 1) / nb)
+    unsigned qk; // dn_proj_wv, qkv only: [(QKV / 16) b / nb, (QKV / 16) (b + 1) / nb)
+    unsigned ab; // dn_proj_wv's K1 alpha / beta items (and gate only): [n_ab b / nb, n_ab (b + 1) / nb)
+    int kc;      // wv_chunk(b, nb).kc
+};
+__constant__ WvDeal cDeal[MK_MAX_GRID];
+__device__ int g_deal_bad; // (k_deal_check: blocks whose entry differs)
+#endif
+
 // Fill units [u0, u0 + US) of T activation rows. norm: s_rs[t] = the RMS-norm scale of row t (as fill_xs).
 // Also returns the dp4a view of the same units (token stride US + 2: rows_* with XP = 2).
 // min2: mx = the MIN 2 accumulator inputs (bits of MAGIC - 32 qsum) instead of dx qsum (the matrix is an offset type)
@@ -466,6 +493,31 @@ __device__ __forceinline__ WvXS wv_fill(const QBuf & q, int u0, bool norm, SX * 
     float4 * md = reinterpret_cast<float4 *>(xm + T * LDU);
     float2 * mx = reinterpret_cast<float2 *>(md + US * C::NG * 4);
     const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
+#if MK_FFNA & 2
+    // the norm warps' ssq loads first (in flight with the copies; the same sum below). (pp defined on every path: left
+    // undefined on the other warps' path, ptxas parked it in stack slots, an STL behind each load that made the copies wait)
+    float pp[U_D / 32] = {};
+    if (norm && warp < T) {
+#pragma unroll
+        for (int k = 0; k < U_D / 32; k++) pp[k] = __ldcg(q.ssq + warp * U_D + lane + 32 * k);
+    }
+#endif
+#if MK_FFNA & 4
+    // the meta group before xa / xb
+#pragma unroll 1
+    for (int i = tid; i < T * US / 2; i += NT) {
+        const int t = 2 * i / US, u = 2 * i - t * US;
+        cp_async16(xm + t * LDU + u, q.meta + (t * q.U + u0 + u));
+    }
+    asm volatile("cp.async.commit_group;" ::: "memory");
+#pragma unroll 1
+    for (int i = tid; i < T * US; i += NT) {
+        const int t = i / US, u = i - t * US, gi = t * q.U + u0 + u;
+        cp_async16(xa + t * LDU + u, q.xa + (size_t) gi * 16);
+        cp_async16(xb + t * LDU + u, q.xb + (size_t) gi * 16);
+    }
+    asm volatile("cp.async.commit_group;" ::: "memory");
+#else
     // (int unit index, widened once per address: the size_t sum kept a sign word live that resid_wv spilled at its register
     // budget; unroll 1: T US <= 3 NT at T <= MAXT, the compiler's 4-way body never ran)
 #pragma unroll 1
@@ -480,12 +532,15 @@ __device__ __forceinline__ WvXS wv_fill(const QBuf & q, int u0, bool norm, SX * 
         cp_async16(xm + t * LDU + u, q.meta + (t * q.U + u0 + u));
     }
     asm volatile("cp.async.commit_group;" ::: "memory");
+#endif
     float * s_rs = misc(sm);
     if (norm) { // normed consumers always read the K = D residual stream (U_D = 160 partial sums)
         if (warp < T) {
+#if !(MK_FFNA & 2)
             float pp[U_D / 32];
 #pragma unroll
             for (int k = 0; k < U_D / 32; k++) pp[k] = __ldcg(q.ssq + warp * U_D + lane + 32 * k);
+#endif
             float acc = 0.f;
 #pragma unroll
             for (int k = 0; k < U_D / 32; k++) acc += pp[k];
@@ -495,7 +550,11 @@ __device__ __forceinline__ WvXS wv_fill(const QBuf & q, int u0, bool norm, SX * 
     } else if (tid < T) {
         s_rs[tid] = 1.0f;
     }
+#if MK_FFNA & 4
+    asm volatile("cp.async.wait_group 1;" ::: "memory"); // (the meta group; xa / xb are not read before the wait_all below)
+#else
     asm volatile("cp.async.wait_all;" ::: "memory");
+#endif
     __syncthreads();
     // md / mx from the staged meta (no second global round trip)
     for (int i = tid; i < US * C::NG * 4; i += NT) {
@@ -544,6 +603,9 @@ __device__ __forceinline__ WvXS wv_fill(const QBuf & q, int u0, bool norm, SX * 
             mx4[i] = make_float4(__int_as_float(WV_MAGIC - 32 * qv[0][0]), __int_as_float(WV_MAGIC - 32 * qv[1][0]),
                                  __int_as_float(WV_MAGIC - 32 * qv[0][1]), __int_as_float(WV_MAGIC - 32 * qv[1][1]));
         }
+#if MK_FFNA & 4
+    asm volatile("cp.async.wait_all;" ::: "memory");
+#endif
     __syncthreads();
     mark_fill();
     if (sxo) {
@@ -816,9 +878,24 @@ __device__ __forceinline__ void pf_l2n(const void * p) { asm volatile("prefetch.
 // issued before the activation fill: the fill reads only L2-resident activations, so DRAM idled through it (~2.5-7 us at
 // T8, ~12 us at T16) and the weight stream started cold after it. ~3-4 MB per phase (one unit per warp; normal priority:
 // the weight loads' evict_first lines go first). part / nparts: that share of the unit only (attn_kv_rh's row halves).
-// Addresses stay inside the tile's own units.
+// Addresses stay inside the tile's own units. NU > 1 (nparts 1): also the tile's next NU - 1 units.
+// MK_PFW N >= 2 (wave 6, top6; hints only): N units per warp at the tops of ffn_gu_wv and dn_proj_wv, MK_C1PF N >= 2: at
+// ffn_down's (resid_wv<T, true, *>); 0: one unit, as resid_sout / resid_o / attn_proj keep (REQ ffn6-1 = proj6-1: depth 2
+// gains in dn_proj and the FFN, loses in the resid phases; 3 loses). MK_L2_TUNE builds: cL2.top at every top instead.
+#ifndef MK_PFW
+#define MK_PFW 0
+#endif
+#ifndef MK_C1PF
+#define MK_C1PF 0
+#endif
+constexpr int WV_PFD = MK_PFW > 1 ? MK_PFW : 1, WV_PFD_C1 = MK_C1PF > 1 ? MK_C1PF : 1;
+template <int NU = 1>
 __device__ __forceinline__ void wv_pf_unit(const Mat & m, int tile, int sb, int part = 0, int nparts = 1) {
+#if MK_FFNA & 8
+    const int lane = threadIdx.x & 31, ub = wv_ubytes(m.type), pb = ub >> (nparts - 1); // (nparts 1 or 2: no division)
+#else
     const int lane = threadIdx.x & 31, ub = wv_ubytes(m.type), pb = ub / nparts;
+#endif
     if (128 * lane >= pb) return;
     const size_t nsb = (size_t) (m.K >> 8), off = ((size_t) tile * nsb + sb) * ub + part * pb + 128 * lane;
 #if MK_L2_TUNE
@@ -827,7 +904,14 @@ __device__ __forceinline__ void wv_pf_unit(const Mat & m, int tile, int sb, int 
         if (o < ((size_t) tile + 1) * nsb * ub) pf_l2n(m.w + o);
     }
 #else
-    if (off < ((size_t) tile + 1) * nsb * ub) pf_l2n(m.w + off);
+    if constexpr (NU > 1) {
+        const size_t end = ((size_t) tile + 1) * nsb * ub;
+#pragma unroll
+        for (int u = 0; u < NU; u++)
+            if (off + (size_t) u * ub < end) pf_l2n(m.w + off + (size_t) u * ub);
+    } else {
+        if (off < ((size_t) tile + 1) * nsb * ub) pf_l2n(m.w + off);
+    }
 #endif
 }
 
@@ -914,21 +998,52 @@ __device__ __forceinline__ bool dn_tile(int p, int nt_q, int & lt) {
     return p < nt_q;
 }
 
+// MK_WVREMAT 1 (wave 6, top6; exact: integer bookkeeping only): dn_proj_wv and attn_proj_wv take the layer's index li (W =
+// cW.L[li]) instead of W, keep only a packed loop word (and n / dn_c) across their tile calls and rebuild W, the dealing range
+// (cDeal) and the derived counts after each call. 0: the old loops and signatures. Callers pass WV_LAYER_ARG(W, L): L under
+// MK_WVREMAT, W otherwise (W == cW.L[L] at every call site)
+#ifndef MK_WVREMAT
+#define MK_WVREMAT 1 // (default: mk_shared.cuh)
+#endif
+#if MK_WVREMAT && !(MK_FFNA & 9)
+#error "MK_WVREMAT reads the dealing table: build it with MK_FFNA bit 1 or 8"
+#endif
+#if MK_WVREMAT
+#define WV_LAYER_ARG(W, L) (L)
+#else
+#define WV_LAYER_ARG(W, L) (W)
+#endif
+
 // delta-net input projections: alpha / beta (fp32 path, as dn_proj), qkv -> conv ring and z (wv tiles, or dp4a pairs
 // for a hybrid-type matrix)
 // BAT (batched launches): row t's qkv goes to the conv ring of its own lane at its own position: rt (the pass's lanes) gives
 // each row its lane, the conv-ring rows are looked up at the start (s_cvp); orphan rows (past the lanes) are not stored.
 // No L2 warm-up of dn_core's inputs (they are per lane). Every matrix of the phase must be in the wv layout (host check).
 template <int T, bool BAT = false>
+#if MK_WVREMAT
+__device__ __noinline__ void dn_proj_wv(int li, int dl, int n, int dn_c, RowTab rt = RowTab{}) {
+    const LayerW & W = cW.L[li];
+#else
 __device__ __noinline__ void dn_proj_wv(const LayerW & W, int dl, int n, int dn_c, RowTab rt = RowTab{}) {
+#endif
     const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
     const int nt_q = W.qkv.fm && W.gate.fm ? -1 : W.qkv.fm ? QKV / 16 : 0; // (dn_tile)
     const int ntile = (W.qkv.fm ? QKV / 16 : 0) + (W.gate.fm ? VD / 16 : 0);
+#if MK_FFNA & 8
+    // (the range of ntile b / G: both in the wv layout dn, qkv only qk, gate only ab (n_ab == VD / 16), neither empty; selects,
+    // no branch: a branch's two definitions of t0 / t1 met in stack slots)
+    static_assert(AB_SPLIT * 2 * NVH == VD / 16, "dn_proj_wv: the gate-only range is the K1 alpha / beta range");
+    const WvDeal & dd = cDeal[blockIdx.x];
+    const unsigned dw = W.qkv.fm ? (W.gate.fm ? dd.dn : dd.qk) : (W.gate.fm ? dd.ab : 0u);
+    const int t0 = dw & 0xffffu, t1 = dw >> 16;
+    (void) ntile;
+#else
     const int t0 = ntile * blockIdx.x / gridDim.x, t1 = ntile * (blockIdx.x + 1) / gridDim.x;
+#endif
     if (t0 + (NW - 1 - warp) < t1) { // (the warp's first tile, below)
         int lt;
         const bool isq = dn_tile(t0 + (NW - 1 - warp), nt_q, lt);
-        wv_pf_unit(isq ? W.qkv : W.gate, lt, 0);
+        wv_pf_unit<WV_PFD>(isq ? W.qkv : W.gate, lt, 0);
     }
     float ** const s_cvp = reinterpret_cast<float **>(misc(nullptr) + 64); // (BAT: per row, its conv-ring row or null)
     if constexpr (BAT) {
@@ -958,11 +1073,19 @@ __device__ __noinline__ void dn_proj_wv(const LayerW & W, int dl, int n, int dn_
     // with upstream's dealing: bit-exact.
     int ab0 = gwarp(), ab1 = n_ab, astep = nwarps();
     if (cB.k1 && W.qkv.fm && W.gate.fm) {
+#if MK_FFNA & 8
+        const unsigned da = cDeal[blockIdx.x].ab;
+        const int nb = t1 - t0; // (both FM: t0 / t1 are the table's NTL range)
+        const int nl = NW - nb % NW; // warps 0 .. nl - 1 carry nb / NW tiles, the others one more
+        ab1 = da >> 16;
+        ab0 = warp < nl ? (int) (da & 0xffffu) + warp : ab1;
+#else
         constexpr int NTL = QKV / 16 + VD / 16; // (the tile space below when both are FM)
         const int nb = NTL * (blockIdx.x + 1) / gridDim.x - NTL * blockIdx.x / gridDim.x;
         const int nl = NW - nb % NW; // warps 0 .. nl - 1 carry nb / NW tiles, the others one more
         ab1 = n_ab * (blockIdx.x + 1) / gridDim.x;
         ab0 = warp < nl ? n_ab * blockIdx.x / gridDim.x + warp : ab1;
+#endif
         astep = nl;
     }
     for (int it = ab0; it < ab1; it += astep) {
@@ -1010,7 +1133,26 @@ __device__ __noinline__ void dn_proj_wv(const LayerW & W, int dl, int n, int dn_
     }
     // (the lane read afresh after the tile call, tid_x: its ring rows / offsets hoisted before the loop had no register to
     // live in across the tile functions and were spilled)
+#if MK_WVREMAT
+    // MK_WVREMAT: across the tile calls only the loop word lw = tile | layer << 11 | dl << 18 (and n, dn_c); W, t1 (the dealing
+    // table), nt_q and conv are rebuilt from it after each call (the shadowing declarations below), so ptxas has no W / t0 / t1
+    // to park in stack slots, whatever the whole-program allocation
+    static_assert(QKV / 16 + VD / 16 + NW <= 2048 && NLA <= 128 && NL <= 64, "dn_proj_wv's loop word");
+    static_assert(AB_SPLIT * 2 * NVH == VD / 16, "dn_proj_wv: the gate-only range is the table's alpha / beta range");
+    unsigned lw = (unsigned) (t0 + (NW - 1 - warp)) | (unsigned) li << 11 | (unsigned) dl << 18;
+    asm volatile("" : "+r"(lw));
+    for (;; lw += NW) {
+        const LayerW & W = cW.L[lw >> 11 & 127u];
+        const int tile = lw & 2047u, dl = lw >> 18;
+        const WvDeal & dr = cDeal[ctaid_x()];
+        const int t1 = (W.qkv.fm ? (W.gate.fm ? dr.dn : dr.qk) : (W.gate.fm ? dr.ab : 0u)) >> 16; // (ntile (b + 1) / G)
+        if (tile >= t1) break;
+        const int nt_q = W.qkv.fm && W.gate.fm ? -1 : W.qkv.fm ? QKV / 16 : 0;
+        float * const conv = cB.conv + (size_t) dl * CONV_RING * QKV;
+        (void) conv;
+#else
     for (int tile = t0 + (NW - 1 - warp); tile < t1; tile += NW) {
+#endif
         int lt;
         const bool isq = dn_tile(tile, nt_q, lt);
         const WvAcc<1> a = wv_tile_any<T, false>(isq ? W.qkv : W.gate, lt, 0, D / 256, xs);
@@ -1031,6 +1173,11 @@ __device__ __noinline__ void dn_proj_wv(const LayerW & W, int dl, int n, int dn_
     }
     // Warm L2 with what dn_core will read (as dn_proj)
     if (!BAT && blockIdx.x < NVH) {
+#if MK_WVREMAT
+        const LayerW & W = cW.L[lw >> 11 & 127u];
+        const int dl = lw >> 18;
+        float * const conv = cB.conv + (size_t) dl * CONV_RING * QKV;
+#endif
         const int h = blockIdx.x, kh = h % NKH, tid = threadIdx.x;
         pf_l2(cB.dstate + ((size_t) dl * NVH + h) * 128 * 128 + tid * 32);
         if (tid == 0) {
@@ -1089,7 +1236,12 @@ __device__ __noinline__ void attn_kv_rh(const Mat m, int w, int lt, int rh, cons
 // attention q / k / v projections (wv tiles of the wv-layout matrices, dp4a pairs of the hybrid's)
 // pf false (batched launches): no L2 warm-up of attn_core's inputs (they are per lane)
 template <int T>
+#if MK_WVREMAT
+__device__ __noinline__ void attn_proj_wv(int li, int slot, int n, bool pf = true) {
+    const LayerW & W = cW.L[li];
+#else
 __device__ __noinline__ void attn_proj_wv(const LayerW & W, int slot, int n, bool pf = true) {
+#endif
     const int warp = threadIdx.x >> 5;
     const int nq = W.q.fm ? QG / 16 : 0, nk = W.k.fm ? KVD / 16 : 0, nv = W.v.fm ? KVD / 16 : 0;
     // K6: items = the q tiles, then the k tiles, then the v tiles; with bit 4 a Q8_0 k / v tile (87 KB vs 56 KB for a
@@ -1111,7 +1263,12 @@ __device__ __noinline__ void attn_proj_wv(const LayerW & W, int slot, int n, boo
     if (i0 < i1) { // (the warp's first item, below)
         const int w = i0 < nq ? 0 : i0 < nq + nkk ? 1 : 2;
         const int j = i0 - (w == 0 ? 0 : w == 1 ? nq : nq + nkk), ns = w == 0 ? 1 : w == 1 ? sk : sv;
+#if MK_FFNA & 8
+        const int lt = j >> (ns - 1); // (ns 1 or 2, j >= 0: j / ns without a division)
+        wv_pf_unit(w == 0 ? W.q : w == 1 ? W.k : W.v, lt, 0, j - lt * ns, ns);
+#else
         wv_pf_unit(w == 0 ? W.q : w == 1 ? W.k : W.v, j / ns, 0, j - j / ns * ns, ns);
+#endif
     }
     const WvXS xs = wv_fill<T, false, U_D>(cB.qn, 0, true, nullptr, false, W.q.type == T_Q6K || W.k.type == T_Q6K || W.v.type == T_Q6K);
     const float * s_rs = misc(nullptr);
@@ -1125,10 +1282,31 @@ __device__ __noinline__ void attn_proj_wv(const LayerW & W, int slot, int n, boo
         lo += KVD / 2;
     }
     if (!W.v.fm) gemv_pairs_dp<T, 5>(W.v, lo, lo + KVD / 2, PairOut{cB.vbuf, KVD, -1});
+#if MK_WVREMAT
+    // MK_WVREMAT: across the tile calls only the loop word lw = it | layer << 12 | slot << 19 | pf << 24 | K6 bit 2 << 25 |
+    // K6 bit 4 << 26 (and n); W, the item counts, i1 and the step are rebuilt from it after each call (as dn_proj_wv)
+    static_assert(QG / 16 + 4 * (KVD / 16) + MK_MAX_GRID * NW <= 4096 && NLA <= 128 && N_ATT_SLOTS <= 32, "attn_proj_wv's loop word");
+    unsigned lw = (unsigned) i0 | (unsigned) li << 12 | (unsigned) slot << 19 | (unsigned) pf << 24 |
+                  (unsigned) ((k6 & 2) != 0) << 25 | (unsigned) ((k6 & 4) != 0) << 26;
+    asm volatile("" : "+r"(lw));
+    for (;; lw += (lw >> 25 & 1u) ? gridDim.x * NW : NW) {
+        const LayerW & W = cW.L[lw >> 12 & 127u];
+        const int it = lw & 4095u, ks = (lw >> 26 & 1u) ? 2 : 1;
+        const int nq = W.q.fm ? QG / 16 : 0, nk = W.k.fm ? KVD / 16 : 0, nv = W.v.fm ? KVD / 16 : 0;
+        const int sk = W.k.type == T_Q8_0 ? ks : 1, sv = W.v.type == T_Q8_0 ? ks : 1;
+        const int nkk = nk * sk, ni = nq + nkk + nv * sv;
+        const int i1 = (lw >> 25 & 1u) ? ni : ni * (ctaid_x() + 1) / gridDim.x;
+        if (it >= i1) break;
+#else
     for (int it = i0; it < i1; it += istep) {
+#endif
         const int w = it < nq ? 0 : it < nq + nkk ? 1 : 2;
         const int j = it - (w == 0 ? 0 : w == 1 ? nq : nq + nkk), ns = w == 0 ? 1 : w == 1 ? sk : sv;
+#if MK_FFNA & 8
+        const int lt = j >> (ns - 1); // (as above)
+#else
         const int lt = j / ns;
+#endif
         if (ns > 1) {
             attn_kv_rh<T>(w == 1 ? W.k : W.v, w, lt, j - lt * ns, xs);
             continue;
@@ -1138,6 +1316,12 @@ __device__ __noinline__ void attn_proj_wv(const LayerW & W, int slot, int n, boo
         wv_store<T>(w == 0 ? cB.qbuf : w == 1 ? cB.kbuf : cB.vbuf, w == 0 ? QG : KVD, lt, a, s_rs, tid_x() & 31);
     }
     // Warm L2 with what attn_core reads first (as attn_proj)
+#if MK_WVREMAT
+    {
+    const LayerW & W = cW.L[lw >> 12 & 127u];
+    const int slot = lw >> 19 & 31u;
+    const bool pf = lw >> 24 & 1u;
+#endif
     if (!pf) return;
     pf_block(W.qn, HD * 4);
     pf_block(W.kn, HD * 4);
@@ -1160,6 +1344,9 @@ __device__ __noinline__ void attn_proj_wv(const LayerW & W, int slot, int n, boo
             if (l < lv) pf_l2(Vc + pos * rv + l * 128);
         }
     }
+#if MK_WVREMAT
+    }
+#endif
 }
 
 // q16_store of chunk j from lane layout (lanes < 16: row r of each token); lane = threadIdx.x & 31, passed in (ffn_gu_wv
@@ -1226,14 +1413,35 @@ __device__ __forceinline__ void c1_wait(int kc) {
 __device__ __forceinline__ int c1_t0(const WvChunk & ch) { return C1_NJC * ch.kc + C1_NJC * ch.bi / ch.G; }
 __device__ __forceinline__ int c1_t1(const WvChunk & ch) { return C1_NJC * ch.kc + C1_NJC * (ch.bi + 1) / ch.G; }
 
+#if MK_FFNA & 9
+// MK_FFNA's init check of cDeal (mkl::wv_deal_init, one launch of nsm blocks): every entry against the device formulas
+__global__ void k_deal_check() {
+    if (threadIdx.x != 0) return;
+    constexpr int NJ = FF / 16, NTILE = D / 16, NTL = QKV / 16 + VD / 16, NQ = QKV / 16, n_ab = AB_SPLIT * 2 * NVH;
+    const unsigned b = blockIdx.x, nb = gridDim.x;
+    const WvChunk ch = wv_chunk(b, nb);
+    const WvDeal & d = cDeal[b];
+    const auto pk = [](int t0, int t1) { return (unsigned) t0 | (unsigned) t1 << 16; };
+    const bool ok = d.kc == ch.kc && d.c1 == pk(c1_t0(ch), c1_t1(ch)) && d.ff == pk(NJ * b / nb, NJ * (b + 1) / nb) &&
+                    d.rt == pk(NTILE * ch.bi / ch.G, NTILE * (ch.bi + 1) / ch.G) && d.dn == pk(NTL * b / nb, NTL * (b + 1) / nb) &&
+                    d.qk == pk(NQ * b / nb, NQ * (b + 1) / nb) && d.ab == pk(n_ab * b / nb, n_ab * (b + 1) / nb);
+    if (!ok) atomicAdd(&g_deal_bad, 1);
+}
+#endif
+
 // this block's ffn_down chunk in the c1 dealing (wv_chunk) from fresh reads of the block index and grid size (asm
 // volatile, as tid_x): recomputed after the phase's tile calls instead of kept live across them; then its c1 arrival
 __device__ __forceinline__ void c1_arrive_mine() {
+#if MK_FFNA & 1
+    const WvDeal & d = cDeal[ctaid_x()];
+    c1_arrive(d.kc, (int) (d.c1 >> 16) - (int) (d.c1 & 0xffffu));
+#else
     unsigned b, n;
     asm volatile("mov.u32 %0, %%ctaid.x;" : "=r"(b));
     asm volatile("mov.u32 %0, %%nctaid.x;" : "=r"(n));
     const WvChunk ch = wv_chunk(b, n);
     c1_arrive(ch.kc, c1_t1(ch) - c1_t0(ch));
+#endif
 }
 
 // FFN gate / up: warp item = tile j of gate and of up -> silu(g) * u quantised per 16-chunk (chunk j) for ffn_down.
@@ -1245,17 +1453,36 @@ template <int T>
 __device__ __noinline__ void ffn_gu_wv(const LayerW & W, bool c1 = false) {
     const int warp = threadIdx.x >> 5;
     constexpr int NJ = FF / 16;
+#if MK_FFNA & 1
+    const unsigned dw = c1 ? cDeal[blockIdx.x].c1 : cDeal[blockIdx.x].ff;
+    const int t0 = dw & 0xffffu, t1 = dw >> 16;
+#else
     int t0 = NJ * blockIdx.x / gridDim.x, t1 = NJ * (blockIdx.x + 1) / gridDim.x;
     if (c1) {
         const WvChunk ch = wv_chunk(blockIdx.x, gridDim.x);
         t0 = c1_t0(ch);
         t1 = c1_t1(ch);
     }
+#endif
     const bool gw = W.fg.fm, uw = W.fu.fm;
-    if (t0 + (NW - 1 - warp) < t1 && (gw || uw)) wv_pf_unit(gw ? W.fg : W.fu, t0 + (NW - 1 - warp), 0); // (its first pair)
+    if (t0 + (NW - 1 - warp) < t1 && (gw || uw)) wv_pf_unit<WV_PFD>(gw ? W.fg : W.fu, t0 + (NW - 1 - warp), 0); // (its first pair)
+#if MK_FFNA & 1
+    // the loop's state in one word, j | t1 << 12 | gw << 24 | uw << 25 | c1 << 26, made opaque here: W and st are all that
+    // crosses the fill (its norm's division call) and the tile calls (W.fg.fm and t1 were stack slots)
+    static_assert(NJ + NW < 4096, "ffn_gu_wv's loop word");
+    unsigned st = (unsigned) (t0 + (NW - 1 - warp)) | (unsigned) t1 << 12 | (unsigned) gw << 24 | (unsigned) uw << 25 |
+                  (unsigned) c1 << 26;
+    asm volatile("" : "+r"(st));
+#endif
     const WvXS xs = wv_fill<T, false, U_D>(cB.qn, 0, true, nullptr, false, W.fg.type == T_Q6K || W.fu.type == T_Q6K);
     const float * s_rs = misc(nullptr);
+#if MK_FFNA & 1
+    for (; (int) (st & 0xfffu) < (int) (st >> 12 & 0xfffu); st += NW) {
+        const int j = st & 0xfffu;
+        const bool gw = st >> 24 & 1u, uw = st >> 25 & 1u; // (the prologue's, from st)
+#else
     for (int j = t0 + (NW - 1 - warp); j < t1; j += NW) {
+#endif
         float act[T];
         int lane;
         if (gw && uw) { // GLU on the C fragments, one transpose
@@ -1267,7 +1494,13 @@ __device__ __noinline__ void ffn_gu_wv(const LayerW & W, bool c1 = false) {
             for (int c = 0; c < 4; c++) {
                 const int t = 2 * (lane & 3) + (c & 1);
                 const float s = t < T ? s_rs[t] : 0.f;
+#if MK_SILUPAD
+                // (padding column t >= T, never read by wv_to_lane<T>: silu(1), not silu(0 * g), whose zero dividend sends the
+                // warp's IEEE division to its slow path at every T < 8)
+                a.v[0][c] = silu(t < T ? g.v[0][c] * s : 1.f) * (u.v[0][c] * s);
+#else
                 a.v[0][c] = silu(g.v[0][c] * s) * (u.v[0][c] * s);
+#endif
             }
             const LaneT<T> l = wv_to_lane<T>(a, lane & 15);
 #pragma unroll
@@ -1296,7 +1529,11 @@ __device__ __noinline__ void ffn_gu_wv(const LayerW & W, bool c1 = false) {
         }
         glu_store<T>(j, act, lane);
     }
+#if MK_FFNA & 1
+    if (st >> 26 & 1u) c1_arrive_mine();
+#else
     if (c1) c1_arrive_mine();
+#endif
 }
 
 // A warp's arrival at a resid group counter after its partial stores (returns the count before it, in every lane): the
@@ -1310,6 +1547,37 @@ __device__ __forceinline__ unsigned wv_arrive(unsigned * c, int lane) {
     return __shfl_sync(0xffffffffu, old, 0);
 }
 __device__ __forceinline__ unsigned wv_arrive(unsigned * c) { return wv_arrive(c, threadIdx.x & 31); }
+// MK_FORMAL_SYNC 1: a __syncwarp after the last arrival's fence (lane 0's atom -> fence is the acquire; bar.warp.sync,
+// unlike the SHFL of the count, orders lanes 1-31's partial loads after it: PTX 9.7.13.2; correct6 F3)
+#ifndef MK_FORMAL_SYNC
+#define MK_FORMAL_SYNC 1 // (default: mk_shared.cuh)
+#endif
+
+#if MK_Q32N
+// K2 combine of tokens t0 .. t0 + N - 1 at row `row` of 32-row group j (resid_wv / resid_ck_last): their partial and residual
+// loads, the sums (((p0 + p1) + p2) + p3) + x and x stores, then one q32_store_n. ss as an uncontracted FMUL (today's SASS)
+template <int N>
+__device__ __forceinline__ void k2_combine(float * x, int t0, int j, int row, float wn) {
+    float p[N][WV_S], xo[N], v[N], ss[N];
+#pragma unroll
+    for (int u = 0; u < N; u++) {
+#pragma unroll
+        for (int k = 0; k < WV_S; k++) p[u][k] = __ldcg(cB.wvpart + ((size_t) k * RMAX + t0 + u) * D + row);
+        xo[u] = __ldcg(x + (t0 + u) * D + row);
+    }
+#pragma unroll
+    for (int u = 0; u < N; u++) {
+        float s = p[u][0];
+#pragma unroll
+        for (int k = 1; k < WV_S; k++) s += p[u][k];
+        const float xv = s + xo[u];
+        x[(t0 + u) * D + row] = xv;
+        v[u] = xv * wn;
+        ss[u] = __fmul_rn(xv, xv);
+    }
+    q32_store_n<N>(cB.qn, t0, j, v, ss);
+}
+#endif
 
 // Output rows with the residual add (out: K = VD, ffn_down: K = FF, X16 = its per-16 activations), split-K WV_S chunks
 // (wv_chunk: each chunk's blocks deal all D / 16 tiles). Each chunk's partial sums go to cB.wvpart; the last of the 2 WV_S (tile, chunk)
@@ -1324,11 +1592,17 @@ __device__ __noinline__ void resid_wv(const Mat & Wm, const QBuf & in, const flo
     using C = WvCfg<T, X16>;
     const int warp = threadIdx.x >> 5;
     if (threadIdx.x < 4 && blockIdx.x + threadIdx.x * gridDim.x < D / 32) pf_l2(wnext + 32 * (blockIdx.x + threadIdx.x * gridDim.x));
+#if MK_FFNA & 1
+    const int kc = cDeal[blockIdx.x].kc;
+    const unsigned dw = cDeal[blockIdx.x].rt;
+    const int t0 = dw & 0xffffu, t1 = dw >> 16;
+#else
     const WvChunk ch = wv_chunk(blockIdx.x, gridDim.x);
     const int kc = ch.kc;
     constexpr int NTILE = D / 16;
     const int t0 = NTILE * ch.bi / ch.G, t1 = NTILE * (ch.bi + 1) / ch.G;
-    if (t0 + (NW - 1 - warp) < t1) wv_pf_unit(Wm, t0 + (NW - 1 - warp), CH * kc); // (its first tile; during the C1 wait)
+#endif
+    if (t0 + (NW - 1 - warp) < t1) wv_pf_unit<(X16 ? WV_PFD_C1 : 1)>(Wm, t0 + (NW - 1 - warp), CH * kc); // (its first tile; during the C1 wait)
     if (role & 2) c1_wait(kc); // (C1: ffn_down after ffn_gu_wv's c1 dealing, no grid barrier: this chunk's tiles of in)
     const WvXS xs = wv_fill<T, X16, US>(in, US * kc, false, nullptr, X16 && wv_min2(Wm.type), !X16 && Wm.type == T_Q6K);
     unsigned * cnt = cB.wvcnt + (role & 1) * (D / 32); // (role bit 1: the C1 wait above)
@@ -1349,6 +1623,9 @@ __device__ __noinline__ void resid_wv(const Mat & Wm, const QBuf & in, const flo
         const unsigned old = wv_arrive(cnt + (tile >> 1), lane);
         if (old == 2 * WV_S - 1) { // last arrival at this 32-row group
             __threadfence();
+#if MK_FORMAL_SYNC
+            __syncwarp();
+#endif
             const int j = tile >> 1, row = 32 * j + lane;
             if (cB.k2) {
                 // K2: the K2-off loop below makes one dependent L2 round trip (+ q32_store's shuffle chains) per token,
@@ -1357,6 +1634,12 @@ __device__ __noinline__ void resid_wv(const Mat & Wm, const QBuf & in, const flo
                 // + x: bit-exact.
                 constexpr int TB = MK_K2_TB < T ? MK_K2_TB : T;
                 const float wn = wnext[row];
+#if MK_Q32N
+                constexpr int NB = T / TB, TL = T - NB * TB; // (TB-token batches, then a T % TB tail)
+#pragma unroll
+                for (int tb = 0; tb < NB * TB; tb += TB) k2_combine<TB>(x, tb, j, row, wn);
+                if constexpr (TL > 0) k2_combine<TL>(x, NB * TB, j, row, wn);
+#else
 #pragma unroll // (T, TB compile-time: no runtime guards; x stores keep the batches apart)
                 for (int tb = 0; tb < T; tb += TB) {
                     float p[TB][WV_S], xo[TB];
@@ -1378,6 +1661,7 @@ __device__ __noinline__ void resid_wv(const Mat & Wm, const QBuf & in, const flo
                             q32_store(cB.qn, tb + u, j, xv * wn, xv * xv, true);
                         }
                 }
+#endif
             } else {
 #pragma unroll 1
                 for (int t = 0; t < T; t++) {
@@ -2210,9 +2494,18 @@ __device__ __noinline__ void resid_ck_last(int tile, const float * wnext, int ro
     float * x = cB.x;
     if (wv_arrive(cnt + (tile >> 1)) != 2 * WV_S - 1) return;
     __threadfence();
+#if MK_FORMAL_SYNC
+    __syncwarp();
+#endif
     const int jj = tile >> 1, row = 32 * jj + lane;
     constexpr int TB = MK_K2_TB < 8 ? MK_K2_TB : 8;
     const float wn = wnext[row];
+#if MK_Q32N
+    constexpr int NB = T / TB, TL = T - NB * TB;
+#pragma unroll 1
+    for (int tb = 0; tb < NB * TB; tb += TB) k2_combine<TB>(x, tb, jj, row, wn);
+    if constexpr (TL > 0) k2_combine<TL>(x, NB * TB, jj, row, wn);
+#else
 #pragma unroll 1
     for (int tb = 0; tb < T; tb += TB) {
         float p[TB][WV_S], xo[TB];
@@ -2234,6 +2527,7 @@ __device__ __noinline__ void resid_ck_last(int tile, const float * wnext, int ro
                 q32_store(cB.qn, tb + u, jj, xv * wn, xv * xv, true);
             }
     }
+#endif
     if (lane == 0) cnt[jj] = 0;
 }
 

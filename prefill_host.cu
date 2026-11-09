@@ -28,11 +28,53 @@ inline void a2_plan(int T, int n0, int slots, size_t part_floats, int & nfull, i
 
 } // namespace
 
+// MK_PF_CAP: tokens per prefill chunk (multiple of 128); scratch ~0.25 MB per token (MK_EXACT, every gate / up fused)
+int MKEngine::Impl::pf_cap_req() const {
+    const char * e = getenv("MK_PF_CAP");
+    return e ? std::max(128, std::min(2048, atoi(e) / 128 * 128)) : 2048;
+}
+
+// pf_init's scratch in bytes at `cap` tokens (ex: MK_EXACT), dalloc's 16-byte pads included: keep in step with pf_init (the
+// loader compares the two after pf_init when MK_RESERVE_EARLY is on)
+size_t MKEngine::Impl::pf_scratch_bytes(int cap, bool ex) {
+    bool all_fused = true;
+    for (int L = 0; L < NL; L++) all_fused &= glu_fused(hw.L[L].fg, hw.L[L].fu) || (glu_mix_on && glu_mix(hw.L[L].fg, hw.L[L].fu, 0));
+    const bool y1full = getenv("MK_PF_Y1") && atoi(getenv("MK_PF_Y1")) == 1;
+    const size_t c = cap;
+    return c * D * 4 * 2 + c * 4 + c * 2 * D * 2 + c * FF * 2 + c * (all_fused ? QG : FF) * 4 +
+           c * (ex && all_fused && !y1full ? VD : FF) * 4 + c * VD * 4 + c * QKV * 2 + c * 2 * NVH * 4 + (size_t) 8 * c * 2 * NVH * 4 +
+           (c + 1) * D * 4 + c * NH * HD * 2 + 3 * c * 4 + 16 * 16;
+}
+
+void MKEngine::Impl::pf_kernel_attrs() {
+    mmh_attr<pf::TQ4K, false>();
+    mmh_attr<pf::TQ5K, false>();
+    mmh_attr<pf::TQ6K, false>();
+    mmh_attr<pf::TQ80, false>();
+    mmh_attr<pf::TIQ4, false>();
+    mmh_attr<pf::TIQ4NL, false>();
+    mmh_attr<pf::TQ3K, false>();
+    mmh_attr<pf::TIQ3S, false>();
+    mmh_attr<pf::TQ4K, true>();
+    mmh_attr<pf::TQ5K, true>();
+    mmh_attr<pf::TIQ4, true>();
+    mmh_attr<pf::TQ4K, false, 1>();
+    mmh_attr<pf::TQ5K, false, 1>();
+    mmh_attr<pf::TQ80, false, 1>();
+    mmh_attr<pf::TIQ4, false, 1>();
+    mmh_attr<pf::TIQ4NL, false, 1>();
+    mmh_attr<pf::TQ4K, true, 1>();
+    mmh_attr<pf::TQ5K, true, 1>();
+    mmh_attr<pf::TIQ4, true, 1>();
+    mmh_attr<pf::TQ6K, false, 1>();
+    mmh_attr<pf::TQ3K, false, 1>();
+    mmh_attr<pf::TIQ3S, false, 1>();
+    glu_mix_attr();
+}
+
 void MKEngine::Impl::pf_init() {
     if (pf_ready) return;
-    // MK_PF_CAP: tokens per prefill chunk (multiple of 128); scratch ~0.25 MB per token (MK_EXACT, every gate / up fused)
-    int cap = 2048;
-    if (const char * e = getenv("MK_PF_CAP")) cap = std::max(128, std::min(2048, atoi(e) / 128 * 128));
+    int cap = pf_cap_req();
     // MK_EXACT checkpoints keep the window rings: ring_snap_rows runs after a whole chunk, which must not wrap a ring
     if (ring_bytes_ck > 0 && cap > hb.kvrc) {
         fprintf(stderr, "[mk] MK_PF_CAP %d -> %d: MK_EXACT checkpoints keep the KV window rings, %d rows (MK_KV_WIN=%d), and a "
@@ -71,29 +113,7 @@ void MKEngine::Impl::pf_init() {
     hp.wsrow = exact ? 1 : 0;
     mem_mark("prefill scratch");
     CK(mkl::set_cP(&hp, sizeof(PBufs)));
-    mmh_attr<pf::TQ4K, false>();
-    mmh_attr<pf::TQ5K, false>();
-    mmh_attr<pf::TQ6K, false>();
-    mmh_attr<pf::TQ80, false>();
-    mmh_attr<pf::TIQ4, false>();
-    mmh_attr<pf::TIQ4NL, false>();
-    mmh_attr<pf::TQ3K, false>();
-    mmh_attr<pf::TIQ3S, false>();
-    mmh_attr<pf::TQ4K, true>();
-    mmh_attr<pf::TQ5K, true>();
-    mmh_attr<pf::TIQ4, true>();
-    mmh_attr<pf::TQ4K, false, 1>();
-    mmh_attr<pf::TQ5K, false, 1>();
-    mmh_attr<pf::TQ80, false, 1>();
-    mmh_attr<pf::TIQ4, false, 1>();
-    mmh_attr<pf::TIQ4NL, false, 1>();
-    mmh_attr<pf::TQ4K, true, 1>();
-    mmh_attr<pf::TQ5K, true, 1>();
-    mmh_attr<pf::TIQ4, true, 1>();
-    mmh_attr<pf::TQ6K, false, 1>();
-    mmh_attr<pf::TQ3K, false, 1>();
-    mmh_attr<pf::TIQ3S, false, 1>();
-    glu_mix_attr();
+    pf_kernel_attrs();
     if (const char * e = getenv("MK_PF_BN")) { // force one GEMM token tile (tuning / tests); 0 = by prompt size
         pf_bn_force = atoi(e);
         if (pf_bn_force != 0 && pf_bn_force != 32 && pf_bn_force != 64 && pf_bn_force != 128)
@@ -130,7 +150,8 @@ void MKEngine::Impl::pf_init() {
     }
     // MK_PFX (bits; a set bit keeps the old path): 1 pf_fork off, 2 pk_dn_scan (no pk_dn_tri / pk_dn_scan4), 4 pk_ab
     // after the DN in-projection join (not before it), 8 attention k on pf_s2 and v on pf_s3 next to q (not k then q on
-    // stream 0, v on pf_s2), 16 pk_ab (not pk_ab2), 64 pk_attn8 (not pk_attn9)
+    // stream 0, v on pf_s2), 16 pk_ab (not pk_ab2), 64 pk_attn8 (not pk_attn9), 128 pk_conv_ring's float loop (not
+    // float4), 256 pk_attn2_comb with 12 rows per warp (not one)
     if (const char * e = getenv("MK_PFX")) pfx_bits = atoi(e);
     mkl::pk_attn_old = pfx_bits & 64 ? 1 : 0;
     pf_fork = !(pfx_bits & 1);
@@ -265,7 +286,7 @@ void MKEngine::Impl::attn(int T, int n, int slot, int r0) {
         if (attn_pv16) mkl::pk_attn2<false, true>(grid, T, n, slot, nfull, S, hp.y1, r0);
         else mkl::pk_attn2<false, false>(grid, T, n, slot, nfull, S, hp.y1, r0);
     }
-    if (N > nfull) mkl::pk_attn2_comb(N - nfull, T, nfull, S, hp.y1);
+    if (N > nfull) mkl::pk_attn2_comb(dim3(N - nfull, pfx_bits & 256 ? 1 : 6 * A2_Q / 8), T, nfull, S, hp.y1); // (a row per warp)
 }
 
 int MKEngine::Impl::pf_nb(int ntok, int nrt) const {
@@ -438,7 +459,8 @@ void MKEngine::Impl::pf_dn_prep(int T, int n, int dl, const LayerW & W) {
 void MKEngine::Impl::pf_report() {
     if (!pf_prof || pf_ev.empty()) return;
     CK(cudaDeviceSynchronize());
-    // per category: sum, and median-per-launch x launches (robust to time-slicing by other GPU users)
+    // per category: sum, and median-per-launch x launches (robust to time-slicing by other GPU users; it assumes one population
+    // of launches per label, so launches of different sizes get labels of their own). Rows by sum, its share last.
     std::vector<std::string> cats;
     std::vector<std::vector<float>> ts;
     for (auto & e : pf_ev) {
@@ -459,7 +481,7 @@ void MKEngine::Impl::pf_report() {
         for (float x : v) sum += x;
         std::sort(v.begin(), v.end());
         const double med = v[v.size() / 2] * v.size();
-        rows.emplace_back(med, sum, cats[i], v.size());
+        rows.emplace_back(sum, med, cats[i], v.size());
         all += sum;
         all_med += med;
     }
@@ -468,8 +490,8 @@ void MKEngine::Impl::pf_report() {
     std::sort(rows.rbegin(), rows.rend());
     fprintf(stderr, "[mk-prefill-profile] %.1f ms in kernels (median-based %.1f ms)\n", all, all_med);
     for (auto & r : rows)
-        fprintf(stderr, "  %-14s median-based %8.1f ms %5.1f%%   sum %8.1f ms   x%zu\n", std::get<2>(r).c_str(), std::get<0>(r),
-                100 * std::get<0>(r) / all_med, std::get<1>(r), std::get<3>(r));
+        fprintf(stderr, "  %-14s median-based %8.1f ms %5.1f%%   sum %8.1f ms   x%zu   %5.1f%% of the sum\n", std::get<2>(r).c_str(),
+                std::get<1>(r), 100 * std::get<1>(r) / all_med, std::get<0>(r), std::get<3>(r), 100 * std::get<0>(r) / all);
 }
 
 void MKEngine::Impl::pf_run(const std::vector<int> & toks, int n0, std::vector<int> * pred, const MKEngine::LogitSink * sink,
@@ -565,12 +587,12 @@ void MKEngine::Impl::pf_run(const std::vector<int> & toks, int n0, std::vector<i
                     if (!kq) CK(cudaEventRecord(pf_e2, pf_s3));
                 }
                 if (kq) gemm(W.k, T, hp.y1, 2 * KVD, pf::OUT_STORE);
-                pf_time("gemm_attn_qkv", [&] { gemm(W.q, T, hp.y0, QG, pf::OUT_STORE); });
+                pf_time("gemm_attn_q", [&] { gemm(W.q, T, hp.y0, QG, pf::OUT_STORE); });
                 if (fk) {
                     CK(cudaStreamWaitEvent(0, pf_e1, 0));
                     if (!kq) CK(cudaStreamWaitEvent(0, pf_e2, 0));
                 } else {
-                    pf_time("gemm_attn_qkv", [&] { gemm(W.k, T, hp.y1, 2 * KVD, pf::OUT_STORE); gemm(W.v, T, hp.y1 + KVD, 2 * KVD, pf::OUT_STORE); });
+                    pf_time("gemm_attn_kv", [&] { gemm(W.k, T, hp.y1, 2 * KVD, pf::OUT_STORE); gemm(W.v, T, hp.y1 + KVD, 2 * KVD, pf::OUT_STORE); });
                 }
                 const int sl = L / 4;
                 if (rsnap) CK(cudaStreamWaitEvent(0, rs_ev[sl], 0)); // (the rings' whole copies are done)
@@ -627,7 +649,7 @@ void MKEngine::Impl::pf_run(const std::vector<int> & toks, int n0, std::vector<i
                 pf_time("dn_prep", [&] {
                     pf_dn_prep(T, n, dl, W);
                     for (int j = 0; j < sn; j++) mkl::pk_ck_conv(n, sp[j], dl, stg_conv(sg[j]));
-                    mkl::pk_conv_ring(T, n, dl);
+                    mkl::pk_conv_ring(T, n, dl, pfx_bits & 128);
                 });
                 pf_time("dn_scan", [&] {
                     // The scan is split only at points of its 32-token grid, which changes no arithmetic: the state

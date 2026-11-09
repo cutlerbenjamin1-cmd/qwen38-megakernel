@@ -28,6 +28,7 @@ cudaError_t set_cView(const void * src, size_t count, size_t offset = 0);
 #if MK_L2_TUNE
 cudaError_t set_cL2(const void * src, size_t count, size_t offset = 0);
 #endif
+cudaError_t wv_deal_init(int nsm); // (MK_FFNA builds: the wv phase tops' per-block dealing table, checked; else nothing)
 cudaError_t set_cP(const void * src, size_t count, size_t offset = 0);
 cudaError_t set_g_iq3s_grid(const void * src, size_t count, size_t offset = 0);
 cudaError_t set_chk_layer_async(const void * src, size_t count, size_t offset, cudaMemcpyKind kind, cudaStream_t st);
@@ -54,7 +55,7 @@ void pk_ab(const float * Wab, const int8_t * abq, const __half * abd, const floa
 void pk_ab2(const float * Wab, const int8_t * abq, const __half * abd, const float * fn, int T, cudaStream_t st = 0);
 void pk_dn_prep(int T, int n0, int dl, const float * convw, const float * dt, const float * A);
 template <int NT> void pk_dn_prep_t(int T, int n0, int dl, const float * convw, const float * dt, const float * A);
-void pk_conv_ring(int T, int n0, int dl);
+void pk_conv_ring(int T, int n0, int dl, bool old = false);
 void pk_ck_conv(int n0, int P, int dl, float * dst);
 void pk_ck_hist(dim3 grid, int lo, int n0, int from_ring, float * dst);
 void pk_dn_scan(int T, int t0, const float * st_in, float * st_out);

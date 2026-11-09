@@ -177,6 +177,21 @@ void MKEngine::Impl::mem_mark(const char * tag) {
     mark_free = fr;
     mark_alloc = alloc_bytes;
 }
+
+// MK_RESERVE_EARLY: a full device (cudaMemGetInfo's free ~0) means the CUDA sysmem fallback (Windows, WSL2) may have put part of
+// this process's memory in system memory; a stack limit above the one reserved at load means a kernel's frame was reserved late
+void MKEngine::Impl::vram_check(const char * where) {
+    size_t fr = 0, tot = 0, stk = 0;
+    CK(cudaMemGetInfo(&fr, &tot));
+    CK(cudaDeviceGetLimit(&stk, cudaLimitStackSize));
+    if (stk > stack_res)
+        fprintf(stderr, "[mk] warning: %s: the stack limit grew to %zu B per thread (%zu reserved at load): a kernel's local memory was "
+                        "reserved late\n", where, stk, stack_res);
+    if (fr < ((size_t) 1 << 20))
+        fprintf(stderr, "[mk] warning: %s: the device memory is full (%.2f MiB free): with the CUDA sysmem fallback (Windows, WSL2) part of "
+                        "this process's memory may now sit in system memory (slower decode, varying per process); a smaller context "
+                        "(-c) or a larger MK_VRAM_MARGIN avoids it\n", where, fr / 1048576.0);
+}
 #if MK_SPEC_LOG
 void MKEngine::Impl::slog_cycle(int n0, int T, const int * drafts, const Ctl & c) {
     if (!slog) return;
@@ -354,6 +369,7 @@ void MKEngine::Impl::launch(int mode, int T, int last, int score) {
     if (err_host[0] | err_host[1]) launch_failed();
     launches_seen++;
     if (memlog && launches_seen == 1) mem_mark("first mk_cycle launch");
+    if (reserve_early && launches_seen == 1) vram_check("first mk_cycle launch");
     if (profiling && mode == MODE_DECODE) prof_collect(T);
 
 }
@@ -398,11 +414,29 @@ static void prof_dump(const std::vector<unsigned long long> & pr, long n, int T,
             else fputs(" -1", f);
         }
         fputc('\n', f);
+#if MK_PROFILE
+        if (k < 1024 && nsm <= 120 && pr[4096 + k * 128 + 120]) { // the last block's sub-stamps 0..3 (sub_stamp), after the phase start
+            fprintf(f, "# sub %d", k);
+            for (int i = 0; i < 4; i++) {
+                const unsigned long long a = pr[4096 + k * 128 + 120 + i] & M;
+                if (a) fprintf(f, " %llu", (a - prev) & M);
+                else fputs(" -1", f);
+            }
+            fputc('\n', f);
+        }
+#endif
         prev = t;
     }
     if (path) fclose(f);
     fprintf(stderr, "[mk] MK_PROF_DUMP: launch %ld (T=%d, %d barriers) -> %s\n", n, T, K - 1, path ? path : "stderr");
 }
+
+#if MK_PROFILE
+// -DMK_PROFILE=1: the last block's serial section per (T, phase) from its sub-stamps (sub_stamp): sums of ticket -> merged,
+// -> sampled, -> control done, -> the barrier's end (ns) and their count
+static double g_sub[MAXD + 1][PH_COUNT][4];
+static long g_sub_n[MAXD + 1][PH_COUNT];
+#endif
 
 void MKEngine::Impl::prof_collect(int T) {
     std::vector<unsigned long long> pr(4096 + 1024 * 128);
@@ -441,6 +475,18 @@ void MKEngine::Impl::prof_collect(int T) {
                 arr_n[tag]++;
             }
         }
+#if MK_PROFILE
+        if (k < 1024 && nsm <= 120 && T >= 0 && T <= MAXD) {
+            const unsigned long long M = (1ull << 56) - 1, * sb = &pr[4096 + k * 128 + 120];
+            if (sb[0] && sb[1] && sb[2] && sb[3]) {
+                g_sub[T][tag][0] += (double) (((sb[1] & M) - (sb[0] & M)) & M);
+                g_sub[T][tag][1] += (double) (((sb[2] & M) - (sb[1] & M)) & M);
+                g_sub[T][tag][2] += (double) (((sb[3] & M) - (sb[2] & M)) & M);
+                g_sub[T][tag][3] += (double) ((t - (sb[3] & M)) & M);
+                g_sub_n[T][tag]++;
+            }
+        }
+#endif
         if (bt[k - 1] != tag) { bt[k - 1] = tag; bn[k - 1] = dt; bf[k - 1] = fill; } // sequence changed
         else if (dt < bn[k - 1]) { bn[k - 1] = dt; bf[k - 1] = fill; }
     }
@@ -457,6 +503,14 @@ void MKEngine::Impl::print_profile() {
         fprintf(stderr, "  %-16s total/launch %8.3f ms   per call %8.2f us   calls/launch %6.1f\n", names[i],
                 ph_ns[i] / launches / 1e6, ph_ns[i] / ph_n[i] / 1e3, (double) ph_n[i] / launches);
     }
+#if MK_PROFILE
+    fprintf(stderr, "[mk-profile] last block's serial section (us, mean): ticket -> merged | -> sampled | -> control done | -> barrier end\n");
+    for (int T = 0; T <= MAXD; T++)
+        for (int i = 0; i < PH_COUNT; i++)
+            if (const long n = g_sub_n[T][i])
+                fprintf(stderr, "  T=%d %-16s %7.2f %7.2f %7.2f %7.2f  (x%ld)\n", T, names[i], g_sub[T][i][0] / n / 1e3,
+                        g_sub[T][i][1] / n / 1e3, g_sub[T][i][2] / n / 1e3, g_sub[T][i][3] / n / 1e3, n);
+#endif
     fprintf(stderr, "[mk-profile] block arrival at barrier (us after phase start; mean over launches): first / median / last\n");
     for (int i = 0; i < PH_COUNT; i++)
         if (arr_n[i])

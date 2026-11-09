@@ -256,6 +256,7 @@ ids or the accuracy report.
 | local memory and spills, frame 816 -> 752 bytes (6f3b257) | ms per cycle -1.55% at 0 drafts, -0.91% at 38k, -1.19% at 101.6k; 4 slots +7.4% tok/s | 2026-10-30 |
 | decode and prefill speedups from Nsight runs, frame 752 -> 704 bytes (03daaa9) | against v2026.11.01: +5.5% tok/s on short prompts, +5.7% at 40.5k, the same tokens | 2026-11-03 |
 | attention kernels for prefill (`pk_attn9`) and for decode on low-bit K / V (3ed5ce5) | sustained, against fbb8efb: preset F's ms per cycle -11.2% at 258k with the default draft gates, -7.5% at 258k with 7 drafts, -4.1% at 101k; prefill against `MK_PFX=64`: F -2.3 / -6.5 / -9.9% and D -2.8 / -6.5 / -10.3% at 40k / 101k / 258k, q8_0 -2.4 / -5.0% at 40k / 101k; the same tokens and saved states | 2026-11-05 |
+| resid's K2 combine interleaved, the wv phase tops' dealing table, the projection wrappers' loop state rebuilt after each tile call, the D / F T = 8 attention schedule, lm_head<8>'s staged drafts, prefill attention (row sums, copies, exponentials) and two small prefill kernels, PTX-model fences (exp-w6, 6f6a3de) | against 1ecb507, interleaved per-barrier minima: ms per cycle -1.43% at 7 drafts on short prompts, -1.14% at 101k (q8_0), -1.95% at 101k (D), -2.19% at 258k (F); sustained at 101k +1.0% tok/s; prefill attention -4.4%, 101k prompt time -1.2%; the same tokens, KL report and saved states | 2026-11-09 |
 
 ### At a 250 W limit
 

@@ -10,7 +10,10 @@
 // fmt: q8 (all q8, no ring), Vl (K q8, V q5 at run time), D (K q6, V q5, 2048-position q8 ring), F (K q5, V q5, ring),
 // any<k><v> (run-time KB / VB, ring), e.g. any45. Per config: ms per launch (min, median of reps, the variants alternating), and the number
 // of output floats that differ from the reference.
-// env: AB_VARS (substring of "01": 0 pk_attn8, 1 pk_attn9; default both), EXA=1 (MK_EXACT form, unsplit), EXA=2 (split, + pk_attn8_combx),
+// env: AB_VARS (digits, the first is the reference for the output comparison and the timing: 0 pk_attn8, 1 pk_attn9 as built
+// (-D A9_* = the engine's), 2, 3, .. pk_attn9 with A9F = -DA9_TV0=.., -DA9_TV1=.., .. (A9_TV0 default 0: the committed kernel; plain
+// F / D / q8 only), e.g. AB_VARS=21 times the build's variant against the committed one; default "01"), COMB_Y (pk_attn2_comb's grid rows
+// for the variants other than 0: default 12, a row per warp; 1: 12 rows per warp, as v0), EXA=1 (MK_EXACT form, unsplit), EXA=2 (split, + pk_attn8_combx),
 // QROW=1 (QROW form, q8 / low-bit generic), QSCALE (Q multiplier, default 1), SPECIAL=1 (Inf / NaN / zero rows in Q and the
 // K scales), SEED, WARM_MS (default 4000: clocks), NCU_N=<launches> (the first variant of AB_VARS only, for ncu), OUT_REPS (repeat the
 // new kernels' output comparison), DIFF_HIST=1 (where outputs differ: per head, row of a query tile, dim / 8), BETWEEN=<n> (n launches of pk_attn8 before each
@@ -268,6 +271,64 @@ template <> void launch1<1>(Form f, bool klow, bool qrow, bool exa, const Plan &
     ATTR1(K, false, true, false, 5, 5); \
     ATTR1(K, false, true);             \
     ATTR1(K, false, false)
+// variants 2, 3, .., 9: pk_attn9 with A9F = A9_TV0, A9_TV1, .., A9_TV7 (-DA9_TV<k>=<A9F>: nvcc splits a -D value at commas), in
+// the plain F, D and q8 forms; A9_TV0 is 0 (the committed kernel) unless given, the list ends at the first one not given
+#ifndef A9_TV0
+#define A9_TV0 0
+#endif
+#ifndef A9_TV1
+#define A9_TV1 -1
+#endif
+#ifndef A9_TV2
+#define A9_TV2 -1
+#endif
+#ifndef A9_TV3
+#define A9_TV3 -1
+#endif
+#ifndef A9_TV4
+#define A9_TV4 -1
+#endif
+#ifndef A9_TV5
+#define A9_TV5 -1
+#endif
+#ifndef A9_TV6
+#define A9_TV6 -1
+#endif
+#ifndef A9_TV7
+#define A9_TV7 -1
+#endif
+constexpr int a9_tv[] = {A9_TV0, A9_TV1, A9_TV2, A9_TV3, A9_TV4, A9_TV5, A9_TV6, A9_TV7};
+constexpr int a9_ntv() {
+    int n = 0;
+    while (n < 8 && a9_tv[n] >= 0) n++;
+    return n;
+}
+constexpr int A9_NTV = a9_ntv();
+template <int I = 0> void launch_tv(int i, Form f, bool qrow, bool exa, const Plan & p) {
+    if constexpr (I < A9_NTV) {
+        if (i > I) return launch_tv<I + 1>(i, f, qrow, exa, p);
+        if (qrow || exa || f == F_ANY) {
+            fprintf(stderr, "variant v%d: plain F, D and q8 only\n", i + 2);
+            exit(1);
+        }
+        constexpr int A = a9_tv[I];
+        if (f == F_D) L_(pk_attn9, false, true, false, 6, 5, A);
+        else if (f == F_F) L_(pk_attn9, false, true, false, 5, 5, A);
+        else L_(pk_attn9, false, false, false, 0, 8, A);
+    } else {
+        fprintf(stderr, "variant v%d: A9_TV has %d values\n", i + 2, A9_NTV);
+        exit(1);
+    }
+}
+template <int I = 0> void attr_tv() {
+    if constexpr (I < A9_NTV) {
+        constexpr int A = a9_tv[I];
+        ATTR1(pk_attn9, false, true, false, 6, 5, A);
+        ATTR1(pk_attn9, false, true, false, 5, 5, A);
+        ATTR1(pk_attn9, false, false, false, 0, 8, A);
+        attr_tv<I + 1>();
+    }
+}
 
 constexpr int NROWS_RAND = 8192;
 // one value row -> the engine's storage: bits 8: int8 (HD bytes), else kv_store_qn's layout (HD * bits / 8 bytes); fp16 scale per 32 values
@@ -432,6 +493,8 @@ int main(int argc, char ** argv) {
     ATTR_ALL(pk_attn9);
     ATTR1(pk_attn9, false, false, false, 0, 8);
     ATTR1(pk_attn9, false, false, true, 0, 8);
+    attr_tv();
+    const int comb_y = getenv("COMB_Y") ? std::max(1, atoi(getenv("COMB_Y"))) : 6 * A2_Q / 8;
     int nsm = 0, occ = 0;
     CK(cudaDeviceGetAttribute(&nsm, cudaDevAttrMultiProcessorCount, 0));
     CK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&occ, pk_attn8<false, false>, A2_NT, A8_SMEM));
@@ -497,11 +560,12 @@ int main(int argc, char ** argv) {
     CK(cudaEventCreate(&e1));
     auto run = [&](int v, const Plan & pl, int T, int n0) {
         if (v == 0) launch1<0>(f, klow, qrow, exa, pl);
-        else launch1<1>(f, klow, qrow, exa, pl);
+        else if (v == 1) launch1<1>(f, klow, qrow, exa, pl);
+        else launch_tv(v - 2, f, qrow, exa, pl);
         const int N = (T + A2_Q - 1) / A2_Q * NKV;
         if (N > pl.nfull) {
             if (exa) pk_attn8_combx<<<N - pl.nfull, 256>>>(T, n0, pl.nfull, pl.S, pl.segt, pl.exh, 0, pl.part, pl.part2, pl.exa);
-            else pk_attn2_comb<<<N - pl.nfull, 256>>>(T, pl.nfull, pl.S, pl.part);
+            else pk_attn2_comb<<<dim3(N - pl.nfull, v ? comb_y : 1), 256>>>(T, pl.nfull, pl.S, pl.part);
         }
     };
     for (auto [T, n0] : cfg) {
