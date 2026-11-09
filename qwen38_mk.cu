@@ -4646,6 +4646,16 @@ __device__ __forceinline__ bool topk_insert(float & tv, int & ti, float v, int i
 // takes -inf or NaN); they are interchangeable, so their keys do not matter.
 __device__ __forceinline__ bool tk_before(float av, int as, float bv, int bs) { return av > bv || (av == bv && as < bs); }
 
+#if MK_PROFILE
+// -DMK_PROFILE=1 builds (with env MK_PROFILE): sub-stamps i = 0..3 of the last block's serial section before barrier
+// s_bar_k + 1 (lm_head / mtp_lm_head: 0 ticket passed, 1 merge done, 2 sampling done, 3 control done), kept in the barrier's
+// arrival slots 120 + i (unused: blocks < 120); MK_PROF_DUMP prints them as "# sub" lines, the profile their means
+__device__ __forceinline__ void sub_stamp(int i) {
+    const unsigned k = s_bar_k + 1;
+    if (cB.prof && threadIdx.x == 0 && k < 1024 && gridDim.x <= 120) cB.prof[4096 + k * 128 + 120 + i] = gtimer();
+}
+#endif
+
 // (v, id, s): this warp's sorted list (lane = rank); merged with the sorted list (bv, bid, bs) into the best 32 of
 // both, sorted: reversing b and keeping the better of each pair gives a bitonic sequence holding the best 32, which
 // a 5-step bitonic merge sorts.
@@ -4714,6 +4724,47 @@ __device__ __noinline__ void tk_grid_chain(int t, int slot, float * tv, int * ti
     ti[a] = id;
     ts[a] = s;
 }
+#ifndef MK_SMP_PAR
+#define MK_SMP_PAR 0
+#endif
+#if MK_SMP_PAR & 2
+// tk_grid_chain over rows r0 .. r0 + NR - 1 (slots 0 .. NR - 1, one batch per row: gridDim.x <= 6 NW) with the next row's
+// loads issued before this row's merges: the same merges in the same order per row (MK_SMP_PAR bit 2)
+template <int BS, int NR>
+__device__ __noinline__ void tk_grid_rows(int r0, float * tv, int * ti, int * ts) {
+    const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5, G = gridDim.x;
+    float2 c[6], f[6];
+#pragma unroll
+    for (int i = 0; i < 6; i++) {
+        const int k = warp + i * NW;
+        c[i] = k < G ? __ldcg(&cB.blk_best[((size_t) k * BS + r0) * TOPK_MAX + lane]) : make_float2(-INFINITY, __int_as_float(-1));
+    }
+#pragma unroll 1
+    for (int t = 0; t < NR; t++) {
+        if (t + 1 < NR) {
+#pragma unroll
+            for (int i = 0; i < 6; i++) {
+                const int k = warp + i * NW;
+                f[i] = k < G ? __ldcg(&cB.blk_best[((size_t) k * BS + r0 + t + 1) * TOPK_MAX + lane])
+                             : make_float2(-INFINITY, __int_as_float(-1));
+            }
+        }
+        float v = -INFINITY;
+        int id = -1, s = 0;
+#pragma unroll
+        for (int i = 0; i < 6; i++) {
+            const int k = warp + i * NW;
+            if (k < G) tk_merge(v, id, s, c[i].x, __float_as_int(c[i].y), k * 32 + lane);
+        }
+        const int a = (t * 16 + warp) * 32 + lane;
+        tv[a] = v;
+        ti[a] = id;
+        ts[a] = s;
+#pragma unroll
+        for (int i = 0; i < 6; i++) c[i] = f[i];
+    }
+}
+#endif
 // sampled lm_head: the final candidate rows [MAXT][32] (value, id) in shared memory, above the top-k merge lists,
 constexpr int SM_CAND = MAXT * 16 * 32 * 12 > 32768 ? MAXT * 16 * 32 * 12 : 32768;
 constexpr int SM_DQ = SM_CAND + MAXT * 32 * 8; // and the drafts' proposals q' staged for sample_targets
@@ -5060,6 +5111,9 @@ __device__ __noinline__ bool lm_head(int t0, bool draft, uint8_t * /*sm*/, int *
     if (!s_last[0]) return false;
     __threadfence();
 #endif
+#if MK_PROFILE
+    sub_stamp(0);
+#endif
     if constexpr (LSE) { // the blocks' (max, sum of exp) -> shared memory in one parallel load; the sum stays in block order
         // On the last warp alone (warp syncs only): warp 0's argmax below runs alongside. The max and the sum stay chains in
         // block order (every lane chains the max, its loads batched ahead; lane l takes the exps of blocks l, l + 32, ..:
@@ -5094,8 +5148,21 @@ __device__ __noinline__ bool lm_head(int t0, bool draft, uint8_t * /*sm*/, int *
         // w, w + 16, ... of each row, then a tree over the 16 warps' lists (H16: per half)
 #pragma unroll 1
         for (int h = 0; h < TL / TLL; h++) {
+#if MK_SMP_PAR & 2
+            if constexpr (TLL > 1) {
+                if ((int) gridDim.x <= 6 * NW) {
+                    tk_grid_rows<BS, TLL>(TLL * h, tkv, tki, tks);
+                } else {
+#pragma unroll 1
+                    for (int t = 0; t < TLL; t++) tk_grid_chain<BS>(TLL * h + t, t, tkv, tki, tks);
+                }
+            } else {
+                tk_grid_chain<BS>(TLL * h, 0, tkv, tki, tks);
+            }
+#else
 #pragma unroll 1
             for (int t = 0; t < TLL; t++) tk_grid_chain<BS>(TLL * h + t, t, tkv, tki, tks);
+#endif
             // main head: the drafts' q' (previous launch) for sample_targets, staged while the merge runs
             if (!H16 && !draft)
                 for (int q = tid; q < (TL - 1) * TOPK_MAX; q += NT) reinterpret_cast<float2 *>(sm + SM_DQ)[q] = __ldcg(cB.dq + q);
@@ -5141,6 +5208,9 @@ __device__ __noinline__ bool lm_head(int t0, bool draft, uint8_t * /*sm*/, int *
     }
     if (tid == 0) *cB.cnt = 0;
     __syncthreads();
+#if MK_PROFILE
+    sub_stamp(1);
+#endif
     return true;
 }
 
@@ -5322,6 +5392,200 @@ __device__ __noinline__ void sample_targets_ol(int mode, int top_k, float temp, 
     S.seed = seed;
     sample_targets(S, T, tl, tg, cand, dq);
 }
+
+#if MK_SMP_PAR & 1
+// ---- sampling on one warp (MK_SMP_PAR bit 1): lane j holds candidate j. Each candidate's operations are the single-thread
+// code's expressions on its lane; every sum and every draw's running x stays a chain in candidate order, which each lane
+// runs over the shuffled values (the same adds in the same order: the same bits, on every lane, so the control flow is
+// warp-uniform); products as __fmul_rn, the FMUL the single-thread code compiles to (no contraction into the next add).
+static_assert(TOPK_MAX == 32, "MK_SMP_PAR: one candidate per lane");
+// the sum, in lane order, of v over the lanes j < n with bit j of m set
+__device__ __forceinline__ float wchain(float v, int n, unsigned m = 0xffffffffu) {
+    float s = 0.f;
+#pragma unroll
+    for (int j = 0; j < 32; j++) {
+        const float x = __shfl_sync(0xffffffffu, v, j);
+        if (j < n && (m >> j & 1u)) s += x;
+    }
+    return s;
+}
+
+// cand_probs: e = the lane's candidate c[lane]; returns K, p = the lane's p[lane] (lanes < K)
+__device__ __forceinline__ int cand_probs_w(const float2 e, const Launch & P, float & p) {
+    const int lane = threadIdx.x & 31;
+    int K = P.top_k > 0 ? min(P.top_k, TOPK_MAX) : TOPK_MAX;
+    { // (while (K > 1 && !(c[K - 1].x > -INFINITY)) K--;)
+        const unsigned fin = __ballot_sync(0xffffffffu, lane < K && e.x > -INFINITY);
+        K = fin ? 32 - __clz(fin) : 1;
+    }
+    const float mx = __shfl_sync(0xffffffffu, e.x, 0);
+    const float e1 = expf(e.x - mx);
+    const float s = wchain(e1, K);
+    if (P.top_p < 1.0f) {
+        const float q = e1 / s;
+        float cum = 0.f;
+        int k2 = K;
+        bool done = false;
+#pragma unroll
+        for (int j = 0; j < 32; j++) {
+            const float x = __shfl_sync(0xffffffffu, q, j);
+            if (!done && j < K) {
+                cum += x;
+                if (cum >= P.top_p) {
+                    k2 = j + 1;
+                    done = true;
+                }
+            }
+        }
+        K = k2;
+    }
+    if (P.min_p > 0.0f) { // (the first k >= 1 with !(p[k] >= min_p p[0]))
+        const float thr = __fmul_rn(P.min_p, __shfl_sync(0xffffffffu, e1, 0));
+        const unsigned bad = __ballot_sync(0xffffffffu, lane >= 1 && lane < K && !(e1 >= thr));
+        if (bad) K = __ffs(bad) - 1;
+    }
+    const float e2 = expf((e.x - mx) / P.temp);
+    p = e2 / wchain(e2, K);
+    return K;
+}
+
+// dq_prob for the lane's own token id: q' entry m on lane m (qe), nq = the list's length (its first id < 0, or 32)
+__device__ __forceinline__ float dq_prob_w(const float2 qe, int nq, int id) {
+    float s = 0.f;
+#pragma unroll
+    for (int m = 0; m < 32; m++) {
+        const float x = __shfl_sync(0xffffffffu, qe.x, m);
+        const int qi = __shfl_sync(0xffffffffu, __float_as_int(qe.y), m);
+        if (m < nq && qi == id) s += x;
+    }
+    return s;
+}
+__device__ __forceinline__ int dq_len_w(const float2 qe) {
+    const unsigned t = __ballot_sync(0xffffffffu, __float_as_int(qe.y) < 0);
+    return t ? __ffs(t) - 1 : 32;
+}
+
+// cand_draw: (id, p) = the lane's candidate
+__device__ __forceinline__ int cand_draw_w(int id, float p, int K, int excl, float u) {
+    float x = __fmul_rn(u, wchain(p, K, __ballot_sync(0xffffffffu, id != excl)));
+    int last = __shfl_sync(0xffffffffu, id, 0), got = 0;
+    bool done = false;
+#pragma unroll
+    for (int j = 0; j < 32; j++) {
+        const float pj = __shfl_sync(0xffffffffu, p, j);
+        const int ij = __shfl_sync(0xffffffffu, id, j);
+        if (!done && j < K && ij != excl) {
+            last = ij;
+            x -= pj;
+            if (x < 0.f) {
+                got = ij;
+                done = true;
+            }
+        }
+    }
+    return done ? got : last;
+}
+
+// sample_targets_ol on one warp (every lane: the same tg)
+__device__ __noinline__ void sample_targets_w(int mode, int top_k, float temp, float top_p, float min_p, unsigned long long seed,
+                                              int T, int tl, int * tg, const float2 * cand, const float2 * dq) {
+    Launch P{};
+    P.mode = mode;
+    P.top_k = top_k;
+    P.temp = temp;
+    P.top_p = top_p;
+    P.min_p = min_p;
+    P.seed = seed;
+    const Ctl * c = cB.ctl;
+    const unsigned long long n = (unsigned long long) c->n;
+    const int lane = threadIdx.x & 31;
+    for (int i = 0; i < tl; i++) {
+        const float2 e = cand[i * TOPK_MAX + lane];
+        const int id = __float_as_int(e.y);
+        float p;
+        const int K = cand_probs_w(e, P, p);
+        if (P.mode == MODE_DECODE && i < T - 1 && c->dsmp) {
+            const int d = c->tok[i + 1];
+            const float2 qe = dq[i * TOPK_MAX + lane];
+            const int nq = dq_len_w(qe);
+            const float pd = wchain(p, K, __ballot_sync(0xffffffffu, id == d));
+            if (__fmul_rn(urand(P.seed, 2 * (n + i)), dq_prob_w(qe, nq, d)) < pd) {
+                tg[i] = d;
+                continue;
+            }
+            const float r = fmaxf(0.f, p - dq_prob_w(qe, nq, id));
+            const float rs = wchain(r, K);
+            const float u = urand(P.seed, 2 * (n + i) + 1);
+            if (!(rs > 0.f)) { // rounding only; the row must not return the rejected d
+                tg[i] = cand_draw_w(id, p, K, d, u);
+                return;
+            }
+            float x = __fmul_rn(u, rs);
+            int pick = -1;
+            bool done = false;
+#pragma unroll
+            for (int j = 0; j < 32; j++) {
+                const float rj = __shfl_sync(0xffffffffu, r, j);
+                const int ij = __shfl_sync(0xffffffffu, id, j);
+                if (!done && j < K && !(rj <= 0.f)) {
+                    pick = ij;
+                    x -= rj;
+                    if (x < 0.f) done = true;
+                }
+            }
+            tg[i] = pick;
+            return;
+        }
+        if (P.mode == MODE_DECODE && i < T - 1) {
+            const int d = c->tok[i + 1];
+            const float pd = wchain(p, K, __ballot_sync(0xffffffffu, id == d));
+            if (urand(P.seed, 2 * (n + i)) < pd) {
+                tg[i] = d;
+                continue;
+            }
+            tg[i] = cand_draw_w(id, p, K, d, urand(P.seed, 2 * (n + i) + 1));
+            return;
+        }
+        tg[i] = cand_draw_w(id, p, K, -1, urand(P.seed, 2 * (n + i) + 1));
+        return;
+    }
+}
+
+// draft_sample_ol on one warp: src entry j on lane j; q' to dst (lanes < K, the terminator at K); returns the draft (every
+// lane) and in qd dq_prob(dst, draft), computed from the registers holding that list
+__device__ __noinline__ int draft_sample_w(int top_k, float temp, float top_p, float min_p, unsigned long long seed,
+                                           const float2 * src, float2 * dst, unsigned long long pos, float & qd) {
+    Launch P{};
+    P.top_k = top_k;
+    P.temp = temp;
+    P.top_p = top_p;
+    P.min_p = min_p;
+    P.seed = seed;
+    const int lane = threadIdx.x & 31;
+    const float2 e = src[lane];
+    const int id = __float_as_int(e.y);
+    float p;
+    const int K = cand_probs_w(e, P, p);
+    __syncwarp(); // (dst may alias src)
+    if (lane < K) dst[lane] = make_float2(p, e.y);
+    else if (lane == K) dst[lane] = make_float2(0.f, __int_as_float(-1));
+    float x = urand(P.seed ^ 0xD1B54A32D192ED03ull, pos);
+    int pick = -1;
+#pragma unroll
+    for (int j = 0; j < 32; j++) {
+        const float pj = __shfl_sync(0xffffffffu, p, j);
+        const int ij = __shfl_sync(0xffffffffu, id, j);
+        if (j < K && pick < 0) {
+            x -= pj;
+            if (x < 0.f) pick = ij;
+        }
+    }
+    const int dt = pick >= 0 ? pick : __shfl_sync(0xffffffffu, id, K - 1);
+    const unsigned t = __ballot_sync(0xffffffffu, lane < K ? id < 0 : lane == K);
+    qd = wchain(p, t ? __ffs(t) - 1 : 32, __ballot_sync(0xffffffffu, id == dt));
+    return dt;
+}
+#endif
 
 // ---- main-model control (single thread) ----
 #include "wv.cuh"
@@ -5543,16 +5807,43 @@ __device__ void main_forward(const Launch & P, uint8_t * /*sm*/, unsigned & epoc
     } else {
         am_last = blockIdx.x == 0;
     }
+#if MK_SMP_PAR & 1
+    if (am_last && threadIdx.x < 32) { // (warp 0 samples, thread 0 runs the control)
+        int tg[MAXT];
+        for (int i = 0; i < tl; i++) tg[i] = s_tok[i];
+        if (sampling) // lm_head left the candidates at SM_CAND and the drafts' q' at SM_DQ
+            sample_targets_w(P.mode, P.top_k, P.temp, P.top_p, P.min_p, P.seed, Tr, tl, tg,
+                             reinterpret_cast<const float2 *>(sm + SM_CAND), reinterpret_cast<const float2 *>(sm + SM_DQ));
+#if MK_PROFILE
+        sub_stamp(2);
+#endif
+        if (threadIdx.x == 0) {
+            for (int i = 0; i < tl; i++) cB.ctl->tgt[i] = tg[i];
+            main_control(P.mode, P.last, Tr, P.score ? s_tok + T - 1 : tg, pen, !P.score);
+            __threadfence();
+#if MK_PROFILE
+            sub_stamp(3);
+#endif
+        }
+    }
+#else
     if (am_last && threadIdx.x == 0) {
         int tg[MAXT];
         for (int i = 0; i < tl; i++) tg[i] = s_tok[i];
         if (sampling) // lm_head left the candidates at SM_CAND and the drafts' q' at SM_DQ
             sample_targets_ol(P.mode, P.top_k, P.temp, P.top_p, P.min_p, P.seed, Tr, tl, tg,
                               reinterpret_cast<const float2 *>(sm + SM_CAND), reinterpret_cast<const float2 *>(sm + SM_DQ));
+#if MK_PROFILE
+        sub_stamp(2);
+#endif
         for (int i = 0; i < tl; i++) cB.ctl->tgt[i] = tg[i];
         main_control(P.mode, P.last, Tr, P.score ? s_tok + T - 1 : tg, pen, !P.score);
         __threadfence();
+#if MK_PROFILE
+        sub_stamp(3);
+#endif
     }
+#endif
     gsync(epoch, PH_LMHEAD);
 }
 
@@ -5842,6 +6133,25 @@ __device__ __noinline__ void mtp_pass(int row0, int dtok, bool draft_row, int dr
             const int k = s_mtp[MS_K];
             int dt = 0, prod = 0, stop = 0, smp = 0;
             float conf = 0.f, chain = 0.f;
+#if MK_SMP_PAR & 1
+            if (threadIdx.x < 32) { // (warp 0 draws a sampled draft, thread 0 sets the gates)
+                const Launch & PL = *s_mtp_pl;
+                const int li = s_mtp[MS_LI];
+                const Launch P = li < 0 ? PL : lane_launch(PL, li);
+                float qd = 0.f;
+                if (P.spec_smp)
+                    dt = draft_sample_w(P.top_k, P.temp, P.top_p, P.min_p, P.seed, reinterpret_cast<const float2 *>(sm + SM_CAND),
+                                        cB.dq + k * TOPK_MAX, (unsigned long long) cB.ctl->mtp_P + 1 + k, qd);
+#if MK_PROFILE
+                sub_stamp(2);
+#endif
+                if (threadIdx.x == 0) {
+                Ctl * c = cB.ctl;
+                const float * mm = misc(sm);
+                conf = __expf(mm[LM_BEST] - mm[LM_LSE]);
+                if (!P.spec_smp) dt = s_tok[0];
+                chain = (k == 0 ? 1.f : c->dchain) * (P.gate_chain == 2 && P.spec_smp ? qd : conf);
+#else
             if (threadIdx.x == 0) {
                 // the launch the drafts are for (a lane's: lane_launch; fixed fields only, so the copy lives in registers)
                 const Launch & PL = *s_mtp_pl;
@@ -5855,9 +6165,13 @@ __device__ __noinline__ void mtp_pass(int row0, int dtok, bool draft_row, int dr
                                                   reinterpret_cast<const float2 *>(sm + SM_CAND),
                                                   cB.dq + k * TOPK_MAX, (unsigned long long) c->mtp_P + 1 + k)
                                 : s_tok[0];
+#if MK_PROFILE
+                sub_stamp(2);
+#endif
                 // gate_chain 2 (policy chain=2) with sampled drafts: the chain runs over the drafted token's own probability
                 // under q' (the distribution it was drawn from) instead of the draft head's top-1 probability
                 chain = (k == 0 ? 1.f : c->dchain) * (P.gate_chain == 2 && P.spec_smp ? dq_prob(cB.dq + k * TOPK_MAX, dt) : conf);
+#endif
                 const float f = P.gate_chain ? chain : conf;
                 smp = P.spec_smp;
                 // (the gates are the launch's, lane_launch keeps them: read from PL, as a dynamic index into P would keep
@@ -5866,6 +6180,9 @@ __device__ __noinline__ void mtp_pass(int row0, int dtok, bool draft_row, int dr
                 stop = f < PL.gate_stop[k] || f < PL.gate_drop[k];
                 s_tok[1] = dt;
             }
+#if MK_SMP_PAR & 1
+            }
+#endif
             __syncthreads();
             if (threadIdx.x == 0) {
                 Ctl * c = cB.ctl;
@@ -5880,6 +6197,9 @@ __device__ __noinline__ void mtp_pass(int row0, int dtok, bool draft_row, int dr
                 c->nd_prod = prod;
                 c->nd_stop = stop;
                 __threadfence();
+#if MK_PROFILE
+                sub_stamp(3);
+#endif
             }
             if (threadIdx.x >> 5 == 1) mtp_pf_embd(s_tok[1]); // (the next draft's token_embd row to L2)
         }

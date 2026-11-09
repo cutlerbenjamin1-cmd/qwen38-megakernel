@@ -414,11 +414,29 @@ static void prof_dump(const std::vector<unsigned long long> & pr, long n, int T,
             else fputs(" -1", f);
         }
         fputc('\n', f);
+#if MK_PROFILE
+        if (k < 1024 && nsm <= 120 && pr[4096 + k * 128 + 120]) { // the last block's sub-stamps 0..3 (sub_stamp), after the phase start
+            fprintf(f, "# sub %d", k);
+            for (int i = 0; i < 4; i++) {
+                const unsigned long long a = pr[4096 + k * 128 + 120 + i] & M;
+                if (a) fprintf(f, " %llu", (a - prev) & M);
+                else fputs(" -1", f);
+            }
+            fputc('\n', f);
+        }
+#endif
         prev = t;
     }
     if (path) fclose(f);
     fprintf(stderr, "[mk] MK_PROF_DUMP: launch %ld (T=%d, %d barriers) -> %s\n", n, T, K - 1, path ? path : "stderr");
 }
+
+#if MK_PROFILE
+// -DMK_PROFILE=1: the last block's serial section per (T, phase) from its sub-stamps (sub_stamp): sums of ticket -> merged,
+// -> sampled, -> control done, -> the barrier's end (ns) and their count
+static double g_sub[MAXD + 1][PH_COUNT][4];
+static long g_sub_n[MAXD + 1][PH_COUNT];
+#endif
 
 void MKEngine::Impl::prof_collect(int T) {
     std::vector<unsigned long long> pr(4096 + 1024 * 128);
@@ -457,6 +475,18 @@ void MKEngine::Impl::prof_collect(int T) {
                 arr_n[tag]++;
             }
         }
+#if MK_PROFILE
+        if (k < 1024 && nsm <= 120 && T >= 0 && T <= MAXD) {
+            const unsigned long long M = (1ull << 56) - 1, * sb = &pr[4096 + k * 128 + 120];
+            if (sb[0] && sb[1] && sb[2] && sb[3]) {
+                g_sub[T][tag][0] += (double) (((sb[1] & M) - (sb[0] & M)) & M);
+                g_sub[T][tag][1] += (double) (((sb[2] & M) - (sb[1] & M)) & M);
+                g_sub[T][tag][2] += (double) (((sb[3] & M) - (sb[2] & M)) & M);
+                g_sub[T][tag][3] += (double) ((t - (sb[3] & M)) & M);
+                g_sub_n[T][tag]++;
+            }
+        }
+#endif
         if (bt[k - 1] != tag) { bt[k - 1] = tag; bn[k - 1] = dt; bf[k - 1] = fill; } // sequence changed
         else if (dt < bn[k - 1]) { bn[k - 1] = dt; bf[k - 1] = fill; }
     }
@@ -473,6 +503,14 @@ void MKEngine::Impl::print_profile() {
         fprintf(stderr, "  %-16s total/launch %8.3f ms   per call %8.2f us   calls/launch %6.1f\n", names[i],
                 ph_ns[i] / launches / 1e6, ph_ns[i] / ph_n[i] / 1e3, (double) ph_n[i] / launches);
     }
+#if MK_PROFILE
+    fprintf(stderr, "[mk-profile] last block's serial section (us, mean): ticket -> merged | -> sampled | -> control done | -> barrier end\n");
+    for (int T = 0; T <= MAXD; T++)
+        for (int i = 0; i < PH_COUNT; i++)
+            if (const long n = g_sub_n[T][i])
+                fprintf(stderr, "  T=%d %-16s %7.2f %7.2f %7.2f %7.2f  (x%ld)\n", T, names[i], g_sub[T][i][0] / n / 1e3,
+                        g_sub[T][i][1] / n / 1e3, g_sub[T][i][2] / n / 1e3, g_sub[T][i][3] / n / 1e3, n);
+#endif
     fprintf(stderr, "[mk-profile] block arrival at barrier (us after phase start; mean over launches): first / median / last\n");
     for (int i = 0; i < PH_COUNT; i++)
         if (arr_n[i])
