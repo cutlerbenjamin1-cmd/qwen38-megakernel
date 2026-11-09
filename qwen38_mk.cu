@@ -3359,6 +3359,11 @@ __device__ __forceinline__ void attn_core_q8_t(const LayerW & W, int slot, int n
         // stored phases before) holds the same bytes before and after the prologue: its first copies go out right after
         // the q loads and land under the prologue (MIX: after the prologue)
         const bool kv0 = !MIX && c1 <= n;
+#if (MK_AQB & 1) && MK_W48X
+        // MK_AQB: MIX's ring-prologue copies {K(0) .. K(3), V(0)} go out at kv0's place when all their positions are below n (this
+        // call writes rows >= n only; every chunk at depth): the same copies, landing under the prologue
+        const bool kvb = MIX && min(c1, c0 + 4 * TP) <= n;
+#endif
         // ---- item prologue, attn_core_t's (q rows -> sQ, this cycle's K / V rows -> cache, m / l init)
         // the q rows' loads first, then the q-norm and RoPE ones (Nsight Compute, 40k context, T5: the q loads went out
         // last, behind those at lg throttle, and the first row's math waited on them: ~4% of attn_core_q8<5>)
@@ -3385,6 +3390,17 @@ __device__ __forceinline__ void attn_core_q8_t(const LayerW & W, int slot, int n
             }
         }
         if (kv0) issue012();
+#if (MK_AQB & 1) && MK_W48X
+        if constexpr (MIX) {
+            if (kvb) {
+                issue(tid, kring, 0, vring, -1, NT);
+                issue(tid, kring + AQ_STG, 1, vring, -1, NT);
+                issue(tid, kring + 2 * AQ_STG, 2, vring, -1, NT);
+                issue(tid, kring + 3 * AQ_STG, 3, vring, 0, NT);
+                asm volatile("cp.async.commit_group;" ::: "memory");
+            }
+        }
+#endif
 #pragma unroll
         for (int k2 = 0; k2 < 2; k2++) {
             if (k2 >= MT) continue;
@@ -3461,6 +3477,9 @@ __device__ __forceinline__ void attn_core_q8_t(const LayerW & W, int slot, int n
             sL(tid) = 0.f;
         }
         if (kv0) asm volatile("cp.async.wait_group 2;" ::: "memory"); // (one barrier for the prologue and K(0))
+#if (MK_AQB & 1) && MK_W48X
+        if (kvb) asm volatile("cp.async.wait_group 0;" ::: "memory"); // (likewise: no ring-prologue barrier)
+#endif
         __threadfence_block();
         __syncthreads();
 
@@ -3476,12 +3495,19 @@ __device__ __forceinline__ void attn_core_q8_t(const LayerW & W, int slot, int n
             // in t - 1, landed by the end of t, to bytes in t + 1, read in t + 2. So S's conversion runs under the other group's
             // MMAs and each copy has at least one interval to land. Prologue: K(0) .. K(3) and V(0) landed, K(0) and K(1) -> bytes
             // (all warps), K(0) converted.
+#if MK_AQB & 1
+            if (!kvb) {
+#endif
             issue(tid, kring, 0, vring, -1, NT);
             issue(tid, kring + AQ_STG, 1, vring, -1, NT);
             issue(tid, kring + 2 * AQ_STG, 2, vring, -1, NT);
             issue(tid, kring + 3 * AQ_STG, 3, vring, 0, NT);
             asm volatile("cp.async.commit_group;" ::: "memory");
             asm volatile("cp.async.wait_group 0;" ::: "memory");
+#if MK_AQB & 1
+            __syncthreads();
+            }
+#endif
 #else
             issue(tid, kring, 0, vring, -1, NT);
             issue(tid, kring + AQ_STG, 1, vring, -1, NT);
@@ -3490,7 +3516,9 @@ __device__ __forceinline__ void attn_core_q8_t(const LayerW & W, int slot, int n
             asm volatile("cp.async.commit_group;" ::: "memory");
             asm volatile("cp.async.wait_group 1;" ::: "memory");
 #endif
+#if !(MK_W48X && (MK_AQB & 1))
             __syncthreads();
+#endif
             const int kb0 = kbt(0); // K(0) -> bytes now (all warps); K(1) in interval 0
 #if MK_W48X
             const int kb1 = ntl > 1 ? kbt(1) : 8;
@@ -3988,6 +4016,26 @@ __device__ __forceinline__ void attn_core_w48(const LayerW & W, int slot, int n,
                 load8(qb + (r % T) * QG + (g * 6 + r / T) * 512 + lane * 8, qv[k2]);
             }
         }
+#if (MK_AQB & 2) && MK_W48X
+        // MK_AQB: MIX's ring-prologue copies K(0) .. K(2) go out here (after the q rows' loads, before the q-norm / RoPE ones: few
+        // registers live) when all their positions are below the first row this call writes: the ring prologue's aq_issue calls
+        // (issue(): tnp, kbt; V side empty), landing under the prologue
+        const bool kvb = MIX && min(c1, c0 + 3 * TP) <= W48_NW;
+        if constexpr (MIX) {
+            if (kvb) {
+                const int jk = kv_ring_tile(kf.kr, wsr, c0, TP);
+#pragma unroll
+                for (int t = 0; t < 3; t++) {
+                    const int8_t * kq;
+                    const __half * ks;
+                    kv_tile_src(0, slot, g, c0 + t * TP, wsr, wsm, kf.kb, t >= jk, kq, ks);
+                    const int kn = c1 - c0 - t * TP;
+                    aq_issue<NT, true>(tid, kring + t * AQ_STG, kq, ks, kn > 0 ? min(TP, kn) : -1, vring, kq, ks, -1, t >= jk ? 8 : kf.kb, 8);
+                    asm volatile("cp.async.commit_group;" ::: "memory");
+                }
+            }
+        }
+#endif
         float qw[8];
         load8_ro(W.qn + lane * 8, qw);
         // T = 8: the warp's q rows warp + 16 k2 are all token warp % 8, one RoPE row for the three (rope_row)
@@ -4079,6 +4127,9 @@ __device__ __forceinline__ void attn_core_w48(const LayerW & W, int slot, int n,
             sM(tid) = -INFINITY;
             sL(tid) = 0.f;
         }
+#if (MK_AQB & 2) && MK_W48X
+        if (kvb) asm volatile("cp.async.wait_group 0;" ::: "memory"); // (one barrier for the prologue and K(0) .. K(2))
+#endif
         __threadfence_block();
         __syncthreads();
 
@@ -4107,19 +4158,31 @@ __device__ __forceinline__ void attn_core_w48(const LayerW & W, int slot, int n,
             if (nth_tid == NT) aq_issue<NT, MIX>(t_, dk, kq, ks, tnp(tk), dv, vq, vs, tv < 0 ? -1 : tnp(tv), kb_, vb_);
             else aq_issue<NT - 128, MIX>(t_, dk, kq, ks, tnp(tk), dv, vq, vs, tv < 0 ? -1 : tnp(tv), kb_, vb_);
         };
+#if (MK_AQB & 2) && MK_W48X
+        if (!kvb) {
+#endif
         issue(tid, kring, 0, vring, -1, NT);
         asm volatile("cp.async.commit_group;" ::: "memory");
         issue(tid, kring + AQ_STG, 1, vring, -1, NT);
         asm volatile("cp.async.commit_group;" ::: "memory");
+#if (MK_AQB & 2) && MK_W48X
+        }
+#endif
 #if MK_W48X
         // MIX: attn_core_q8_t's warp groups, in the same three K and three V stages, so one interval for a copy to land: K(t + 3)
         // goes into K(t)'s stage at the start of interval t (K(t) was converted in t - 1), V(t) into V(t - 3)'s (read in t - 1).
         // Prologue: K(0) .. K(2) landed, K(0) and K(1) -> bytes, K(0) converted.
         if constexpr (MIX) {
+#if MK_AQB & 2
+            if (!kvb) {
+#endif
             issue(tid, kring + 2 * AQ_STG, 2, vring, -1, NT);
             asm volatile("cp.async.commit_group;" ::: "memory");
             asm volatile("cp.async.wait_group 0;" ::: "memory");
             __syncthreads();
+#if MK_AQB & 2
+            }
+#endif
             const int kb0 = kbt(0), kb1 = ntl > 1 ? kbt(1) : 8;
             if (kb0 != 8) kv_tile_expand<false>(kring, kb0, TP, warp, NW, KVQ_ROW);
             if (kb1 != 8) kv_tile_expand<false>(kring + AQ_STG, kb1, TP, warp, NW, KVQ_ROW);
