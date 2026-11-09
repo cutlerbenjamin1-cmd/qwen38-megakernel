@@ -368,6 +368,16 @@ __device__ __forceinline__ unsigned long long scr_pol() {
 __device__ __forceinline__ void scr_stcg(float * p, float v, unsigned long long pol) {
     asm volatile("st.global.cg.L2::cache_hint.f32 [%0], %1, %2;" ::"l"(p), "f"(v), "l"(pol));
 }
+// plain (weak) global stores with the policy: f32, the low 8 / 16 bits of v
+__device__ __forceinline__ void scr_st(float * p, float v, unsigned long long pol) {
+    asm volatile("st.global.L2::cache_hint.f32 [%0], %1, %2;" ::"l"(p), "f"(v), "l"(pol));
+}
+__device__ __forceinline__ void scr_st8(void * p, int v, unsigned long long pol) {
+    asm volatile("st.global.L2::cache_hint.b8 [%0], %1, %2;" ::"l"(p), "r"(v), "l"(pol));
+}
+__device__ __forceinline__ void scr_st16(void * p, unsigned short v, unsigned long long pol) {
+    asm volatile("st.global.L2::cache_hint.b16 [%0], %1, %2;" ::"l"(p), "h"(v), "l"(pol));
+}
 #endif
 
 struct SX {
@@ -1061,11 +1071,20 @@ __device__ __forceinline__ void q16_store(const QBuf & q, int t, int c, float v,
     if (!valid) return;
     const int b = c >> 4, p = (c >> 2) & 3, part = (c >> 1) & 1, hh = c & 1, byte = lane & 15;
     const int gi = t * q.U + 8 * b + 2 * p + hh;
+#if MK_HEL
+    const unsigned long long pol = scr_pol(); // (h = cB.qa, every caller's q: evict_last, rewritten in place)
+    scr_st8((part ? q.xb : q.xa) + gi * 16 + byte, qi, pol);
+    if (byte == 0) {
+        scr_st16(reinterpret_cast<__half *>(q.meta + gi) + part, __half_as_ushort(__float2half_rn(d)), pol);
+        scr_st16(reinterpret_cast<short *>(q.meta + gi) + 2 + part, (unsigned short) qs, pol);
+    }
+#else
     (part ? q.xb : q.xa)[gi * 16 + byte] = (int8_t) qi;
     if (byte == 0) {
         reinterpret_cast<__half *>(q.meta + gi)[part] = __float2half_rn(d);
         reinterpret_cast<short *>(q.meta + gi)[2 + part] = (short) qs;
     }
+#endif
 }
 
 template <int T>
