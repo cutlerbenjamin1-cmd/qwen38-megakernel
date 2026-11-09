@@ -299,6 +299,12 @@ struct MKEngine::Impl {
     size_t alloc_bytes = 0, mark_alloc = 0, mark_free = 0;
     long launches_seen = 0, pf_runs_seen = 0;
     void mem_mark(const char * tag);
+    // MK_RESERVE_EARLY=1 (loader.cu): the local-memory reservation (stack limit stack_res, mk_cycle's frame) at the context and
+    // the kernels' lazy loads before the KV cache is sized, which is then checked against what is really left (it refuses
+    // with the -c that fits); vram_check warns at load end and after the first launch if the device is full
+    bool reserve_early = false;
+    size_t stack_res = 0;
+    void vram_check(const char * where);
 
     size_t wbytes = 0;
     bool profiling = false;
@@ -576,6 +582,9 @@ struct MKEngine::Impl {
     std::vector<cudaEvent_t> pf_gev; // MK_PF_GAPS: timing events, 4 per chunk (start, trunk end, MTP part start, end)
 
     void pf_init();
+    int pf_cap_req() const;                   // tokens per prefill chunk as requested (MK_PF_CAP), before pf_init's ring clamp
+    void pf_kernel_attrs();                   // the prefill GEMMs' attributes (pf_init; MK_RESERVE_EARLY: before the KV cache too)
+    size_t pf_scratch_bytes(int cap, bool ex); // the device bytes pf_init's scratch takes (MK_RESERVE_EARLY's fit check)
 
     // causal attention of the chunk's T queries (positions n ..) over the cache of attention slot `slot` -> y2
     int a2_slots = 0;

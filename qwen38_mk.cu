@@ -4756,6 +4756,16 @@ __device__ __forceinline__ bool topk_insert(float & tv, int & ti, float v, int i
 // takes -inf or NaN); they are interchangeable, so their keys do not matter.
 __device__ __forceinline__ bool tk_before(float av, int as, float bv, int bs) { return av > bv || (av == bv && as < bs); }
 
+#if MK_PROFILE
+// -DMK_PROFILE=1 builds (with env MK_PROFILE): sub-stamps i = 0..3 of the last block's serial section before barrier
+// s_bar_k + 1 (lm_head / mtp_lm_head: 0 ticket passed, 1 merge done, 2 sampling done, 3 control done), kept in the barrier's
+// arrival slots 120 + i (unused: blocks < 120); MK_PROF_DUMP prints them as "# sub" lines, the profile their means
+__device__ __forceinline__ void sub_stamp(int i) {
+    const unsigned k = s_bar_k + 1;
+    if (cB.prof && threadIdx.x == 0 && k < 1024 && gridDim.x <= 120) cB.prof[4096 + k * 128 + 120 + i] = gtimer();
+}
+#endif
+
 // (v, id, s): this warp's sorted list (lane = rank); merged with the sorted list (bv, bid, bs) into the best 32 of
 // both, sorted: reversing b and keeping the better of each pair gives a bitonic sequence holding the best 32, which
 // a 5-step bitonic merge sorts.
@@ -4920,10 +4930,16 @@ __device__ __noinline__ bool lm_head(int t0, bool draft, uint8_t * /*sm*/, int *
     // loads waited on them (Nsight Compute, 8-row code prompt: ~1.3 us per draft step before the row loop, 2.5 MB of
     // local traffic)
     constexpr bool XS = H16 || LSE;
-    int xt[XS ? 1 : MAXD - 1];
+#ifndef MK_LMH8
+#define MK_LMH8 0
+#endif
+    // MK_LMH8 (TL = MAXT): the drafts in shared memory too, loaded into registers inside the pen block of each row pair: the
+    // MAXD - 1 registers are no longer live across the row loop (lm_head<8> spills 5 address offsets, reloaded per pair)
+    constexpr bool XR = MK_LMH8 && !XS && TL == MAXT;
+    int xt[XS || XR ? 1 : MAXD - 1];
     volatile int * const xts = reinterpret_cast<volatile int *>(m + LM_XT);
     if (pen) {
-        if constexpr (XS) {
+        if constexpr (XS || XR) {
             if (tid < MAXD - 1) xts[tid] = ((volatile Ctl *) cB.ctl)->tok[1 + tid];
             __syncthreads();
         } else {
@@ -4989,6 +5005,13 @@ __device__ __noinline__ bool lm_head(int t0, bool draft, uint8_t * /*sm*/, int *
                 a[0][0] = pen_logit(a[0][0], m[t], e0, pres, freq);
                 a[1][0] = pen_logit(a[1][0], m[t], e1, pres, freq);
             } else {
+#if MK_LMH8
+                int xr[XR ? MAXD - 1 : 1];
+                if constexpr (XR) {
+#pragma unroll
+                    for (int i = 0; i < MAXD - 1; i++) xr[i] = xts[i];
+                }
+#endif
 #pragma unroll
                 for (int t = 0; t < TL; t++) {
                     int e0 = c0, e1 = c1;
@@ -4997,6 +5020,9 @@ __device__ __noinline__ bool lm_head(int t0, bool draft, uint8_t * /*sm*/, int *
                         if (i < nx0 + t) {
                             int x;
                             if constexpr (XS) x = xts[i];
+#if MK_LMH8
+                            else if constexpr (XR) x = xr[i];
+#endif
                             else x = xt[i];
                             e0 += x == p0;
                             e1 += x == p1;
@@ -5145,6 +5171,23 @@ __device__ __noinline__ bool lm_head(int t0, bool draft, uint8_t * /*sm*/, int *
             cB.blk_lse[blockIdx.x] = make_float2(M, S);
         }
     }
+#ifndef MK_FORMAL_SYNC
+#define MK_FORMAL_SYNC 0
+#endif
+#if MK_FORMAL_SYNC
+    // the ticket in the PTX model's terms (correct6 F4): the block's stores -> bar.sync -> thread 0's fence + ticket is a release
+    // pattern for every thread's stores (causality); thread 0's ticket + fence -> bar.sync an acquire for every reading lane
+    __syncthreads();
+    int * s_last = reinterpret_cast<int *>(m + LM_LAST);
+    if (tid == 0) {
+        __threadfence();
+        const bool last = atomicAdd(cB.cnt, 1u) == gridDim.x - 1;
+        if (last) __threadfence();
+        s_last[0] = last;
+    }
+    __syncthreads();
+    if (!s_last[0]) return false;
+#else
     __threadfence();
     __syncthreads();
     int * s_last = reinterpret_cast<int *>(m + LM_LAST);
@@ -5152,6 +5195,10 @@ __device__ __noinline__ bool lm_head(int t0, bool draft, uint8_t * /*sm*/, int *
     __syncthreads();
     if (!s_last[0]) return false;
     __threadfence();
+#endif
+#if MK_PROFILE
+    sub_stamp(0);
+#endif
     if constexpr (LSE) { // the blocks' (max, sum of exp) -> shared memory in one parallel load; the sum stays in block order
         // On the last warp alone (warp syncs only): warp 0's argmax below runs alongside. The max and the sum stay chains in
         // block order (every lane chains the max, its loads batched ahead; lane l takes the exps of blocks l, l + 32, ..:
@@ -5233,6 +5280,9 @@ __device__ __noinline__ bool lm_head(int t0, bool draft, uint8_t * /*sm*/, int *
     }
     if (tid == 0) *cB.cnt = 0;
     __syncthreads();
+#if MK_PROFILE
+    sub_stamp(1);
+#endif
     return true;
 }
 
@@ -5641,9 +5691,15 @@ __device__ void main_forward(const Launch & P, uint8_t * /*sm*/, unsigned & epoc
         if (sampling) // lm_head left the candidates at SM_CAND and the drafts' q' at SM_DQ
             sample_targets_ol(P.mode, P.top_k, P.temp, P.top_p, P.min_p, P.seed, Tr, tl, tg,
                               reinterpret_cast<const float2 *>(sm + SM_CAND), reinterpret_cast<const float2 *>(sm + SM_DQ));
+#if MK_PROFILE
+        sub_stamp(2);
+#endif
         for (int i = 0; i < tl; i++) cB.ctl->tgt[i] = tg[i];
         main_control(P.mode, P.last, Tr, P.score ? s_tok + T - 1 : tg, pen, !P.score);
         __threadfence();
+#if MK_PROFILE
+        sub_stamp(3);
+#endif
     }
     gsync(epoch, PH_LMHEAD);
 }
@@ -5947,6 +6003,9 @@ __device__ __noinline__ void mtp_pass(int row0, int dtok, bool draft_row, int dr
                                                   reinterpret_cast<const float2 *>(sm + SM_CAND),
                                                   cB.dq + k * TOPK_MAX, (unsigned long long) c->mtp_P + 1 + k)
                                 : s_tok[0];
+#if MK_PROFILE
+                sub_stamp(2);
+#endif
                 // gate_chain 2 (policy chain=2) with sampled drafts: the chain runs over the drafted token's own probability
                 // under q' (the distribution it was drawn from) instead of the draft head's top-1 probability
                 chain = (k == 0 ? 1.f : c->dchain) * (P.gate_chain == 2 && P.spec_smp ? dq_prob(cB.dq + k * TOPK_MAX, dt) : conf);
@@ -5972,6 +6031,9 @@ __device__ __noinline__ void mtp_pass(int row0, int dtok, bool draft_row, int dr
                 c->nd_prod = prod;
                 c->nd_stop = stop;
                 __threadfence();
+#if MK_PROFILE
+                sub_stamp(3);
+#endif
             }
             if (threadIdx.x >> 5 == 1) mtp_pf_embd(s_tok[1]); // (the next draft's token_embd row to L2)
         }

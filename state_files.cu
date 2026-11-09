@@ -75,6 +75,7 @@ void MKEngine::Impl::st_name(const std::vector<int> & head, std::string & path, 
     // environment: every MK_* setting except those that only change decode, logging, timing or the load path
     static const char * const skip[] = {"MK_STATE", "MK_POLICY", "MK_PROFILE", "MK_SPEC_LOG", "MK_MEMLOG", "MK_LOADLOG", "MK_LOAD_",
                                         "MK_WDIGEST", "MK_WATCHDOG", "MK_CK_SLOTS", "MK_BENCH", "MK_STACK_LIMIT",
+                                        "MK_RESERVE_EARLY", "MK_VRAM_", // (device memory placement / load checks)
                                         "MK_K1=", "MK_K2=", "MK_GSB", // (K1 / K2 / gsync bench: decode only)
                                         "MK_K6="};                    // (K6: decode only; MK_K8 = prefill: kept)
     std::vector<std::string> env;

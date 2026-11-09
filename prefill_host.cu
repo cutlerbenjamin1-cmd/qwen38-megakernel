@@ -28,11 +28,53 @@ inline void a2_plan(int T, int n0, int slots, size_t part_floats, int & nfull, i
 
 } // namespace
 
+// MK_PF_CAP: tokens per prefill chunk (multiple of 128); scratch ~0.25 MB per token (MK_EXACT, every gate / up fused)
+int MKEngine::Impl::pf_cap_req() const {
+    const char * e = getenv("MK_PF_CAP");
+    return e ? std::max(128, std::min(2048, atoi(e) / 128 * 128)) : 2048;
+}
+
+// pf_init's scratch in bytes at `cap` tokens (ex: MK_EXACT), dalloc's 16-byte pads included: keep in step with pf_init (the
+// loader compares the two after pf_init when MK_RESERVE_EARLY is on)
+size_t MKEngine::Impl::pf_scratch_bytes(int cap, bool ex) {
+    bool all_fused = true;
+    for (int L = 0; L < NL; L++) all_fused &= glu_fused(hw.L[L].fg, hw.L[L].fu) || (glu_mix_on && glu_mix(hw.L[L].fg, hw.L[L].fu, 0));
+    const bool y1full = getenv("MK_PF_Y1") && atoi(getenv("MK_PF_Y1")) == 1;
+    const size_t c = cap;
+    return c * D * 4 * 2 + c * 4 + c * 2 * D * 2 + c * FF * 2 + c * (all_fused ? QG : FF) * 4 +
+           c * (ex && all_fused && !y1full ? VD : FF) * 4 + c * VD * 4 + c * QKV * 2 + c * 2 * NVH * 4 + (size_t) 8 * c * 2 * NVH * 4 +
+           (c + 1) * D * 4 + c * NH * HD * 2 + 3 * c * 4 + 16 * 16;
+}
+
+void MKEngine::Impl::pf_kernel_attrs() {
+    mmh_attr<pf::TQ4K, false>();
+    mmh_attr<pf::TQ5K, false>();
+    mmh_attr<pf::TQ6K, false>();
+    mmh_attr<pf::TQ80, false>();
+    mmh_attr<pf::TIQ4, false>();
+    mmh_attr<pf::TIQ4NL, false>();
+    mmh_attr<pf::TQ3K, false>();
+    mmh_attr<pf::TIQ3S, false>();
+    mmh_attr<pf::TQ4K, true>();
+    mmh_attr<pf::TQ5K, true>();
+    mmh_attr<pf::TIQ4, true>();
+    mmh_attr<pf::TQ4K, false, 1>();
+    mmh_attr<pf::TQ5K, false, 1>();
+    mmh_attr<pf::TQ80, false, 1>();
+    mmh_attr<pf::TIQ4, false, 1>();
+    mmh_attr<pf::TIQ4NL, false, 1>();
+    mmh_attr<pf::TQ4K, true, 1>();
+    mmh_attr<pf::TQ5K, true, 1>();
+    mmh_attr<pf::TIQ4, true, 1>();
+    mmh_attr<pf::TQ6K, false, 1>();
+    mmh_attr<pf::TQ3K, false, 1>();
+    mmh_attr<pf::TIQ3S, false, 1>();
+    glu_mix_attr();
+}
+
 void MKEngine::Impl::pf_init() {
     if (pf_ready) return;
-    // MK_PF_CAP: tokens per prefill chunk (multiple of 128); scratch ~0.25 MB per token (MK_EXACT, every gate / up fused)
-    int cap = 2048;
-    if (const char * e = getenv("MK_PF_CAP")) cap = std::max(128, std::min(2048, atoi(e) / 128 * 128));
+    int cap = pf_cap_req();
     // MK_EXACT checkpoints keep the window rings: ring_snap_rows runs after a whole chunk, which must not wrap a ring
     if (ring_bytes_ck > 0 && cap > hb.kvrc) {
         fprintf(stderr, "[mk] MK_PF_CAP %d -> %d: MK_EXACT checkpoints keep the KV window rings, %d rows (MK_KV_WIN=%d), and a "
@@ -71,29 +113,7 @@ void MKEngine::Impl::pf_init() {
     hp.wsrow = exact ? 1 : 0;
     mem_mark("prefill scratch");
     CK(mkl::set_cP(&hp, sizeof(PBufs)));
-    mmh_attr<pf::TQ4K, false>();
-    mmh_attr<pf::TQ5K, false>();
-    mmh_attr<pf::TQ6K, false>();
-    mmh_attr<pf::TQ80, false>();
-    mmh_attr<pf::TIQ4, false>();
-    mmh_attr<pf::TIQ4NL, false>();
-    mmh_attr<pf::TQ3K, false>();
-    mmh_attr<pf::TIQ3S, false>();
-    mmh_attr<pf::TQ4K, true>();
-    mmh_attr<pf::TQ5K, true>();
-    mmh_attr<pf::TIQ4, true>();
-    mmh_attr<pf::TQ4K, false, 1>();
-    mmh_attr<pf::TQ5K, false, 1>();
-    mmh_attr<pf::TQ80, false, 1>();
-    mmh_attr<pf::TIQ4, false, 1>();
-    mmh_attr<pf::TIQ4NL, false, 1>();
-    mmh_attr<pf::TQ4K, true, 1>();
-    mmh_attr<pf::TQ5K, true, 1>();
-    mmh_attr<pf::TIQ4, true, 1>();
-    mmh_attr<pf::TQ6K, false, 1>();
-    mmh_attr<pf::TQ3K, false, 1>();
-    mmh_attr<pf::TIQ3S, false, 1>();
-    glu_mix_attr();
+    pf_kernel_attrs();
     if (const char * e = getenv("MK_PF_BN")) { // force one GEMM token tile (tuning / tests); 0 = by prompt size
         pf_bn_force = atoi(e);
         if (pf_bn_force != 0 && pf_bn_force != 32 && pf_bn_force != 64 && pf_bn_force != 128)
