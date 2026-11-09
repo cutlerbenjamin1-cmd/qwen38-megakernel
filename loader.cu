@@ -844,10 +844,11 @@ MKEngine::Impl::Impl(const std::string & path, int ctx_, int ndraft_, const std:
                                      " only: rebuild for it (make ARCH=..., build.ps1 -Arch ...; docs/BUILDING.md)");
     }
 #endif
-    // MK_RESERVE_EARLY=1: the driver reserves local memory for every thread slot by the stack limit and grows it at the first
-    // launch whose frame needs more; set to mk_cycle's frame (the largest; prefill kernels' <= 40 B) here, before the weights,
-    // and kept, it no longer comes last, where a full device leaves it to system memory (Windows / WSL2 sysmem fallback)
-    reserve_early = getenv("MK_RESERVE_EARLY") && atoi(getenv("MK_RESERVE_EARLY")) != 0;
+    // MK_RESERVE_EARLY (default 1; 0 = 1ecb507's order): the driver reserves local memory for every thread slot by the stack
+    // limit and grows it at the first launch whose frame needs more; set to mk_cycle's frame (the largest; prefill kernels'
+    // <= 40 B) here, before the weights, and kept, it no longer comes last, where a full device leaves it to system memory
+    // (Windows / WSL2 sysmem fallback)
+    reserve_early = !getenv("MK_RESERVE_EARLY") || atoi(getenv("MK_RESERVE_EARLY")) != 0;
     if (reserve_early) {
         cudaFuncAttributes fa{};
         CK(cudaFuncGetAttributes(&fa, mkl::k_mk_cycle));

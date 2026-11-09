@@ -102,6 +102,32 @@ extern char ** environ; // (state files: the MK_* settings in the key)
 #ifndef MK_L2_TUNE
 #define MK_L2_TUNE 0
 #endif
+// Wave 6 (exact, measured as one build against 1ecb507; -D...=0 gives back 1ecb507's code for each). Defined here, before any use:
+// MK_FORMAL_SYNC is tested in qwen38_mk.cu ahead of its local #ifndef, so a flag-less build needs these to be set first.
+#ifndef MK_Q32N
+#define MK_Q32N 1 // resid K2 combine: a batch's q32_store chains interleaved
+#endif
+#ifndef MK_FORMAL_SYNC
+#define MK_FORMAL_SYNC 1 // correct6's PTX-model fences / __syncwarp (lm_head ticket, softmax, resid last arrival)
+#endif
+#ifndef MK_FFNA
+#define MK_FFNA 7 // wv phase-top dealing table, ssq loads first, meta-first fill (bit 8, the proj wrappers' dealing: off)
+#endif
+#ifndef MK_WVREMAT
+#define MK_WVREMAT 1 // dn_proj_wv / attn_proj_wv rebuild their loop state after each tile call (needs MK_FFNA's table)
+#endif
+#ifndef MK_W48Z
+#define MK_W48Z 1 // attn_core_w48m: dead acc[2] tile re-zeroed, next k-step's Q loads first
+#endif
+#ifndef MK_K6X
+#define MK_K6X 1 // preset D T8: K6 expansion on the P V warps
+#endif
+#ifndef MK_LMH8
+#define MK_LMH8 1 // lm_head<8>: pen drafts staged in shared memory, loaded per row pair
+#endif
+#ifndef MK_SILUPAD
+#define MK_SILUPAD 1 // ffn_gu_wv at T < 8: padding columns feed silu 1 (fast division path), results unchanged
+#endif
 // Not compile-time switches (the served behaviour is built in): a -D for one of these names stops the build.
 #if defined(MK_WV)
 #error "MK_WV is built in (its served value): drop -DMK_WV"

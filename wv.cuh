@@ -457,7 +457,7 @@ __host__ __device__ constexpr int wv_smem() {
 //   shift). (8 apart: with every bit on, their T = 8 instances kept more values in stack slots and their tile parts ran
 //   ~1 us longer per call; 8 is the suspect)
 #ifndef MK_FFNA
-#define MK_FFNA 0
+#define MK_FFNA 7 // (default: mk_shared.cuh)
 #endif
 #if MK_FFNA & 9
 // The wv phase tops' dealing per block b of the engine's grid (nsm blocks: every mk_cycle launch that runs a wv phase),
@@ -1003,7 +1003,7 @@ __device__ __forceinline__ bool dn_tile(int p, int nt_q, int & lt) {
 // (cDeal) and the derived counts after each call. 0: the old loops and signatures. Callers pass WV_LAYER_ARG(W, L): L under
 // MK_WVREMAT, W otherwise (W == cW.L[L] at every call site)
 #ifndef MK_WVREMAT
-#define MK_WVREMAT 0
+#define MK_WVREMAT 1 // (default: mk_shared.cuh)
 #endif
 #if MK_WVREMAT && !(MK_FFNA & 9)
 #error "MK_WVREMAT reads the dealing table: build it with MK_FFNA bit 1 or 8"
@@ -1550,7 +1550,7 @@ __device__ __forceinline__ unsigned wv_arrive(unsigned * c) { return wv_arrive(c
 // MK_FORMAL_SYNC 1: a __syncwarp after the last arrival's fence (lane 0's atom -> fence is the acquire; bar.warp.sync,
 // unlike the SHFL of the count, orders lanes 1-31's partial loads after it: PTX 9.7.13.2; correct6 F3)
 #ifndef MK_FORMAL_SYNC
-#define MK_FORMAL_SYNC 0
+#define MK_FORMAL_SYNC 1 // (default: mk_shared.cuh)
 #endif
 
 #if MK_Q32N

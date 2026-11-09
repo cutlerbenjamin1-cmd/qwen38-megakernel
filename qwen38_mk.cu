@@ -306,7 +306,7 @@ __device__ __forceinline__ void q32_store(const QBuf & q, int t, int j, float v,
 }
 
 #ifndef MK_Q32N
-#define MK_Q32N 0 // 1: resid_wv / resid_ck_last's K2 combine runs a batch's q32_store chains interleaved (q32_store_n)
+#define MK_Q32N 1 // 1: resid_wv / resid_ck_last's K2 combine runs a batch's q32_store chains interleaved (q32_store_n)
 #endif
 #if MK_Q32N
 // q32_store(q, t0 + i, j, v[i], ss[i], true) for the N tokens i, one warp: the tokens' shuffle chains and divisions
@@ -4931,7 +4931,7 @@ __device__ __noinline__ bool lm_head(int t0, bool draft, uint8_t * /*sm*/, int *
     // local traffic)
     constexpr bool XS = H16 || LSE;
 #ifndef MK_LMH8
-#define MK_LMH8 0
+#define MK_LMH8 1 // (default: mk_shared.cuh)
 #endif
     // MK_LMH8 (TL = MAXT): the drafts in shared memory too, loaded into registers inside the pen block of each row pair: the
     // MAXD - 1 registers are no longer live across the row loop (lm_head<8> spills 5 address offsets, reloaded per pair)
@@ -5172,7 +5172,7 @@ __device__ __noinline__ bool lm_head(int t0, bool draft, uint8_t * /*sm*/, int *
         }
     }
 #ifndef MK_FORMAL_SYNC
-#define MK_FORMAL_SYNC 0
+#define MK_FORMAL_SYNC 1 // (default: mk_shared.cuh)
 #endif
 #if MK_FORMAL_SYNC
     // the ticket in the PTX model's terms (correct6 F4): the block's stores -> bar.sync -> thread 0's fence + ticket is a release
