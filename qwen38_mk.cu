@@ -3132,10 +3132,10 @@ __device__ __forceinline__ void aqx_conv(float (&acc)[MTA][4][4], const uint8_t 
 // measured there; the stall is ~30% of the S warps' samples at 101k). KILL (MK_AQK bit 0, MK_W48Z 2): k-step ks's fragment slots are
 // zeroed after its last MMA, so they are dead in the rest of the block (exact: the warp's next aqx_conv rewrites every slot of
 // acc[0 .. 1] before its next aqx_mma, and only P V warps, which never run this, read acc as accumulators). PIN (MK_AQK bit 3, MK_W48Z
-// 3): k-step ks + 1's Q loads, then a __syncwarp, then k-step ks's MMAs: bar.warp.sync orders shared memory, so ptxas cannot sink
-// those loads below it (LA is not used; a warp barrier changes no value).
+// 3): k-step ks + 1's Q loads, then a __syncwarp, then k-step ks's MMAs (LA is not used; a warp barrier changes no value). ptxas elides
+// the barrier but keeps a convergence check in the critical warp (r4: +3.9% at T5); PIN 2 (MK_W48Z 4): the same order, no barrier.
 constexpr int AQX_LA = 4;
-template <int MT, int MTA, int LDH, int LA = AQX_LA, bool KILL = false, bool PIN = false>
+template <int MT, int MTA, int LDH, int LA = AQX_LA, bool KILL = false, int PIN = 0>
 __device__ __forceinline__ void aqx_mma(float (&s)[MT][4], float (&acc)[MTA][4][4], unsigned qaddr) {
 #pragma unroll
     for (int i = 0; i < MT; i++)
@@ -3146,7 +3146,7 @@ __device__ __forceinline__ void aqx_mma(float (&s)[MT][4], float (&acc)[MTA][4][
                      : "=r"(a[0]), "=r"(a[1]), "=r"(a[2]), "=r"(a[3])
                      : "r"(qaddr + 2 * (16 * (q % MT) * LDH + 16 * (q / MT))));
     };
-    if constexpr (PIN) {
+    if constexpr (PIN != 0) {
         unsigned a[2][MT][4];
 #pragma unroll
         for (int i = 0; i < MT; i++) ldq(i, a[0][i]);
@@ -3156,7 +3156,7 @@ __device__ __forceinline__ void aqx_mma(float (&s)[MT][4], float (&acc)[MTA][4][
 #pragma unroll
                 for (int i = 0; i < MT; i++) ldq((ks + 1) * MT + i, a[(ks + 1) & 1][i]);
             }
-            __syncwarp();
+            if constexpr (PIN == 1) __syncwarp();
             float (&b)[4] = acc[ks >> 3][(ks >> 1) & 3];
 #pragma unroll
             for (int i = 0; i < MT; i++) {
@@ -4299,8 +4299,8 @@ __device__ __forceinline__ void attn_core_w48(const LayerW & W, int slot, int n,
                 } else if (jt < ntl) {
                     {
                         float s[MT][4];
-#if MK_W48Z >= 2 // 2: and the consumed K fragments killed; 3: PIN instead of the kill
-                        aqx_mma<MT, MT, LDH, AQX_LA, (MK_W48Z == 2), (MK_W48Z >= 3)>(s, acc, (unsigned) __cvta_generic_to_shared(sQ + (lane & 15) * LDH + (lane >> 4) * 8));
+#if MK_W48Z >= 2 // 2: and the consumed K fragments killed; 3: PIN instead of the kill; 4: PIN's order without its __syncwarp
+                        aqx_mma<MT, MT, LDH, AQX_LA, (MK_W48Z == 2), (MK_W48Z == 3 ? 1 : MK_W48Z == 4 ? 2 : 0)>(s, acc, (unsigned) __cvta_generic_to_shared(sQ + (lane & 15) * LDH + (lane >> 4) * 8));
 #else
                         aqx_mma<MT, MT, LDH>(s, acc, (unsigned) __cvta_generic_to_shared(sQ + (lane & 15) * LDH + (lane >> 4) * 8));
 #endif
