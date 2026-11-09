@@ -3005,6 +3005,9 @@ __device__ __forceinline__ void attn_core_t(const LayerW & W, int slot, int n, i
                 const float ps = wsum(p0 + p1);
                 sP[r * LDP + lane] = __float2half_rn(p0);
                 if (TP > 32) sP[r * LDP + (lane + 32) % TP] = __float2half_rn(p1);
+#if MK_FORMAL_SYNC
+                __syncwarp(); // the warp's sM[r] reads before lane 0 rewrites it (shfl.sync orders no memory)
+#endif
                 if (lane == 0) {
                     sL[r] = sL[r] * al + ps;
                     sM[r] = mnew;
@@ -3176,9 +3179,10 @@ __device__ __forceinline__ void aqx_conv(float (&acc)[MTA][4][4], const uint8_t 
 }
 // S = Q K^T from the fragments above (the same MMAs in the same order: k-step ks, then row tile i). The Q loads go out AQX_LA MMAs
 // ahead in the program text: a small module keeps that, in the engine ptxas moves each load back in front of its MMA (no effect
-// measured there; the stall is ~30% of the S warps' samples at 101k).
+// measured there; the stall is ~30% of the S warps' samples at 101k). KS (MK_W48Z): k-step ks + 1's Q loads before k-step ks's MMAs,
+// two k-steps of fragments; with attn_core_w48's acc[2] relief ptxas then keeps w48m<8>'s loads a k-step ahead (wave 6, r5).
 constexpr int AQX_LA = 4;
-template <int MT, int MTA, int LDH>
+template <int MT, int MTA, int LDH, bool KS = false>
 __device__ __forceinline__ void aqx_mma(float (&s)[MT][4], const float (&acc)[MTA][4][4], unsigned qaddr) {
 #pragma unroll
     for (int i = 0; i < MT; i++)
@@ -3189,16 +3193,44 @@ __device__ __forceinline__ void aqx_mma(float (&s)[MT][4], const float (&acc)[MT
                      : "=r"(a[0]), "=r"(a[1]), "=r"(a[2]), "=r"(a[3])
                      : "r"(qaddr + 2 * (16 * (q % MT) * LDH + 16 * (q / MT))));
     };
-    unsigned a[AQX_LA][4];
+    if constexpr (KS) {
+        unsigned a[2][MT][4];
 #pragma unroll
-    for (int q = 0; q < AQX_LA; q++) ldq(q, a[q]);
+        for (int i = 0; i < MT; i++) ldq(i, a[0][i]);
 #pragma unroll
-    for (int q = 0; q < (HD / 16) * MT; q++) {
-        const int ks = q / MT, w = q % AQX_LA;
-        const float (&b)[4] = acc[ks >> 3][(ks >> 1) & 3];
-        mma16816(s[q % MT], a[w][0], a[w][1], a[w][2], a[w][3], __float_as_uint(b[2 * (ks & 1)]), __float_as_uint(b[2 * (ks & 1) + 1]));
-        if (q + AQX_LA < (HD / 16) * MT) ldq(q + AQX_LA, a[w]);
+        for (int ks = 0; ks < HD / 16; ks++) {
+            if (ks + 1 < HD / 16) {
+#pragma unroll
+                for (int i = 0; i < MT; i++) ldq((ks + 1) * MT + i, a[(ks + 1) & 1][i]);
+            }
+            const float (&b)[4] = acc[ks >> 3][(ks >> 1) & 3];
+#pragma unroll
+            for (int i = 0; i < MT; i++) {
+                const unsigned (&x)[4] = a[ks & 1][i];
+                mma16816(s[i], x[0], x[1], x[2], x[3], __float_as_uint(b[2 * (ks & 1)]), __float_as_uint(b[2 * (ks & 1) + 1]));
+            }
+        }
+    } else {
+        unsigned a[AQX_LA][4];
+#pragma unroll
+        for (int q = 0; q < AQX_LA; q++) ldq(q, a[q]);
+#pragma unroll
+        for (int q = 0; q < (HD / 16) * MT; q++) {
+            const int ks = q / MT, w = q % AQX_LA;
+            const float (&b)[4] = acc[ks >> 3][(ks >> 1) & 3];
+            mma16816(s[q % MT], a[w][0], a[w][1], a[w][2], a[w][3], __float_as_uint(b[2 * (ks & 1)]), __float_as_uint(b[2 * (ks & 1) + 1]));
+            if (q + AQX_LA < (HD / 16) * MT) ldq(q + AQX_LA, a[w]);
+        }
     }
+}
+// MK_W48Z: a row tile of acc that the S / softmax-group warps never read (attn_core_w48 MIX: acc[2]) re-zeroed at the end of their
+// branches: its value (0 since the item start for those warps) is unchanged, its registers are dead inside the branches (with aqx_mma's
+// KS order: the S warp's Q-fragment loads a k-step ahead of their MMAs; 258k F T8 attn_core -0.8 ms in wave 6)
+__device__ __forceinline__ void aqx_zero(float (&a)[4][4]) {
+#pragma unroll
+    for (int j = 0; j < 4; j++)
+#pragma unroll
+        for (int k = 0; k < 4; k++) a[j][k] = 0.f;
 }
 // rows r0 .. r0 + N - 1 of a staged tile -> biased bytes: kv_rows_expand<BITS, false>'s bytes without a branch per row; all loads
 // first, then every lane has read before any lane writes (the output overlaps the input)
@@ -3755,6 +3787,9 @@ __device__ __forceinline__ void attn_core_q8_t(const LayerW & W, int slot, int n
                     float ps = u0 + u1;
                     ps += __shfl_xor_sync(0xffffffffu, ps, 2);
                     ps += __shfl_xor_sync(0xffffffffu, ps, 1);
+#if MK_FORMAL_SYNC
+                    __syncwarp(); // the quad's sM(r) reads before lane l4 == 0 rewrites it (shfl.sync orders no memory)
+#endif
                     if (r < R) {
                         __half * prow = sP + b * 32 * LDP + r * LDP;
 #pragma unroll
@@ -4215,8 +4250,15 @@ __device__ __forceinline__ void attn_core_w48(const LayerW & W, int slot, int n,
                     }
                     if (jt + 2 < ntl) {
                         const int kbx = kbt(jt + 2);
+#if MK_K6X
+                        if (kbx != 8 && kbx != 6) kvx_tile<8>(kring + ((jt + 2) % NSK) * AQ_STG, kbx, 8 * (warp & 3)); // (6: the P V warps)
+#else
                         if (kbx != 8) kvx_tile<8>(kring + ((jt + 2) % NSK) * AQ_STG, kbx, 8 * (warp & 3));
+#endif
                     }
+#if MK_W48Z
+                    aqx_zero(acc[2]);
+#endif
                 } else if (sg < 0) { // V -> bytes before the P V MMAs: the S warps get the tensor pipe first, two warps share its tail
                     if (jt >= 1 && jt - 1 < ntl) {
                         const int vbx = vbt(jt - 1);
@@ -4225,7 +4267,11 @@ __device__ __forceinline__ void attn_core_w48(const LayerW & W, int slot, int n,
                 } else if (jt < ntl) {
                     {
                         float s[MT][4];
+#if MK_W48Z
+                        aqx_mma<MT, MT, LDH, true>(s, acc, (unsigned) __cvta_generic_to_shared(sQ + (lane & 15) * LDH + (lane >> 4) * 8));
+#else
                         aqx_mma<MT, MT, LDH>(s, acc, (unsigned) __cvta_generic_to_shared(sQ + (lane & 15) * LDH + (lane >> 4) * 8));
+#endif
 #pragma unroll
                         for (int i = 0; i < MT; i++) {
                             float * so = sS + (jt & 1) * RP * LDS + (16 * i + g8) * LDS + 8 * (warp & 3) + 2 * tig;
@@ -4235,6 +4281,9 @@ __device__ __forceinline__ void attn_core_w48(const LayerW & W, int slot, int n,
                             so[8 * LDS + 1] = s[i][3];
                         }
                     }
+#if MK_W48Z
+                    aqx_zero(acc[2]);
+#endif
                 }
             }
             if (!MIX && warp < 4) {
@@ -4369,6 +4418,11 @@ __device__ __forceinline__ void attn_core_w48(const LayerW & W, int slot, int n,
                         }
                     }
                 }
+#if MK_K6X && MK_W48X
+                if constexpr (MIX) { // MK_K6X: a 6-bit K(jt + 2) -> bytes here, not on the converting group (after the MMAs, as T <= 5)
+                    if (jt + 2 < ntl && kbt(jt + 2) == 6) kvx_rows<6, 4>(kring + ((jt + 2) % NSK) * AQ_STG, 4 * (warp - 4));
+                }
+#endif
 #if MK_W48X
             } else if (!MIX || rC) {
                 const int sn_ = MIX ? warp & 3 : warp - 12;
@@ -4415,6 +4469,9 @@ __device__ __forceinline__ void attn_core_w48(const LayerW & W, int slot, int n,
                         float ps = u0 + u1;
                         ps += __shfl_xor_sync(0xffffffffu, ps, 2);
                         ps += __shfl_xor_sync(0xffffffffu, ps, 1);
+#if MK_FORMAL_SYNC
+                        __syncwarp(); // the quad's sM(r) reads before lane l4 == 0 rewrites it (shfl.sync orders no memory)
+#endif
                         if (r < R) {
                             __half * prow = sP + b * RP * LDP + r * LDP;
 #pragma unroll
@@ -4427,6 +4484,9 @@ __device__ __forceinline__ void attn_core_w48(const LayerW & W, int slot, int n,
                         }
                     }
                 }
+#if MK_W48Z && MK_W48X
+                if constexpr (MIX) aqx_zero(acc[2]);
+#endif
             }
             // ---- copies: K(jt + 2) into the stage of K(jt - 1), V(jt) into the stage of V(jt - 3) (both read in interval
             // jt - 1), issued by warps 4-15; then wait for K(jt + 1) and V(jt - 1)
