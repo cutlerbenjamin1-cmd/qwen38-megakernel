@@ -10,7 +10,8 @@
 // fmt: q8 (all q8, no ring), Vl (K q8, V q5 at run time), D (K q6, V q5, 2048-position q8 ring), F (K q5, V q5, ring),
 // any<k><v> (run-time KB / VB, ring), e.g. any45. Per config: ms per launch (min, median of reps, the variants alternating), and the number
 // of output floats that differ from the reference.
-// env: AB_VARS (substring of "01": 0 pk_attn8, 1 pk_attn9; default both), EXA=1 (MK_EXACT form, unsplit), EXA=2 (split, + pk_attn8_combx),
+// env: AB_VARS (substring of "01": 0 pk_attn8, 1 pk_attn9; default both), COMB_Y (pk_attn2_comb's grid rows for variant 1:
+// default 12, a row per warp; 1: 12 rows per warp, as variant 0), EXA=1 (MK_EXACT form, unsplit), EXA=2 (split, + pk_attn8_combx),
 // QROW=1 (QROW form, q8 / low-bit generic), QSCALE (Q multiplier, default 1), SPECIAL=1 (Inf / NaN / zero rows in Q and the
 // K scales), SEED, WARM_MS (default 4000: clocks), NCU_N=<launches> (the first variant of AB_VARS only, for ncu), OUT_REPS (repeat the
 // new kernels' output comparison), DIFF_HIST=1 (where outputs differ: per head, row of a query tile, dim / 8), BETWEEN=<n> (n launches of pk_attn8 before each
@@ -432,6 +433,7 @@ int main(int argc, char ** argv) {
     ATTR_ALL(pk_attn9);
     ATTR1(pk_attn9, false, false, false, 0, 8);
     ATTR1(pk_attn9, false, false, true, 0, 8);
+    const int comb_y = getenv("COMB_Y") ? std::max(1, atoi(getenv("COMB_Y"))) : 6 * A2_Q / 8;
     int nsm = 0, occ = 0;
     CK(cudaDeviceGetAttribute(&nsm, cudaDevAttrMultiProcessorCount, 0));
     CK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&occ, pk_attn8<false, false>, A2_NT, A8_SMEM));
@@ -501,7 +503,7 @@ int main(int argc, char ** argv) {
         const int N = (T + A2_Q - 1) / A2_Q * NKV;
         if (N > pl.nfull) {
             if (exa) pk_attn8_combx<<<N - pl.nfull, 256>>>(T, n0, pl.nfull, pl.S, pl.segt, pl.exh, 0, pl.part, pl.part2, pl.exa);
-            else pk_attn2_comb<<<N - pl.nfull, 256>>>(T, pl.nfull, pl.S, pl.part);
+            else pk_attn2_comb<<<dim3(N - pl.nfull, v ? comb_y : 1), 256>>>(T, pl.nfull, pl.S, pl.part);
         }
     };
     for (auto [T, n0] : cfg) {

@@ -6867,10 +6867,16 @@ void pk_norm_quant1(dim3 grid, const float * src, const float * w) { ::pk_norm_q
 void pk_ab(const float * Wab, const int8_t * abq, const __half * abd, const float * fn, int T, cudaStream_t st) {
     ::pk_ab<<<dim3((T + 63) / 64, AB_SPLITS), 256, 0, st>>>(Wab, abq, abd, fn, T);
 }
-void pk_ab2(const float * Wab, const int8_t * abq, const __half * abd, const float * fn, int T, cudaStream_t st) {
-    const dim3 grid((T + 63) / 64, AB_SPLITS);
-    if (abq) ::pk_ab2<true><<<grid, 128, 0, st>>>(Wab, abq, abd, fn, T);
-    else ::pk_ab2<false><<<grid, 128, 0, st>>>(Wab, abq, abd, fn, T);
+void pk_ab2(const float * Wab, const int8_t * abq, const __half * abd, const float * fn, int T, cudaStream_t st, bool old) {
+    if (old) { // MK_PFX bit 32: 64 tokens per block
+        const dim3 grid((T + 63) / 64, AB_SPLITS);
+        if (abq) ::pk_ab2<true><<<grid, 128, 0, st>>>(Wab, abq, abd, fn, T);
+        else ::pk_ab2<false><<<grid, 128, 0, st>>>(Wab, abq, abd, fn, T);
+    } else {
+        const dim3 grid((T + 31) / 32, AB_SPLITS);
+        if (abq) ::pk_ab2<true, 32><<<grid, 128, 0, st>>>(Wab, abq, abd, fn, T);
+        else ::pk_ab2<false, 32><<<grid, 128, 0, st>>>(Wab, abq, abd, fn, T);
+    }
 }
 void pk_dn_prep(int T, int n0, int dl, const float * convw, const float * dt, const float * A) {
     ::pk_dn_prep<<<T, 256>>>(T, n0, dl, convw, dt, A);
@@ -6880,7 +6886,10 @@ template <int NT> void pk_dn_prep_t(int T, int n0, int dl, const float * convw, 
 }
 template void pk_dn_prep_t<4>(int, int, int, const float *, const float *, const float *);
 template void pk_dn_prep_t<8>(int, int, int, const float *, const float *, const float *);
-void pk_conv_ring(int T, int n0, int dl) { ::pk_conv_ring<<<std::min(T, CONV_RING), 256>>>(T, n0, dl); }
+void pk_conv_ring(int T, int n0, int dl, bool old) {
+    if (old) ::pk_conv_ring<false><<<std::min(T, CONV_RING), 256>>>(T, n0, dl); // MK_PFX bit 128
+    else ::pk_conv_ring<true><<<std::min(T, CONV_RING), 256>>>(T, n0, dl);
+}
 void pk_ck_conv(int n0, int P, int dl, float * dst) { ::pk_ck_conv<<<CONV_RING, 256>>>(n0, P, dl, dst); }
 void pk_ck_hist(dim3 grid, int lo, int n0, int from_ring, float * dst) { ::pk_ck_hist<<<grid, 256>>>(lo, n0, from_ring, dst); }
 void pk_dn_scan(int T, int t0, const float * st_in, float * st_out) { ::pk_dn_scan<<<dim3(NVH, 2), 256>>>(T, t0, st_in, st_out); }

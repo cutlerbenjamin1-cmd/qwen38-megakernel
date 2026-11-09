@@ -554,13 +554,14 @@ __global__ void __launch_bounds__(A2_NT, 1) pk_attn2(int T, int n0, int slot, in
     }
 }
 
-// merge the S partials of each split item (block = item nfull + blockIdx.x) into y2
+// merge the S partials of each split item (block = item nfull + blockIdx.x) into y2: warp w of block row y merges rows
+// w + 8 y, w + 8 (y + gridDim.y), .. (gridDim.y 12: one row per warp; 1: twelve, MK_PFX bit 256), each with the same code
 __global__ void __launch_bounds__(256) pk_attn2_comb(int T, int nfull, int S, const float * __restrict__ part) { MK_VIEW_INIT();
     const int item = nfull + blockIdx.x, nqt = (T + A2_Q - 1) / A2_Q, qt = item % nqt, g = item / nqt;
     const int t0 = qt * A2_Q, nq = min(A2_Q, T - t0);
     const float * P = part + (size_t) blockIdx.x * S * A2_PART;
     const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
-    for (int r = warp; r < 6 * A2_Q; r += 8) {
+    for (int r = warp + 8 * blockIdx.y; r < 6 * A2_Q; r += 8 * gridDim.y) {
         const int h = r / A2_Q, tt = r % A2_Q;
         if (tt >= nq) continue;
         float m = -INFINITY;
