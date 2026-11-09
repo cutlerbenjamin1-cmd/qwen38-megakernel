@@ -4300,7 +4300,8 @@ __device__ __forceinline__ void attn_core_w48(const LayerW & W, int slot, int n,
                     {
                         float s[MT][4];
 #if MK_W48Z >= 2 // 2: and the consumed K fragments killed; 3: PIN instead of the kill; 4: PIN's order without its __syncwarp
-                        aqx_mma<MT, MT, LDH, AQX_LA, (MK_W48Z == 2), (MK_W48Z == 3 ? 1 : MK_W48Z == 4 ? 2 : 0)>(s, acc, (unsigned) __cvta_generic_to_shared(sQ + (lane & 15) * LDH + (lane >> 4) * 8));
+                        aqx_mma<MT, MT, LDH, AQX_LA, (MK_W48Z == 2), (MK_W48Z == 3 ? 1 : MK_W48Z == 4 ? 2 : 0)>(
+                            s, acc, (unsigned) __cvta_generic_to_shared(sQ + (lane & 15) * LDH + (lane >> 4) * 8));
 #else
                         aqx_mma<MT, MT, LDH>(s, acc, (unsigned) __cvta_generic_to_shared(sQ + (lane & 15) * LDH + (lane >> 4) * 8));
 #endif
