@@ -1369,12 +1369,19 @@ __device__ __noinline__ void resid_wv(const Mat & Wm, const QBuf & in, const flo
         const int lane = tid_x() & 31, g = lane >> 2, tq = lane & 3; // (read afresh after the call, as dn_proj_wv)
         float * part = cB.wvpart + (size_t) kc * RMAX * D;
         if (!X16 || tq < 2) {
+#if MK_SCR_WV
+            const unsigned long long pol = scr_pol(); // (evict_last: wvpart stays resident, rewritten in place)
+#endif
 #pragma unroll
             for (int n = 0; n < C::NG; n++)
 #pragma unroll
                 for (int c = 0; c < 4; c++) {
                     const int t = X16 ? 4 * n + 2 * tq + (c & 1) : 8 * n + 2 * tq + (c & 1);
+#if MK_SCR_WV
+                    if (t < T) scr_stcg(part + (size_t) t * D + 16 * tile + g + 8 * (c >> 1), a.v[n][c], pol);
+#else
                     if (t < T) __stcg(part + (size_t) t * D + 16 * tile + g + 8 * (c >> 1), a.v[n][c]);
+#endif
                 }
         }
         const unsigned old = wv_arrive(cnt + (tile >> 1), lane);

@@ -355,6 +355,21 @@ __device__ __forceinline__ void q32_store_n(const QBuf & q, int t0, int j, const
 }
 #endif
 
+// Dead-scratch stores (buffers rewritten in place every layer, dead after their reader), each buffer behind its own macro
+// (MK_SCR_WV: wvpart, MK_HEL: h = cB.qa, MK_SCR_Z: z / ab): L2 evict_last, so the buffer stays resident and its dirty
+// lines are not written back between uses (dn6 REQ dn6-2: 0 of 33 rounds). Cache policy only: the same values / addresses
+#if MK_SCR_WV || MK_HEL || MK_SCR_Z
+__device__ __forceinline__ unsigned long long scr_pol() {
+    unsigned long long pol;
+    asm("createpolicy.fractional.L2::evict_last.b64 %0, 1.0;" : "=l"(pol));
+    return pol;
+}
+// __stcg's st.global.cg with the policy
+__device__ __forceinline__ void scr_stcg(float * p, float v, unsigned long long pol) {
+    asm volatile("st.global.cg.L2::cache_hint.f32 [%0], %1, %2;" ::"l"(p), "f"(v), "l"(pol));
+}
+#endif
+
 struct SX {
     int4 * xa;
     int4 * xb;
