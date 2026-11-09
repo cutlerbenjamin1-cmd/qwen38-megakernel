@@ -2955,6 +2955,9 @@ __device__ __forceinline__ void attn_core_t(const LayerW & W, int slot, int n, i
                 const float ps = wsum(p0 + p1);
                 sP[r * LDP + lane] = __float2half_rn(p0);
                 if (TP > 32) sP[r * LDP + (lane + 32) % TP] = __float2half_rn(p1);
+#if MK_FORMAL_SYNC
+                __syncwarp(); // the warp's sM[r] reads before lane 0 rewrites it (shfl.sync orders no memory)
+#endif
                 if (lane == 0) {
                     sL[r] = sL[r] * al + ps;
                     sM[r] = mnew;
@@ -3124,12 +3127,14 @@ __device__ __forceinline__ void aqx_conv(float (&acc)[MTA][4][4], const uint8_t 
         a[2 * (ks & 1) + 1] = __uint_as_float(aq_q8x2(*reinterpret_cast<const unsigned short *>(krow + 16 * ks + 2 * tig + 8), dd, kxm, ksub));
     }
 }
-// S = Q K^T from the fragments above (the same MMAs in the same order: k-step ks, then row tile i). The Q loads go out AQX_LA MMAs
+// S = Q K^T from the fragments above (the same MMAs in the same order: k-step ks, then row tile i). The Q loads go out LA MMAs
 // ahead in the program text: a small module keeps that, in the engine ptxas moves each load back in front of its MMA (no effect
-// measured there; the stall is ~30% of the S warps' samples at 101k).
+// measured there; the stall is ~30% of the S warps' samples at 101k). KILL (MK_AQK, MK_W48S 2): k-step ks's fragment slots are
+// zeroed after its last MMA, so they are dead in the rest of the block (exact: the warp's next aqx_conv rewrites every slot of
+// acc[0 .. 1] before its next aqx_mma, and only P V warps, which never run this, read acc as accumulators).
 constexpr int AQX_LA = 4;
-template <int MT, int MTA, int LDH>
-__device__ __forceinline__ void aqx_mma(float (&s)[MT][4], const float (&acc)[MTA][4][4], unsigned qaddr) {
+template <int MT, int MTA, int LDH, int LA = AQX_LA, bool KILL = false>
+__device__ __forceinline__ void aqx_mma(float (&s)[MT][4], float (&acc)[MTA][4][4], unsigned qaddr) {
 #pragma unroll
     for (int i = 0; i < MT; i++)
 #pragma unroll
@@ -3139,16 +3144,30 @@ __device__ __forceinline__ void aqx_mma(float (&s)[MT][4], const float (&acc)[MT
                      : "=r"(a[0]), "=r"(a[1]), "=r"(a[2]), "=r"(a[3])
                      : "r"(qaddr + 2 * (16 * (q % MT) * LDH + 16 * (q / MT))));
     };
-    unsigned a[AQX_LA][4];
+    unsigned a[LA][4];
 #pragma unroll
-    for (int q = 0; q < AQX_LA; q++) ldq(q, a[q]);
+    for (int q = 0; q < LA; q++) ldq(q, a[q]);
 #pragma unroll
     for (int q = 0; q < (HD / 16) * MT; q++) {
-        const int ks = q / MT, w = q % AQX_LA;
-        const float (&b)[4] = acc[ks >> 3][(ks >> 1) & 3];
+        const int ks = q / MT, w = q % LA;
+        float (&b)[4] = acc[ks >> 3][(ks >> 1) & 3];
         mma16816(s[q % MT], a[w][0], a[w][1], a[w][2], a[w][3], __float_as_uint(b[2 * (ks & 1)]), __float_as_uint(b[2 * (ks & 1) + 1]));
-        if (q + AQX_LA < (HD / 16) * MT) ldq(q + AQX_LA, a[w]);
+        if (q + LA < (HD / 16) * MT) ldq(q + LA, a[w]);
+        if constexpr (KILL) {
+            if (q % MT == MT - 1) {
+                b[2 * (ks & 1)] = 0.f;
+                b[2 * (ks & 1) + 1] = 0.f;
+            }
+        }
     }
+}
+// MK_W48S: a row tile of acc that the S / softmax-group warps never read (attn_core_w48 MIX: acc[2]) re-zeroed at the end of their
+// branches: its value (0 since the item start for those warps) is unchanged, its registers are dead inside the branches
+__device__ __forceinline__ void aqx_zero(float (&a)[4][4]) {
+#pragma unroll
+    for (int j = 0; j < 4; j++)
+#pragma unroll
+        for (int k = 0; k < 4; k++) a[j][k] = 0.f;
 }
 // rows r0 .. r0 + N - 1 of a staged tile -> biased bytes: kv_rows_expand<BITS, false>'s bytes without a branch per row; all loads
 // first, then every lane has read before any lane writes (the output overlaps the input)
@@ -3529,7 +3548,12 @@ __device__ __forceinline__ void attn_core_q8_t(const LayerW & W, int slot, int n
                 } else if (sg >= 0) {
                     if (jt < ntl) {
                         float s[MT][4];
+#if MK_AQK // bit 0: consumed K fragments killed; bit 1: Q loads 1 MMA ahead in the source, bit 2: 2 (else AQX_LA)
+                        aqx_mma<MT, MTA, LDH, (MK_AQK & 2) ? 1 : (MK_AQK & 4) ? 2 : AQX_LA, (MK_AQK & 1) != 0>(
+                            s, acc, (unsigned) __cvta_generic_to_shared(sQ + (lane & 15) * LDH + (lane >> 4) * 8));
+#else
                         aqx_mma<MT, MTA, LDH>(s, acc, (unsigned) __cvta_generic_to_shared(sQ + (lane & 15) * LDH + (lane >> 4) * 8));
+#endif
 #pragma unroll
                         for (int i = 0; i < MT; i++) {
                             float * so = sS + (jt & 1) * 32 * LDS + (16 * i + g8) * LDS + 8 * (warp & 3) + 2 * tig;
@@ -3705,6 +3729,9 @@ __device__ __forceinline__ void attn_core_q8_t(const LayerW & W, int slot, int n
                     float ps = u0 + u1;
                     ps += __shfl_xor_sync(0xffffffffu, ps, 2);
                     ps += __shfl_xor_sync(0xffffffffu, ps, 1);
+#if MK_FORMAL_SYNC
+                    __syncwarp(); // the quad's sM(r) reads before lane l4 == 0 rewrites it (shfl.sync orders no memory)
+#endif
                     if (r < R) {
                         __half * prow = sP + b * 32 * LDP + r * LDP;
 #pragma unroll
@@ -4167,6 +4194,9 @@ __device__ __forceinline__ void attn_core_w48(const LayerW & W, int slot, int n,
                         const int kbx = kbt(jt + 2);
                         if (kbx != 8) kvx_tile<8>(kring + ((jt + 2) % NSK) * AQ_STG, kbx, 8 * (warp & 3));
                     }
+#if MK_W48S
+                    aqx_zero(acc[2]);
+#endif
                 } else if (sg < 0) { // V -> bytes before the P V MMAs: the S warps get the tensor pipe first, two warps share its tail
                     if (jt >= 1 && jt - 1 < ntl) {
                         const int vbx = vbt(jt - 1);
@@ -4175,7 +4205,11 @@ __device__ __forceinline__ void attn_core_w48(const LayerW & W, int slot, int n,
                 } else if (jt < ntl) {
                     {
                         float s[MT][4];
+#if MK_W48S >= 2 // (and the consumed K fragments killed)
+                        aqx_mma<MT, MT, LDH, AQX_LA, true>(s, acc, (unsigned) __cvta_generic_to_shared(sQ + (lane & 15) * LDH + (lane >> 4) * 8));
+#else
                         aqx_mma<MT, MT, LDH>(s, acc, (unsigned) __cvta_generic_to_shared(sQ + (lane & 15) * LDH + (lane >> 4) * 8));
+#endif
 #pragma unroll
                         for (int i = 0; i < MT; i++) {
                             float * so = sS + (jt & 1) * RP * LDS + (16 * i + g8) * LDS + 8 * (warp & 3) + 2 * tig;
@@ -4185,6 +4219,9 @@ __device__ __forceinline__ void attn_core_w48(const LayerW & W, int slot, int n,
                             so[8 * LDS + 1] = s[i][3];
                         }
                     }
+#if MK_W48S
+                    aqx_zero(acc[2]);
+#endif
                 }
             }
             if (!MIX && warp < 4) {
@@ -4365,6 +4402,9 @@ __device__ __forceinline__ void attn_core_w48(const LayerW & W, int slot, int n,
                         float ps = u0 + u1;
                         ps += __shfl_xor_sync(0xffffffffu, ps, 2);
                         ps += __shfl_xor_sync(0xffffffffu, ps, 1);
+#if MK_FORMAL_SYNC
+                        __syncwarp(); // the quad's sM(r) reads before lane l4 == 0 rewrites it (shfl.sync orders no memory)
+#endif
                         if (r < R) {
                             __half * prow = sP + b * RP * LDP + r * LDP;
 #pragma unroll
@@ -4377,6 +4417,9 @@ __device__ __forceinline__ void attn_core_w48(const LayerW & W, int slot, int n,
                         }
                     }
                 }
+#if MK_W48S && MK_W48X
+                if constexpr (MIX) aqx_zero(acc[2]);
+#endif
             }
             // ---- copies: K(jt + 2) into the stage of K(jt - 1), V(jt) into the stage of V(jt - 3) (both read in interval
             // jt - 1), issued by warps 4-15; then wait for K(jt + 1) and V(jt - 1)
