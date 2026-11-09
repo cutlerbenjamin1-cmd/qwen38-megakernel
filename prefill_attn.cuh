@@ -1446,15 +1446,15 @@ __global__ void __launch_bounds__(A2_NT, 1) pk_attn9(int T, int n0, int slot, in
             }
         }
     }
-    // A9_CP bit 2: slot k's source for tile it0 + n (cps stays the tile-it0 base; the same address the running pointer has
-    // wherever a copy is issued: a fast tile's predecessors from it0 on are all fast tiles)
-    auto cp_src = [&](int k, int n) { return cps[k] + (size_t) (unsigned) n * (unsigned) cpi[k]; };
-    (void) cp_src;
+    // A9_CP bit 2: slot k's source for tile it0 + n is cps[k] + n cpi[k] (cps stays the tile-it0 base): the address the running
+    // pointer has wherever a copy is issued (a fast tile's predecessors from it0 on are all fast tiles). (No lambda for it: a dead
+    // closure capturing these by reference changes the A9F = 0 kernel's code.)
     auto issue_fast = [&](unsigned sto, int n) { // (n = tile - it0)
         if constexpr (A9CW) {
-            cp_async16_to(smem0 + sto + cpd[0], cp_src(0, n));
+            cp_async16_to(smem0 + sto + cpd[0], cps[0] + (size_t) (unsigned) n * (unsigned) cpi[0]);
 #pragma unroll
-            for (int k = 1; k < A9_NSL; k++) a9_cp16p(tid + A2_NT * k < cpn, smem0 + sto + cpd[k], cp_src(k, n));
+            for (int k = 1; k < A9_NSL; k++)
+                a9_cp16p(tid + A2_NT * k < cpn, smem0 + sto + cpd[k], cps[k] + (size_t) (unsigned) n * (unsigned) cpi[k]);
         } else {
             cp_async16_to(smem0 + sto + cpd[0], cps[0]);
             cps[0] += cpi[0];
@@ -1654,28 +1654,18 @@ __global__ void __launch_bounds__(A2_NT, 1) pk_attn9(int T, int n0, int slot, in
         const int ia = it + A8_NS - 1; // refill the stage of tile it - 1 with tile ia
         uint8_t * sta = asm_ + st_c;
         const unsigned cpok = ia < itf && ia < it1;
-        auto cp_slot = [&](int k) { // copy slot k of tile ia (A9_CP)
-            const unsigned p = k ? cpok & (tid + A2_NT * k < cpn) : cpok;
-            if constexpr (A9CW) {
-                a9_cp16p(p, smem0 + st_c + cpd[k], cp_src(k, ia - it0));
-            } else {
-                a9_cp16p(p, smem0 + st_c + cpd[k], cps[k]);
+        if constexpr (A9CW && !A9CS) { // A9_CP bit 2 alone: the copies here, sources from the base
+#pragma unroll
+            for (int k = 0; k < A9_NSL; k++)
+                a9_cp16p(k ? cpok & (tid + A2_NT * k < cpn) : cpok, smem0 + st_c + cpd[k], cps[k] + (size_t) (unsigned) (ia - it0) * (unsigned) cpi[k]);
+            pf::cpa_commit();
+        } else if constexpr (!A9CS) {
+            a9_cp16p(cpok, smem0 + st_c + cpd[0], cps[0]);
+            cps[0] += cpi[0];
+#pragma unroll
+            for (int k = 1; k < A9_NSL; k++) {
+                a9_cp16p(cpok & (tid + A2_NT * k < cpn), smem0 + st_c + cpd[k], cps[k]);
                 cps[k] += cpi[k];
-            }
-        };
-        (void) cp_slot;
-        if constexpr (!A9CS) {
-            if constexpr (A9CW) {
-#pragma unroll
-                for (int k = 0; k < A9_NSL; k++) cp_slot(k);
-            } else {
-                a9_cp16p(cpok, smem0 + st_c + cpd[0], cps[0]);
-                cps[0] += cpi[0];
-#pragma unroll
-                for (int k = 1; k < A9_NSL; k++) {
-                    a9_cp16p(cpok & (tid + A2_NT * k < cpn), smem0 + st_c + cpd[k], cps[k]);
-                    cps[k] += cpi[k];
-                }
             }
             pf::cpa_commit();
         }
@@ -1724,7 +1714,16 @@ __global__ void __launch_bounds__(A2_NT, 1) pk_attn9(int T, int n0, int slot, in
             // A9_CP bit 1: slot k after block 2 k + 1 (its fragment and scale loads are issued), off the barrier's load burst;
             // the stage is free from barrier(it) on and the group must land by barrier(it + 1): it does, it is committed here
             if constexpr (A9CS) {
-                if (b % 2 == 1 && b / 2 < A9_NSL) cp_slot(b / 2);
+                if (b % 2 == 1 && b / 2 < A9_NSL) {
+                    const int k = b / 2;
+                    const unsigned p = k ? cpok & (tid + A2_NT * k < cpn) : cpok;
+                    if constexpr (A9CW) {
+                        a9_cp16p(p, smem0 + st_c + cpd[k], cps[k] + (size_t) (unsigned) (ia - it0) * (unsigned) cpi[k]);
+                    } else {
+                        a9_cp16p(p, smem0 + st_c + cpd[k], cps[k]);
+                        cps[k] += cpi[k];
+                    }
+                }
                 if (b == 2 * A9_NSL - 1) pf::cpa_commit();
             }
         }
