@@ -46,8 +46,8 @@ folder) and `scripts\package_release.ps1` (after `build.ps1`; it bundles the Vis
   CUDA 13.2; it links the CUDA runtime statically, so at run time only the driver is needed.
 - **OS:** Linux, WSL2, or Windows 10 / 11 x64.
 - **RAM to compile:** most of the build is ptxas on the megakernel (`qwen38_mk.cu`, the device code), one thread with a
-  large heap. For the served configuration it peaked at 21.0 GiB on Linux / WSL2 (12 minutes of ptxas in a 14-minute
-  `make -j4`, 2026-11-03), the [deep-pass build](EXPERIMENTAL.md#the-deep-pass) the same (21.1 GiB), int8 decode
+  large heap. For the served configuration it peaked at 20.2 GiB on Linux / WSL2 (a 13.5-minute `make -j4`, 2026-11-11;
+  21.0 GiB on 2026-11-03), the [deep-pass build](EXPERIMENTAL.md#the-deep-pass) the same (21.1 GiB), int8 decode
   attention ([`-DMK_ATT_I8=1`](EXPERIMENTAL.md#int8-decode-attention)) 26.1 GiB in 17 minutes of ptxas. Natively on
   Windows the previous engine (6f3b257, 2026-10-30) peaked at 18.8 GiB in a 12-minute `build.ps1`; expect about the
   Linux figure for this one. A change to the host side alone (`engine.cu`, `engine_impl.h` and the other host files)
