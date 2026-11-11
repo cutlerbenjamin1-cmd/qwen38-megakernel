@@ -583,6 +583,7 @@ struct MKEngine::Impl {
 
     void pf_init();
     int pf_cap_req() const;                   // tokens per prefill chunk as requested (MK_PF_CAP), before pf_init's ring clamp
+    int pf_cap_eff(bool ring_ck, int kvrc) const; // after it: what pf_init allocates for (and the fit check counts)
     void pf_kernel_attrs();                   // the prefill GEMMs' attributes (pf_init; MK_RESERVE_EARLY: before the KV cache too)
     size_t pf_scratch_bytes(int cap, bool ex); // the device bytes pf_init's scratch takes (MK_RESERVE_EARLY's fit check)
 

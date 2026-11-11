@@ -77,7 +77,9 @@ void MKEngine::Impl::st_name(const std::vector<int> & head, std::string & path, 
                                         "MK_WDIGEST", "MK_WATCHDOG", "MK_CK_SLOTS", "MK_BENCH", "MK_STACK_LIMIT",
                                         "MK_RESERVE_EARLY", "MK_VRAM_", // (device memory placement / load checks)
                                         "MK_K1=", "MK_K2=", "MK_GSB", // (K1 / K2 / gsync bench: decode only)
-                                        "MK_K6="};                    // (K6: decode only; MK_K8 = prefill: kept)
+                                        "MK_K6=",                     // (K6: decode only; MK_K8 = prefill: kept)
+                                        "MK_PF_PROFILE", "MK_PF_GAPS", "MK_PF_SYNC", // (prefill timing / launch flow)
+                                        "MK_CK_DEVICE", "MK_STORE_", "MK_SLOT_RESERVE", "MK_CUDAMALLOC"}; // (placement)
     std::vector<std::string> env;
     for (char ** e = environ; *e; e++) {
         if (strncmp(*e, "MK_", 3)) continue;
@@ -141,12 +143,18 @@ void MKEngine::Impl::st_save(const std::string & path, const std::string & key, 
     for (const auto & r : R) w64(r.second), tot += r.second;
     const size_t PC = (size_t) 64 << 20;
     std::unique_ptr<uint8_t[]> buf(new uint8_t[PC]);
-    for (const auto & r : R)
-        for (size_t o = 0; ok && o < r.second; o += PC) {
-            const size_t n = std::min(PC, r.second - o);
-            CK(cudaMemcpy(buf.get(), r.first + o, n, cudaMemcpyDeviceToHost));
-            ok = fwrite(buf.get(), 1, n, f) == n;
-        }
+    try {
+        for (const auto & r : R)
+            for (size_t o = 0; ok && o < r.second; o += PC) {
+                const size_t n = std::min(PC, r.second - o);
+                CK(cudaMemcpy(buf.get(), r.first + o, n, cudaMemcpyDeviceToHost));
+                ok = fwrite(buf.get(), 1, n, f) == n;
+            }
+    } catch (...) { // (a CUDA error: no half-written file is left behind)
+        fclose(f);
+        unlink(tmp.c_str());
+        throw;
+    }
     ok = (fclose(f) == 0) && ok;
 #ifdef _WIN32
     if (ok) remove(path.c_str()); // (rename does not replace an existing file on Windows)

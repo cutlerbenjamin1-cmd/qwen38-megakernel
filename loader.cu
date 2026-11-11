@@ -1352,8 +1352,10 @@ MKEngine::Impl::Impl(const std::string & path, int ctx_, int ndraft_, const std:
                     throw std::runtime_error("MK_KV: expected 4..8 or 4r..8r in " + tok);
                 const bool rot = md.size() == 2;
                 const bool all = sl.empty() || sl == "*";
-                const int slot = all ? -1 : std::stoi(sl);
-                if (!all && (slot < 0 || slot >= N_ATT_SLOTS)) throw std::runtime_error("MK_KV: bad slot in " + tok);
+                char * end = nullptr;
+                const long slot = all ? -1 : strtol(sl.c_str(), &end, 10);
+                if (!all && (*end || slot < 0 || slot >= N_ATT_SLOTS))
+                    throw std::runtime_error("MK_KV: bad slot in " + tok + " (0.." + std::to_string(N_ATT_SLOTS - 1) + " or *)");
                 for (int w = 0; w < 2; w++)
                     if (tok[0] == '*' || tok[0] == "KV"[w])
                         for (int s = 0; s < N_ATT_SLOTS; s++)
@@ -1379,10 +1381,10 @@ MKEngine::Impl::Impl(const std::string & path, int ctx_, int ndraft_, const std:
             // MK_RESERVE_EARLY: the cache, its MK_KV_WIN rings and what is allocated after them (the prefill scratch, a device
             // checkpoint) plus MK_VRAM_MARGIN MiB for what loads later (kernels at the first prefill / launch, the driver)
             // against the device memory left now: under it, refuse with the -c that fits (MK_VRAM_OVERCOMMIT=1: warn, load)
-            size_t ring_b = 0;
+            size_t ring_b = 0, rc = 0;
             if (want_kv && getenv("MK_KV_WIN") && atoi(getenv("MK_KV_WIN")) > 0) {
                 const int win = atoi(getenv("MK_KV_WIN"));
-                const size_t rc = (size_t) ((win + ATT_BUCKET - 1) / ATT_BUCKET + 1) * ATT_BUCKET + ATP; // (hb.kvrc below)
+                rc = (size_t) ((win + ATT_BUCKET - 1) / ATT_BUCKET + 1) * ATT_BUCKET + ATP; // (hb.kvrc below)
                 const bool all = getenv("MK_KV_WIN_ALL") && atoi(getenv("MK_KV_WIN_ALL")) != 0;
                 for (int w = 0; w < 2; w++)
                     for (int s = 0; s < kv_slots; s++)
@@ -1394,7 +1396,9 @@ MKEngine::Impl::Impl(const std::string & path, int ctx_, int ndraft_, const std:
             fit_b = (q8 ? vbytes[0] + vbytes[1] + (size_t) 2 * rows * (HD / 32) * 2 + 64 : rows * HD * 4 + 32) + ring_b;
             const bool ex = getenv("MK_EXACT") ? atoi(getenv("MK_EXACT")) != 0 : exact;
             const char * cd = getenv("MK_CK_DEVICE");
-            const size_t scr = pf_scratch_bytes(pf_cap_req(), ex), post = scr + (cd && cd[0] == '1' ? ck_block_bytes() + 16 : 0);
+            // (exact checkpoints keep the rings when there are any: ck_pool's ring_bytes_ck > 0, which pf_init's cap reads)
+            const size_t scr = pf_scratch_bytes(pf_cap_eff(ex && ring_b > 0, (int) rc), ex);
+            const size_t post = scr + (cd && cd[0] == '1' ? ck_block_bytes() + 16 : 0);
             size_t fr = 0, tt = 0;
             CK(cudaDeviceSynchronize());
             CK(cudaMemGetInfo(&fr, &tt));

@@ -34,6 +34,13 @@ int MKEngine::Impl::pf_cap_req() const {
     return e ? std::max(128, std::min(2048, atoi(e) / 128 * 128)) : 2048;
 }
 
+// the chunk pf_init allocates for: pf_cap_req, but no longer than the KV window rings (kvrc rows) when MK_EXACT checkpoints
+// keep them (ring_ck), whose ring_snap_rows runs after a whole chunk, which must not wrap a ring
+int MKEngine::Impl::pf_cap_eff(bool ring_ck, int kvrc) const {
+    const int cap = pf_cap_req();
+    return ring_ck && cap > kvrc ? kvrc / 128 * 128 : cap;
+}
+
 // pf_init's scratch in bytes at `cap` tokens (ex: MK_EXACT), dalloc's 16-byte pads included: keep in step with pf_init (the
 // loader compares the two after pf_init when MK_RESERVE_EARLY is on)
 size_t MKEngine::Impl::pf_scratch_bytes(int cap, bool ex) {
@@ -74,13 +81,12 @@ void MKEngine::Impl::pf_kernel_attrs() {
 
 void MKEngine::Impl::pf_init() {
     if (pf_ready) return;
-    int cap = pf_cap_req();
-    // MK_EXACT checkpoints keep the window rings: ring_snap_rows runs after a whole chunk, which must not wrap a ring
-    if (ring_bytes_ck > 0 && cap > hb.kvrc) {
+    const int req = pf_cap_req(), cap = pf_cap_eff(ring_bytes_ck > 0, hb.kvrc);
+    if (const char * e = getenv("MK_PF_CAP"); e && atoi(e) != req)
+        fprintf(stderr, "[mk] MK_PF_CAP %s -> %d (a multiple of 128, 128 .. 2048)\n", e, req);
+    if (cap != req)
         fprintf(stderr, "[mk] MK_PF_CAP %d -> %d: MK_EXACT checkpoints keep the KV window rings, %d rows (MK_KV_WIN=%d), and a "
-                        "prefill chunk must not wrap them\n", cap, hb.kvrc / 128 * 128, hb.kvrc, hb.kvwin);
-        cap = hb.kvrc / 128 * 128;
-    }
+                        "prefill chunk must not wrap them\n", req, cap, hb.kvrc, hb.kvwin);
     hp.cap = cap;
     mem_mark("before prefill scratch");
     hp.x = dalloc<float>((size_t) cap * D);

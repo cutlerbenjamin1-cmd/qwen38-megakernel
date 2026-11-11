@@ -372,7 +372,7 @@ static int run(int argc, char ** argv) {
             fclose(f);
             fprintf(stderr, "%zu images from %s\n", kimg.size(), kld_images.c_str());
         }
-        MKEngine eng(model, std::max(ctx, (int) longest + 64), 0, "", kv_mode);
+        MKEngine eng(model, std::max(ctx, (int) longest + 64), 0, "", kv_mode, mtp);
         for (const std::string & sp : specs) {
             if (!kld_specs.empty()) {
                 eng.set_kv_emu(sp);
