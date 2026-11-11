@@ -271,7 +271,8 @@ class AnthropicBlockTests(_HttpCase):
     def test_a_prefill_and_fields_the_server_ignores_are_warnings(self) -> None:
         # (accepted, as before: Claude Code sends some of these fields; never silent)
         body = {"max_tokens": 5, "messages": [{"role": "user", "content": "Q"}, {"role": "assistant", "content": "{"}],
-                "output_format": {"type": "json_schema", "schema": {"type": "object"}}, "output_config": {"effort": "high"},
+                "output_format": {"type": "json_schema", "schema": {"type": "object"}},
+                "output_config": {"effort": "high", "format": {"type": "json_schema"}},
                 "context_management": {"edits": [{"type": "clear_thinking_20251015"}]}, "container": "c1",
                 "metadata": {"user_id": "u"}, "service_tier": "auto"}
         want = {"anthropic-prefill", "anthropic-field-output_format", "anthropic-field-output_config",
@@ -287,6 +288,32 @@ class AnthropicBlockTests(_HttpCase):
             status, data = _post(http_.port, path, body)
             self.assertEqual(status, 200, data)
         self.assertTrue(want <= srv.warned)
+
+    def test_output_config_effort_is_the_templates_reasoning_effort(self) -> None:
+        # (Claude Code's /effort; it sends high by default: the template's default xhigh, so the same prompt as without it)
+        base = {"max_tokens": 5, "messages": [{"role": "user", "content": "Q"}], "thinking": {"type": "adaptive"}}
+        for eff, want in (("low", "low"), ("medium", "medium"), ("high", "xhigh"), ("max", "xhigh")):
+            notes = []
+            self.assertEqual(self.mk.anthropic_to_chat({**base, "output_config": {"effort": eff}}, notes)["reasoning_effort"],
+                             want)
+            self.assertEqual(notes, [])
+        off = {**base, "output_config": {"effort": "low"}, "thinking": {"type": "disabled"}}
+        self.assertNotIn("reasoning_effort", self.mk.anthropic_to_chat(off, []))
+        notes = []
+        self.assertNotIn("reasoning_effort", self.mk.anthropic_to_chat({**base, "output_config": {"effort": "x"}}, notes))
+        self.assertEqual([k for k, _ in notes], ["anthropic-field-output_config"])
+
+    def test_a_history_tool_call_name_that_is_not_a_string_is_a_400(self) -> None:
+        srv, http_ = self.serve(_ScriptEngine(["ok"]))
+        for name in (5, ["x"], True):
+            call = {"id": "c1", "type": "function", "function": {"name": name, "arguments": "{}"}}
+            body = {"max_tokens": 2, "messages": [{"role": "user", "content": "hi"},
+                                                  {"role": "assistant", "content": "", "tool_calls": [call]},
+                                                  {"role": "tool", "tool_call_id": "c1", "content": "r"}]}
+            status, data = _post(http_.port, "/v1/chat/completions", body)
+            self.assertEqual(status, 400, data)
+            self.assertIn("function name must be a string", json.loads(data)["error"]["message"])
+        self.assertEqual(srv.counters()["requests_failed"], 0)
 
     def test_system_messages_inside_the_conversation(self) -> None:
         # (Claude Code 2.1 sends its reminders as a system message after the first user message)
@@ -380,6 +407,32 @@ class TextPartTests(_HttpCase):
         parts = [{"type": "input_text", "text": p["text"]} for p in self.PARTS]
         self.check("/v1/responses", "/v1/responses/input_tokens",
                    {"max_output_tokens": 2, "input": [{"type": "message", "role": "user", "content": parts}]})
+
+
+class CutCharacterTests(_HttpCase):
+    """a reply cut by max_tokens inside a character whose bytes span tokens (byte-fallback pieces) ends before that
+    character: no U+FFFD for bytes the model never finished"""
+
+    BODY = {"messages": [{"role": "user", "content": "hi"}], "chat_template_kwargs": {"enable_thinking": False}}
+
+    def reply(self, raw, **kw):
+        eng = _ScriptEngine([])
+        eng.pieces = list(raw)
+        srv, http_ = self.serve(eng)
+        srv.template = self.mk.make_template((ROOT / "tests" / "templates" / "qwen38_unsloth.jinja").read_text(encoding="utf-8"))
+        status, data = _post(http_.port, "/v1/chat/completions", {**self.BODY, **kw})
+        self.assertEqual(status, 200, data)
+        if not kw.get("stream"):
+            return json.loads(data)["choices"][0]["message"]["content"]
+        events = [json.loads(ln[6:]) for ln in data.decode().split("\n") if ln.startswith("data: {")]
+        return "".join(e["choices"][0]["delta"].get("content") or "" for e in events if e.get("choices"))
+
+    def test_the_cut_character_is_dropped(self) -> None:
+        for raw, whole in (([b"ok \xf0\x9f", b"\x98\x80 done"], "ok \U0001F600 done"),
+                           ([b"ok \xe2", b"\x82\xac done"], "ok \u20ac done")):
+            self.assertEqual(self.reply(raw, max_tokens=8), whole)
+            for stream in (False, True):
+                self.assertEqual(self.reply(raw, max_tokens=1, stream=stream).rstrip(), "ok", (raw, stream))
 
 
 class ContextOverflowTests(_HttpCase):

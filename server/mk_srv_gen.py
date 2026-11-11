@@ -231,7 +231,8 @@ class GenerateMixin:
             spent()
             log(f"#{rid} the client disconnected after {n_gen:,} generated tok ({secs(time.time() - t1)}): stopped")
             raise ClientGone()
-        for kind, delta in parser.feed(stopper.feed(dec.decode(b"", final=True), final=True), final=True):
+        # (bytes the decoder still holds start a character the reply was cut inside: dropped, not sent as U+FFFD)
+        for kind, delta in parser.feed(stopper.feed("", final=True), final=True):
             emit(kind, delta)
         self.stop_word = stopper.word
         self.reasoning_tokens, self.answer_tokens = phase["thinking"], phase["answer"]
@@ -272,7 +273,8 @@ class GenerateMixin:
         self.count(prompt_tokens=len(toks) - reused, prompt_tokens_reused=reused, prompt_seconds=t1 - t0,
                    tokens_predicted=n_gen, predicted_seconds=t2 - t1)
         usage = {"prompt_tokens": len(toks), "completion_tokens": n_gen, "total_tokens": len(toks) + n_gen,
-                 "prompt_tokens_details": {"cached_tokens": reused}}
+                 "prompt_tokens_details": {"cached_tokens": reused},
+                 "completion_tokens_details": {"reasoning_tokens": phase["thinking"]}}
         timings = {"prompt_n": len(toks) - reused, "prompt_ms": (t1 - t0) * 1e3, "predicted_n": n_gen,
                    "predicted_ms": (t2 - t1) * 1e3, "predicted_per_second": n_gen / max(t2 - t1, 1e-9)}
         return finish, calls, usage, timings

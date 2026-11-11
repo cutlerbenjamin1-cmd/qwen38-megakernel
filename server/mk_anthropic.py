@@ -18,9 +18,12 @@ BILLING_RE = re.compile(r"^(x-anthropic-billing-header:.*?cch=)[^;\s]{5};")
 IGNORED_FIELDS = {
     "output_format": "structured output needs constrained sampling, which the megakernel does not have: the reply is "
                      "not held to the format",
-    "output_config": "its settings (effort, format) are not applied",
+    "output_config": "its format is not applied (its effort is: the chat template's reasoning effort)",
     "context_management": "context editing is not done: the conversation is rendered as sent",
     "container": "the server runs no code-execution container"}
+# output_config.effort (Claude Code's /effort; Claude Code sends high by default) -> the chat template's reasoning_effort,
+# whose levels are low, medium and xhigh (the default)
+EFFORT = {"low": "low", "medium": "medium", "high": "xhigh", "max": "xhigh"}
 
 
 def _anthropic_image(src):
@@ -163,7 +166,9 @@ def anthropic_to_chat(body, notes=None, mid_system=True):
         notes.append(("anthropic-prefill", "an Anthropic request that ends with an assistant message (a prefill) is not "
                       "continued: the message is rendered as a finished turn and the reply starts a new one"))
     for k, why in IGNORED_FIELDS.items():
-        if body.get(k) is not None:
+        v = body.get(k)
+        if v is not None and not (k == "output_config" and isinstance(v, dict) and set(v) <= {"effort"}
+                                  and v.get("effort") in EFFORT):
             notes.append((f"anthropic-field-{k}", f"Anthropic field {k!r} is ignored: {why}"))
     if not mid_system:  # (Claude Code sends its environment and skills list as a system message after the first one)
         for i, m in enumerate(msgs):
@@ -212,6 +217,10 @@ def anthropic_to_chat(body, notes=None, mid_system=True):
     if think is not None and not (isinstance(think, dict) and think.get("type") in ("enabled", "adaptive", "disabled")):
         raise BadRequest("thinking: {\"type\": \"enabled\" | \"adaptive\" | \"disabled\"}")
     kw.setdefault("enable_thinking", bool(think) and think["type"] != "disabled")
+    oc = body.get("output_config")
+    eff = EFFORT.get(oc.get("effort")) if isinstance(oc, dict) else None
+    if eff and kw["enable_thinking"]:  # (chat_template_kwargs' reasoning_effort wins, as on the chat route)
+        out["reasoning_effort"] = eff
     if think and think["type"] != "disabled" and think.get("budget_tokens") is not None:
         notes.append(("anthropic-thinking-budget", "Anthropic thinking.budget_tokens is not enforced: the reasoning ends "
                       "when the model ends it, within max_tokens"))

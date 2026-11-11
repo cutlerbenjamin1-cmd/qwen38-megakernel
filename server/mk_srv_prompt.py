@@ -52,7 +52,12 @@ class PromptMixin:
                                               "none win)")
                 kw["enable_thinking"] = soft
         media, notes = [] if self.vision else None, []
-        ctx = dict(messages=normalize_messages(body.get("messages") or [], media, notes), add_generation_prompt=True)
+        msgs = normalize_messages(body.get("messages") or [], media, notes)
+        if "<|channel|>" not in (getattr(self, "template_src", None) or ""):  # (llama-server's mapping: a template
+            for m in msgs:  # without GPT-OSS's channels has no developer role, so OpenAI's newer name for system is one)
+                if m.get("role") == "developer":
+                    m["role"] = "system"
+        ctx = dict(messages=msgs, add_generation_prompt=True)
         for key, msg in notes:
             self.warn_once(key, msg)
         if body.get("tools"):
@@ -66,6 +71,8 @@ class PromptMixin:
             text = self.template.render(**ctx)
         except jinja2.exceptions.TemplateError as e:
             raise BadRequest(f"chat template: {e}")
+        except Exception as e:  # (the template's own expressions failing on the request's data: a 400, as llama-server)
+            raise BadRequest(f"chat template: {type(e).__name__}: {e}")
         thinking = text.endswith("<think>\n")
         n_img = sum(1 for d in media or [] if not isinstance(d, VideoBytes))
         if n_img > mk_limits.MAX_IMAGES:

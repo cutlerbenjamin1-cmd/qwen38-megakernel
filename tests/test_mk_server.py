@@ -1430,11 +1430,12 @@ class ChatTemplateOptionTests(_HttpCase):
                          "<|im_start|>system\nBe brief.<|im_end|>\n<|im_start|>user\nhi<|im_end|>\n<|im_start|>assistant\n")
 
     def test_requests_the_original_template_refuses_render_under_unsloths(self) -> None:
-        """a fine-tune shipping Qwen's original template: 400s for a developer role, a second system message, a turn with
-        no user query, reasoning_effort high; with --chat-template-file of unsloth's template the same requests render"""
+        """a fine-tune shipping Qwen's original template: 400s for a second system message, a turn with no user query,
+        reasoning_effort high; with --chat-template-file of unsloth's template the same requests render. A developer
+        message is a system message under either (llama-server's mapping for templates without <|channel|>)"""
         user = {"role": "user", "content": "hi"}
+        dev = {"messages": [{"role": "developer", "content": "Be brief."}, user]}
         bodies = {
-            "Unexpected message role": {"messages": [{"role": "developer", "content": "Be brief."}, user]},
             "System message must be at the beginning": {"messages": [{"role": "system", "content": "a"},
                                                                       {"role": "system", "content": "b"}, user]},
             "No user query found": {"messages": [{"role": "system", "content": "s"},
@@ -1448,18 +1449,34 @@ class ChatTemplateOptionTests(_HttpCase):
             status, o = self._post(http_, "/v1/chat/completions", {**body, "max_tokens": 5})
             self.assertEqual(status, 400, why)
             self.assertIn(why, o["error"]["message"])
+        status, o = self._post(http_, "/v1/chat/completions", {**dev, "max_tokens": 5})
+        self.assertEqual(status, 200, o)
+        as_system = {"messages": [{"role": "system", "content": "Be brief."}, user]}
+        self.assertEqual(self._post(http_, "/apply-template", dev)[1]["prompt"],
+                         self._post(http_, "/apply-template", as_system)[1]["prompt"])
         srv, http_ = self._server(self.ORIGINAL, "file", str(TEMPLATES / "qwen38_unsloth.jinja"))
         self.assertEqual(self._props(http_)["chat_template"], self.UNSLOTH)
         for why, body in bodies.items():
             status, o = self._post(http_, "/apply-template", body)
             self.assertEqual(status, 200, why)
             self.assertTrue(o["prompt"].endswith("<|im_start|>assistant\n<think>\n"), why)
-        p = self._post(http_, "/apply-template", bodies["Unexpected message role"])[1]["prompt"]
+        p = self._post(http_, "/apply-template", dev)[1]["prompt"]
         self.assertTrue(p.startswith("<|im_start|>system\n") and "Be brief.<|im_end|>" in p, p)  # (developer = system)
         p = self._post(http_, "/apply-template", bodies["Unexpected reasoning effort high"])[1]["prompt"]
         self.assertIn("Reasoning effort is set to xhigh", p)  # (unsloth's template maps high to xhigh)
         status, o = self._post(http_, "/v1/chat/completions", {**bodies["No user query found"], "max_tokens": 5})
         self.assertEqual(status, 200, o)
+        # (a template with GPT-OSS's channels has a developer role of its own: the message keeps it, as in llama-server)
+        _, http_ = self._server("{# <|channel|> #}{% for m in messages %}<|{{ m.role }}|>{{ m.content }}{% endfor %}")
+        self.assertEqual(self._post(http_, "/apply-template", dev)[1]["prompt"], "<|developer|>Be brief.<|user|>hi")
+
+    def test_a_template_that_fails_on_the_requests_data_is_a_400(self) -> None:
+        # (the template's own Python error, e.g. a value it concatenates of another type: the request's fault, not a 500)
+        _, http_ = self._server("{% if tools %}{{ tools[0] + 1 }}{% endif %}{% for m in messages %}{{ m.content }}{% endfor %}")
+        status, o = self._post(http_, "/v1/chat/completions", {"messages": [{"role": "user", "content": "hi"}],
+                                                                "tools": TOOLS, "max_tokens": 5})
+        self.assertEqual(status, 400, o)
+        self.assertIn("chat template: TypeError", o["error"]["message"])
 
     def test_the_gguf_template_as_a_file_renders_byte_identical_prompts(self) -> None:
         """the GGUF's own template given as a file (written with CRLF line ends, as an extraction on Windows writes it):

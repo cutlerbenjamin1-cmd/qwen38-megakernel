@@ -63,6 +63,8 @@ def normalize_messages(messages, media=None, notes=None):
                     raise BadRequest("messages: each of tool_calls must be an object, with an object as its function")
                 tc = dict(tc)
                 fn = dict(tc.get("function") or {})
+                if fn.get("name") is not None and not isinstance(fn["name"], str):  # (none: the template's own 400)
+                    raise BadRequest("messages: a tool call's function name must be a string")
                 args = given = fn.get("arguments")
                 if isinstance(args, str):
                     try:
