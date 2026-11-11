@@ -138,9 +138,9 @@ class SlotScheduler:
     the tokens of its cycles through its SlotJob. Requests wait for a free slot in arrival order and take the one whose
     sequence shares the most with the prompt, less what that discards of the slot's last prompt (a conversation's next
     turn goes back to its own slot and prefills only its new tokens; an empty slot goes before another conversation's).
-    While slots decode, a waiting prompt is fed in chunks, one per cycle right before their step (mk_slots_step_mixed:
-    the chunk, then the step, separate launches; MK_PF_MIX rows, default 256; MK_PF_MIX=0: MK_PF_CHUNK tokens between
-    the cycles, default 512, 0: the whole prompt), so they keep decoding while a long prompt is read; while none decodes,
+    While slots decode, a waiting prompt is fed in chunks, one per cycle right before their step (a failed chunk fails
+    only its own request: the step is a call of its own; MK_PF_MIX rows, default 256; MK_PF_MIX=0: MK_PF_CHUNK tokens
+    between the cycles, default 512, 0: the whole prompt), so they keep decoding while a long prompt is read; while none decodes,
     MK_PF_SOLO tokens per call (default 0: the whole prompt). With MK_EXACT the chunks change no row (the engine feeds
     every chunk but a prompt's last as batched rows, each ending on the 32-token scan grid: up to 31 tokens off the
     budget; a last chunk of 32 tokens or fewer joins the one before, so the prompt keeps its checkpoint), so a prompt that
@@ -150,7 +150,8 @@ class SlotScheduler:
     With MK_EXACT (exact reuse; --agents sets it), a prompt never reuses the rows a slot decoded: those depend on how many
     drafts each cycle verified, which depends on the slots decoding beside it. A prompt that reaches into the slot's last
     reply first takes the slot back to a checkpoint inside its last prompt (slot_begin with that prompt's tokens), as
-    Server.load_prompt restores a checkpoint with --exact-reuse.
+    Server.load_prompt restores a checkpoint with --exact-reuse (the engine does the same itself under MK_EXACT, so a slot
+    whose bookkeeping a failure cleared stays exact too).
 
     The engine's keep-warm load (MK_KEEP_WARM_S) is armed when the scheduler goes idle and stopped before its next GPU
     work: the slot calls do not stop it themselves."""
@@ -284,7 +285,7 @@ class SlotScheduler:
             self.filling[slot] = job
         for slot in [s for s, j in self.active.items() if j.closed]:
             self._finish(slot)
-        stepped = None  # (slots, their tokens) of this cycle
+        slots = None  # (the slots this cycle steps)
         if self.filling:  # one chunk of the oldest admitted prompt
             slot = next(iter(self.filling))
             job = self.filling[slot]
@@ -297,30 +298,26 @@ class SlotScheduler:
                     self.free.append(slot)
                     self._end(job)
                 else:
-                    if self.active and self.mix > 0:
+                    mixed = self.active and self.mix > 0
+                    if mixed:  # (a slot whose prompt this chunk completes decodes from the next cycle on)
                         slots = sorted(self.active)
-                        out, job.left = eng.slots_step_mixed(slot, self.mix, slots)
-                        stepped = (slots, out)
-                    else:
-                        job.left = eng.slot_prefill(slot, (self.chunk if self.active else self.solo) or 1 << 30)
+                    job.left = eng.slot_prefill(slot, self.mix if mixed else (self.chunk if self.active else self.solo)
+                                                or 1 << 30)
                     if job.left == 0:
                         self._prefilled(slot, job)
-            except Exception as e:
+            except Exception as e:  # (the chunk's own request fails: the decoding slots were not stepped, they go on)
                 self.filling.pop(slot, None)
                 self._fail(slot, job, e)
-                if stepped is None and self.active and self.mix > 0:  # (the cycle failed with it)
-                    for s in sorted(self.active):
-                        self._fail(s, self.active.pop(s), e)
-        if stepped is None:
+        if slots is None:
             if not self.active:
                 return
             slots = sorted(self.active)
-            try:
-                stepped = (slots, eng.slots_step(slots))
-            except Exception as e:
-                for s in slots:
-                    self._fail(s, self.active.pop(s), e)
-                return
+        try:
+            stepped = (slots, eng.slots_step(slots))
+        except Exception as e:
+            for s in slots:
+                self._fail(s, self.active.pop(s), e)
+            return
         self.cycles += 1
         for s, toks in zip(*stepped):
             job = self.active[s]

@@ -592,6 +592,9 @@ int MKEngine::slot_begin(int slot, const std::vector<int> & toks, float temp, fl
         }
         size_t c = 0;
         while (c < I.seq.size() && c < toks.size() && I.seq[c] == toks[c]) c++;
+        // MK_EXACT: the last prompt's last row and every row after it came from the megakernel (they depend on the draft
+        // schedule): a prompt reaching them goes back into the last prompt, as slot_begin(slot, that prompt) first would
+        if (I.exact && !L.prompt.empty() && c >= L.prompt.size()) c = L.prompt.size() - 1;
         if (c < I.seq.size() || c == toks.size()) {
             // back to a position <= c from which at least the prompt's last token is fed: a truncate (emitted tokens past
             // the committed position), else the newest checkpoint there, else from scratch

@@ -36,7 +36,7 @@ struct MKStats {
 
 class MKEngine {
   public:
-    // n_draft: MTP draft tokens per cycle (0..4). ctx: KV-cache capacity in tokens.
+    // n_draft: MTP draft tokens per cycle (0 .. MAXD - 1: 7 in the served build). ctx: KV-cache capacity in tokens.
     // draft_vocab: optional file of int32 token ids; the MTP draft head is restricted to them.
     // kv_mode: KV cache format, 0 fp16, 1 q8_0 (half the memory, ~1-2% slower), -1 auto (q8_0 only
     // when the fp16 cache for ctx positions does not fit in the free GPU memory).
@@ -215,14 +215,13 @@ class MKEngine {
     // last chunk saves a checkpoint before its last token (a repeat of the prompt resumes there). MK_EXACT: a chunk
     // before the last ends on the 32-token scan grid and a last chunk of 32 tokens or fewer joins the one before (a
     // budget of 32 or more: chunks within 32 tokens of it); the checkpoint is the grid point at or before the last token.
-    // MK_EXACT follow-ups: a prompt that keeps the slot's reply up to its committed position (last prompt + reply + new
-    // turn) reuses the reply's decoded rows (a truncate, or no rewind when it extends the whole sequence), whose bits
-    // depend on the draft schedule, and prefills from off the grid: not exact (warned once per engine). For a bit-exact
-    // follow-up whose prompt starts with the slot's last prompt, first call slot_begin(slot, that last prompt), which
-    // takes the slot back to its newest checkpoint inside it (else empties it), then slot_begin(slot, prompt), as
-    // mk_server's --agents scheduler does. slots_step: one step of the given slots (two or more: one batched launch, each
-    // slot up to 1 + MAXT / n - 1 tokens), the tokens each emitted (a slot's first call after its prefill: the prefill's
-    // token only; empty: its context is full).
+    // MK_EXACT follow-ups: a prompt that reaches the last token of the slot's last prompt (last prompt + reply + new turn,
+    // or that prompt again) reuses none of the rows from there on (the megakernel's, whose bits depend on the draft
+    // schedule): the slot goes back to its newest checkpoint inside the last prompt (else empties it) and prefills the
+    // rest, so the reply is the one a fresh slot gives (calling slot_begin(slot, that last prompt) first, as mk_server's
+    // --agents scheduler does, changes nothing). slots_step: one step of the given slots (two or more: one batched
+    // launch, each slot up to 1 + MAXT / n - 1 tokens), the tokens each emitted (a slot's first call after its prefill:
+    // the prefill's token only; empty: its context is full).
     // slots_step_mixed: pslot's next prompt chunk, then slots_step (a failed chunk steps nothing: no token is lost).
     // Every slot call leaves the engine's own sequence current again. An MKCudaError fails the slots the call ran on:
     // slot_prefill / slots_step refuse them (std::runtime_error) until slot_begin, which starts them from scratch

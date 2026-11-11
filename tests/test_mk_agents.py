@@ -45,7 +45,7 @@ class _SlotEngine:
         self.ctx, self.delay, self.prefill_delay = ctx, delay, prefill_delay
         self.seqs, self.pend, self.first, self.script, self.plen, self.sp = {}, {}, {}, {}, {}, {}
         self.calls, self.warm, self.threads = [], [], set()
-        self.max_batch, self.fail_steps = 0, 0
+        self.max_batch, self.fail_steps, self.fail_feeds = 0, 0, 0
         self._busy = threading.Lock()
         self.overlap = False
 
@@ -110,6 +110,9 @@ class _SlotEngine:
     def slot_prefill(self, slot, budget):
         self._enter()
         try:
+            if self.fail_feeds and budget > 0:
+                self.fail_feeds -= 1
+                raise RuntimeError("prefill: out of memory (test)")
             return self._feed(slot, budget)
         finally:
             self._busy.release()
@@ -142,15 +145,6 @@ class _SlotEngine:
         self._enter()
         try:
             return self._step(slots)
-        finally:
-            self._busy.release()
-
-    def slots_step_mixed(self, pslot, budget, slots):
-        self._enter()
-        try:
-            out = self._step(slots)
-            self.calls.append(("mixed", pslot, budget))
-            return out, self._feed(pslot, budget)
         finally:
             self._busy.release()
 
@@ -304,8 +298,8 @@ class AgentsTests(unittest.TestCase):
         self.idle(srv)
 
     def test_arrival_mid_decode(self) -> None:
-        """a request arriving while another decodes: its prompt rides along with the other's cycles (slots_step_mixed),
-        both replies as alone"""
+        """a request arriving while another decodes: its prompt rides along with the other's cycles (a chunk right before
+        each step), both replies as alone"""
         eng = _SlotEngine(delay=0.003)
         srv, http_ = self.serve(eng)
         srv.sched.mix = 64
@@ -323,9 +317,31 @@ class AgentsTests(unittest.TestCase):
         out[1] = _reply_of(b[0], b[1], *http_.post(b[1]))
         ta.join(30)
         self.assertEqual(out, ref)
-        mixed = [c for c in eng.calls if c[0] == "mixed"]
-        self.assertGreater(len(mixed), 5)  # (B's ~2,450-token prompt in 64-row chunks beside A's cycles)
-        self.assertTrue(all(c[2] == 64 for c in mixed))
+        fed = [i for i, c in enumerate(eng.calls) if c[0] == "prefill" and c[2] == 64]
+        self.assertGreater(len(fed), 5)  # (B's ~2,450-token prompt in 64-row chunks beside A's cycles)
+        self.assertTrue(all(eng.calls[i + 1][0] == "step" for i in fed))
+        self.idle(srv)
+
+    def test_a_failed_chunk_fails_its_own_request_only(self) -> None:
+        """a prompt chunk that fails while another request decodes (the engine stepped nothing with it): that request
+        gets the error, the decoding one goes on and answers as alone"""
+        eng = _SlotEngine(delay=0.003)
+        srv, http_ = self.serve(eng)
+        srv.sched.mix = 64
+        a = ("/v1/chat/completions", _chat("a long story", stream=True))
+        ref = self.alone(self.serve(_SlotEngine())[1], [a])
+        out = [None]
+        ta = threading.Thread(target=lambda: out.__setitem__(0, _reply_of(a[0], a[1], *http_.post(a[1]))))
+        eng.calls.clear()
+        ta.start()
+        t0 = time.time()
+        while sum(1 for c in eng.calls if c[0] == "step") < 20:  # (A decodes)
+            self.assertLess(time.time() - t0, 10)
+            time.sleep(0.005)
+        eng.fail_feeds = 1
+        self.assertEqual(http_.post(_chat("summarise: " + "lorem ipsum " * 200))[0], 500)
+        ta.join(30)
+        self.assertEqual(out, ref)
         self.idle(srv)
 
     def test_prompt_feeding_settings(self) -> None:
@@ -349,7 +365,7 @@ class AgentsTests(unittest.TestCase):
         n0 = len(eng.calls)
         self.assertEqual(http_.post(b)[0], 200)
         ta.join(30)
-        fed = [c for c in eng.calls[n0:] if c[0] in ("prefill", "mixed")]
+        fed = [c for c in eng.calls[n0:] if c[0] == "prefill"]
         self.assertEqual(fed, [("prefill", fed[0][1], len(srv.render(b)[0]))])  # (one call: the whole prompt)
         with unittest.mock.patch.dict("os.environ", {"MK_PF_MIX": "128", "MK_PF_SOLO": "1024"}):
             s = self.mk.SlotScheduler(_SlotEngine(), 2, 4096)

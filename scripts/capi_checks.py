@@ -308,7 +308,7 @@ def case_slot_ck(L):
     text = reuse_text(20)
     buf = (ctypes.c_int * 4096)()
     n = L.mk_tokenize(h, text, len(text), buf, 4096)
-    ok = check(n >= 100, f"the prompt has {n} >= 100 tokens", L)
+    ok = check(n >= 140, f"the text has {n} >= 140 tokens", L)
     toks = (ctypes.c_int * 100)(*buf[:100])
     ok &= check(L.mk_slots_open2(h, 2, 4096, 0) > 0, "slots_open 2 x 4096", L)
     ok &= check(L.mk_slot_begin2(h, 0, toks, 100, 0.0, 1.0, 20, 0.0, 1, 0, 0) == 0, "slot 0: begin 100 tokens", L)
@@ -321,6 +321,19 @@ def case_slot_ck(L):
     for s in (0, 1):
         r = L.mk_slot_begin2(h, s, toks, 100, 0.0, 1.0, 20, 0.0, 1, 0, 0)
         ok &= check(r == 96, f"slot {s}: the prompt again resumes at its checkpoint at 96 (reused {r})", L)
+    # a follow-up holding everything slot 0 decoded (its last prompt + reply + a new turn), sent with no slot_begin of the
+    # last prompt first: the engine goes back to the checkpoint inside that prompt itself (it used to keep the reply's
+    # decoded rows), so the reply is the one of a slot that prefills the follow-up from scratch
+    ok &= check(L.mk_slot_prefill(h, 0, 1 << 30) == 0 and slot_ids(L, h, 0, 16) is not None, "slot 0: 16 more tokens", L)
+    fu = slot_seq(L, h, 0) + list(buf[100:140])
+    fa = (ctypes.c_int * len(fu))(*fu)
+    r = L.mk_slot_begin2(h, 0, fa, len(fu), 0.0, 1.0, 20, 0.0, 1, 0, 0)
+    ok &= check(r == 96, f"slot 0: the follow-up resumes at 96, inside its last prompt (reused {r} of {len(fu)})", L)
+    ok &= check(L.mk_slot_prefill(h, 0, 1 << 30) == 0, "slot 0: the follow-up prefilled", L)
+    other = (ctypes.c_int * 50)(*buf[50:100])
+    ok &= check(begin(L, h, 1, other, 50) and begin(L, h, 1, fa, len(fu)), "slot 1: another prompt, then the follow-up", L)
+    got = [slot_ids(L, h, s, 16) for s in (0, 1)]
+    ok &= check(got[0] is not None and got[0] == got[1], f"follow-up: the same 16 greedy ids as from scratch ({got[0]} / {got[1]})", L)
     L.mk_free(h)
     return ok
 

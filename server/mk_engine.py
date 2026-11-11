@@ -115,14 +115,12 @@ class Engine:
             L.mk_ck_pin.restype, L.mk_ck_pin.argtypes = ctypes.c_int, [vp, ip, ctypes.c_int]
             L.mk_ck_pinned.restype, L.mk_ck_pinned.argtypes = ctypes.c_int, [vp, ip, ctypes.c_int]
         # parallel slots (--agents: SlotScheduler; open-jet's slot API, MKEngine::slots_open; libraries before them: none)
-        self.slots = all(hasattr(L, n) for n in ("mk_slots_open2", "mk_slot_begin2", "mk_slot_prefill", "mk_slots_step",
-                                                 "mk_slots_step_mixed"))
+        self.slots = all(hasattr(L, n) for n in ("mk_slots_open2", "mk_slot_begin2", "mk_slot_prefill", "mk_slots_step"))
         if self.slots:
             ci, cf = ctypes.c_int, ctypes.c_float
             for name, args in (("mk_slots_open2", [vp, ci, ci, ci]),
                                ("mk_slot_begin2", [vp, ci, ip, ci, cf, cf, ci, cf, ctypes.c_ulonglong, ci, ci]),
-                               ("mk_slot_prefill", [vp, ci, ci]), ("mk_slots_step", [vp, ip, ci, ip, ci, ip]),
-                               ("mk_slots_step_mixed", [vp, ci, ci, ip, ci, ip, ci, ip, ip])):
+                               ("mk_slot_prefill", [vp, ci, ci]), ("mk_slots_step", [vp, ip, ci, ip, ci, ip])):
                 f = getattr(L, name)
                 f.restype, f.argtypes = ci, args
         self.n_vocab = 0  # (libraries before mk_n_vocab: unknown)
@@ -460,13 +458,3 @@ class Engine:
         if self.L.mk_slots_step(self.h, sa, n, out, self.SLOT_PER, cnt) < 0:
             raise self._err("decode")
         return self._slot_tokens(n, out, cnt)
-
-    def slots_step_mixed(self, pslot, budget, slots):
-        """slots_step after the next `budget` tokens of slot pslot's prompt (a launch of their own, first): (the slots'
-        tokens, the prompt tokens left)"""
-        n = len(slots)
-        sa, out, cnt = (ctypes.c_int * n)(*slots), (ctypes.c_int * (n * self.SLOT_PER))(), (ctypes.c_int * n)()
-        rem = ctypes.c_int()
-        if self.L.mk_slots_step_mixed(self.h, pslot, budget, sa, n, out, self.SLOT_PER, cnt, ctypes.byref(rem)) < 0:
-            raise self._err("decode")
-        return self._slot_tokens(n, out, cnt), rem.value
