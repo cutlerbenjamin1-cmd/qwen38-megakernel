@@ -265,7 +265,7 @@ limits in [SERVER.md](SERVER.md#limits).
 | `--no-mtp` | `MK_NO_MTP=1` (engine) | off | no MTP layer: plain decoding at depth 0, no MTP weights or KV slot | drafts only |
 | `--lib` | - | `libqwen38mk.so` / `qwen38mk.dll` in the repo root | the engine library | - |
 | `--kv` | - | `auto` (launchers `q8`) | KV cache format: `f16`, `q8` (q8_0), `auto` (q8_0 when fp16 does not fit next to ~1.5 GB of working memory, or when `MK_KV` is set; with `--agents` q8_0, which the slots need) | changes (f16 vs q8_0) |
-| `--agents N` | `MK_AGENTS` | `0`: one request at a time | up to N requests (1-4) at once, each in a parallel slot of the engine with its own context (`-c`, at most the model's context length, 262,144), decoded together in one batched launch per cycle; images, video and the presence / frequency penalties get a 400, side requests, parking and pinned checkpoints are off ([SERVER.md](SERVER.md#several-agents-at-once---agents)) | greedy: the reply alone, bit for bit (a prompt fed in chunks beside other slots: see `MK_PF_MIX`); sampled: the same distribution, not the same tokens beside other requests |
+| `--agents N` | `MK_AGENTS` | `0`: one request at a time | up to N requests (1-4) at once, each in a parallel slot of the engine with its own context (`-c`, at most the model's context length, 262,144), decoded together in one batched launch per cycle; images, video and the presence / frequency penalties get a 400, side requests, parking and pinned checkpoints are off ([SERVER.md](SERVER.md#several-agents-at-once---agents)) | greedy: the reply alone, bit for bit (a prompt fed in chunks beside other slots: see `MK_PF_MIX`; beside a sampled request, rarely not: two logits one float step apart can tie after the norm scale, [SERVER.md](SERVER.md#several-agents-at-once---agents)); sampled: the same distribution, not the same tokens beside other requests |
 | `--parallel N`, `-np N` | - | `0` | `--agents N` with `-c` defaulting to 32,768 per slot (llama-server's and open-jet's option) | as `--agents` |
 | `--ck-every N` | - | `4096` | a DeltaNet checkpoint every N prompt tokens (0: off); the pool has `MK_CK_SLOTS` slots | same with exact reuse |
 | `--ck-msgs` | - | `1` | a checkpoint at each message start (1 / 0) | same with exact reuse |
@@ -521,7 +521,7 @@ it.
 | `MK_Q32N` | `1` | `1` | resid_wv / resid_ck_last's K2 combine: a batch's `q32_store` chains interleaved (`q32_store_n`) instead of one token after another; `0`: the earlier order | same | served |
 | `MK_FORMAL_SYNC` | `1` | `1` | the PTX memory model's fences and `__syncwarp`s at three hand-offs: lm_head's last-block ticket, the softmax groups' partials, resid's last arrival. `0`: the earlier code, which relied on the hardware's ordering there | same | served |
 | `MK_FFNA` | `7` | `7` | bits for the wv phase tops: 1 a per-block dealing table (`cDeal`, checked against the device formulas at load: the log says so) and ffn_gu_wv's packed loop word, 2 the ssq loads first, 4 the meta-first fill, 8 the table's dealing for dn_proj_wv / attn_proj_wv too (off: their T = 8 instances spilled) | same | served |
-| `MK_WVREMAT` | `1` | `1` | needs `MK_FFNA` bit 1: dn_proj_wv / attn_proj_wv take the layer index and rebuild their loop state after each tile call, so only a packed word stays live across it, however ptxas allocates the rest | same | served |
+| `MK_WVREMAT` | `1` | `1` | needs `MK_FFNA` bit 1 or 8 (its dealing table): dn_proj_wv / attn_proj_wv take the layer index and rebuild their loop state after each tile call, so only a packed word stays live across it, however ptxas allocates the rest | same | served |
 | `MK_W48Z` | `1` | `1` | preset D / F decode attention at T = 8 (`attn_core_w48m`): the accumulator tile its S warps never read is re-zeroed and the next k-step's Q loads issue ahead of this one's MMAs | same | served |
 | `MK_K6X` | `1` | `1` | preset D at T = 8: the 6-bit K expansion runs on the P V warps | same | served |
 | `MK_LMH8` | `1` | `1` | lm_head at T = 8: the pen drafts staged in shared memory and loaded per row pair, so their addresses are not spilled across the row loop | same | served |
@@ -618,7 +618,9 @@ A `--state-dir` file is keyed by the binary, the GPU (name, compute capability, 
 the KV formats, the prompt, and every `MK_*` variable in the environment except those that only change decode,
 logging, timing or the load path: names starting with `MK_STATE`, `MK_POLICY`, `MK_PROFILE`, `MK_SPEC_LOG`,
 `MK_MEMLOG`, `MK_LOADLOG`, `MK_LOAD_`, `MK_WDIGEST`, `MK_WATCHDOG`, `MK_CK_SLOTS`, `MK_BENCH`, `MK_STACK_LIMIT`,
-`MK_RESERVE_EARLY`, `MK_VRAM_`, `MK_GSB`, and `MK_K1`, `MK_K2`, `MK_K6`. Any other change saves a new file instead of restoring a stale one.
+`MK_RESERVE_EARLY`, `MK_VRAM_`, `MK_GSB`, `MK_PF_PROFILE`, `MK_PF_GAPS`, `MK_PF_SYNC`, `MK_CK_DEVICE`, `MK_STORE_`,
+`MK_SLOT_RESERVE`, `MK_CUDAMALLOC`, and `MK_K1`, `MK_K2`, `MK_K6`. Any other change saves a new file instead of restoring a
+stale one.
 
 ## Tools and benchmarks
 
@@ -728,5 +730,5 @@ a longer one that replaced a conversation with tools, of that conversation (a sh
 back); a conversation parked with low priority evicts only side conversations and other low-priority ones (it is not
 parked when they do not make room), except the conversation a request without tools has just replaced; a shared prefix
 shorter than 1024 tokens is not pinned. A Responses API stream sends a progress event every 10 s during a long
-prefill; a stream's write that makes no progress for 60 s ends the request (its client counts as gone); browsers may
+prefill; a reply's write that makes no progress for 60 s ends the request (its client counts as gone); browsers may
 keep a CORS preflight's answer for 86400 s.

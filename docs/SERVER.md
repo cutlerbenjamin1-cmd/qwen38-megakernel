@@ -432,7 +432,9 @@ MK_AGENTS=4 scripts/serve.sh 8080 0                                        # the
   does not fit its slot gets the usual 400. The KV cache is q8_0 (`--kv f16` is refused at startup); the presets
   (`MK_KV`, `MK_KV_WIN`) apply to every slot.
 - **The same replies:** a greedy reply is the one the request gets when it runs alone on the server, bit for bit,
-  whatever runs beside it, its follow-up turns included. Each slot decodes as it decodes
+  whatever runs beside it, its follow-up turns included (one exception, rare: beside a sampled request, a greedy one
+  picks among its top candidates after the final norm scale, so two logits within one float step of each other can
+  tie there and pick the smaller token id, where alone it compares them unscaled). Each slot decodes as it decodes
   alone, and `--agents` turns on `MK_EXACT` (unless it is set), so a prompt never reuses the rows a slot decoded (their
   bits depend on how many drafts each cycle verified, which depends on the slots beside it): a follow-up that reaches
   into its last reply resumes at a checkpoint inside its last prompt, as with
@@ -517,7 +519,10 @@ share the cache, side requests and parking, and a greedy reply through `/v1/mess
 OpenAI `tools`, `chat_template_kwargs` and the controls in [Request features](#request-features). The reasoning comes
 back as `reasoning_content` (streamed too), Qwen's XML tool calls as structured `tool_calls`. `max_tokens`,
 `max_completion_tokens` and llama-server's `n_predict` all set the reply's limit; without one, the reply runs to its end
-or to the context's.
+or to the context's. A `developer` message (OpenAI's newer name for a system message) is a `system` message for every
+template without GPT-OSS's `<|channel|>`, as llama-server maps it. `usage` reports
+`completion_tokens_details.reasoning_tokens`. A reply cut by its limit inside a character whose bytes span tokens ends
+before that character.
 
 ### Anthropic Messages API
 
@@ -545,9 +550,12 @@ them; the request is translated to a chat request, as llama-server does.
   reach `/v1/messages` ([Thinking](#thinking)). Earlier turns' thinking blocks that a client sends back (Claude Code
   does) stay in the prompt: Qwen3.8's template keeps them unless `preserve_thinking` is false
   (`--chat-template-kwargs '{"preserve_thinking": false}'` drops those before the last user message).
-- **Fields the server does not act on:** `output_format`, `output_config`, `context_management` and `container` are
-  accepted with a one-time console warning (clients send some of them on every request): a structured-output request
-  gets plain text here, where `response_format` on the chat route is a 400.
+- **Effort:** `output_config.effort` (Claude Code's `/effort`) sets the template's reasoning effort while thinking is
+  on: `low` and `medium` as named, `high` (what Claude Code sends by default) and `max` as `xhigh`, the template's
+  default, so a default session's prompt is the one it gets without the field. `chat_template_kwargs` win.
+- **Fields the server does not act on:** `output_format`, `output_config`'s format, `context_management` and
+  `container` are accepted with a one-time console warning (clients send some of them on every request): a
+  structured-output request gets plain text here, where `response_format` on the chat route is a 400.
 - **Replies:** content blocks `thinking` (with an empty signature), `text` and `tool_use` (parsed `input`);
   `stop_reason` `end_turn`, `max_tokens`, `stop_sequence` (with `stop_sequence`) or `tool_use`; `usage` with
   `input_tokens` (prefilled), `cache_read_input_tokens` (reused from the cache) and `output_tokens`.
@@ -708,9 +716,9 @@ them) or `--chat-template TEMPLATE` (the Jinja source itself, or `chatml`) repla
 requests, `/apply-template`, token counts and `/props` `chat_template`; the last of the two options given wins
 (`MK_CHAT_TEMPLATE_FILE` in the launchers). The server does not start (it exits before it opens the port) when the file
 cannot be read, the template does not compile, or it fails on a short conversation (system, user, assistant, user).
-Use: a fine-tune of the same model whose GGUF ships Qwen's original template, which answers a `developer` message, a
-second system message, a turn without a user query or `reasoning_effort` "high" with a 400; Unsloth's template (the one
-in its Qwen3.8-27B GGUFs) takes all four.
+Use: a fine-tune of the same model whose GGUF ships Qwen's original template, which answers a second system message, a
+turn without a user query or `reasoning_effort` "high" with a 400; Unsloth's template (the one in its Qwen3.8-27B
+GGUFs) takes all three. (A `developer` message is a system message under any template without `<|channel|>`.)
 
 ### Images
 
@@ -898,16 +906,16 @@ the rest:
   M = C - 17) with the same two fields; on `/v1/responses`, OpenAI's `invalid_request_error` with code
   `context_length_exceeded` and the two fields. Streams get it as the status, before the stream starts.
 - **Disconnects:** before the prefill and before each decode cycle the server checks whether the client closed its
-  connection, and stops. A stream whose client stops reading counts as a disconnect once a write has made no progress
-  for 60 s ([Limits](#limits)). During the prefill a watcher thread checks every 50 ms and asks the engine to stop at
-  its next prefill chunk (a host flag read between chunks of 2,048 tokens, no device sync); the chunk running and the
-  one queued behind it finish, so the engine is free 1-2 chunks later. Nothing of a stopped prefill counts: the engine
-  drops the checkpoints it saved and goes back to the last checkpoint from before it (or resets), with the draft
-  vocabulary as it was at that position, so the next request answers as on a server that never saw it. A client that
-  leaves during decoding leaves what was generated in the cache, as after a reply cut by `max_tokens`, and the next
-  request reuses or rewinds it as usual. A disconnect during a side request brings the kept conversation back like a
-  finished one. (On Windows an aborted client connection raises a different error than on Linux; both are counted as
-  disconnects.)
+  connection, and stops. A client that stops reading its reply (streamed or not) counts as a disconnect once a write has
+  made no progress for 60 s ([Limits](#limits)). During the prefill a watcher thread checks every 50 ms and asks the
+  engine to stop at its next prefill chunk (a host flag read between chunks of 2,048 tokens, no device sync); the chunk
+  running and the one queued behind it finish, so the engine is free 1-2 chunks later. Nothing of a stopped prefill
+  counts: the engine drops the checkpoints it saved and goes back to the last checkpoint from before it (or resets),
+  with the draft vocabulary as it was at that position, so the next request answers as on a server that never saw it. A
+  client that leaves during decoding leaves what was generated in the cache, as after a reply cut by `max_tokens`, and
+  the next request reuses or rewinds it as usual. A disconnect during a side request brings the kept conversation back
+  like a finished one. (On Windows an aborted client connection raises a different error than on Linux; both are counted
+  as disconnects.)
 - **Closing:** when the server ends a connection while the client may still be sending (a 400 / 411 / 413 for a body it
   does not read), it shuts down its write side, then reads and drops what the client still sends (at most 1 GiB and
   30 s, 5 s without data, as nginx's lingering close) before closing. Closing with unread data makes the kernel send a
@@ -979,7 +987,7 @@ Read from the environment at startup ([CONFIGURATION.md](CONFIGURATION.md)):
 | request body, `MK_MAX_BODY_MB` | 128 MB | 413, refused before the body is read (also on `Expect: 100-continue`) |
 | request bodies in memory at once, all connections, `MK_MAX_INFLIGHT_MB` | 256 MB (at least `MK_MAX_BODY_MB`) | 503 with `Retry-After`, and the connection closes |
 | a connection's read or write without progress, `MK_TIMEOUT_S` | 600 s (llama-server's `--timeout`; 0: none) | the connection closes: an idle keep-alive one, a stalled request, or a client that stopped reading a reply (a disconnect: the generation stops) |
-| a stream's write without progress (fixed) | 60 s, or `MK_TIMEOUT_S` when that is shorter and not 0 | the client counts as gone, as after a disconnect: the generation stops and the engine is free for the requests waiting for it |
+| a reply's write without progress, streamed or not (fixed) | 60 s, or `MK_TIMEOUT_S` when that is shorter and not 0 | the client counts as gone, as after a disconnect: the generation stops and the engine is free for the requests waiting for it |
 | a request's arrival, first byte to the last of its body, `MK_REQUEST_TIMEOUT_S` | 300 s (0: none) | the connection closes. A client sending a byte at a time never hits `MK_TIMEOUT_S`, but hits this; generating the reply does not count |
 | open connections, `MK_MAX_CONNECTIONS` | 256 | 503 with `Retry-After` as the connection is accepted, and it closes |
 | images per request, `MK_MAX_IMAGES` | 32 | 400 |

@@ -70,6 +70,8 @@ claude --exclude-dynamic-system-prompt-sections
   path; with these two the system prompt is the same in every directory, and a new session reuses its ~9k tokens of
   system prompt and tools (9,024 of 11,809 tokens instead of 8,288 of 11,850 with the defaults; measured in
   [SERVER.md](SERVER.md#new-sessions-pinned-prefix-checkpoints)).
+- **Effort:** `/effort low` and `/effort medium` set the template's reasoning effort; `high` (the default) and `max`
+  are its highest, `xhigh`.
 - **Side requests:** in `claude -p` runs Claude Code sent no title or other small requests. Subagents (the Agent tool)
   are conversations of their own, with tools: each is parked like any conversation, and the main one comes back from
   host memory when the subagent is done. `/compact` is one request that continues the session. The Read tool counts a
