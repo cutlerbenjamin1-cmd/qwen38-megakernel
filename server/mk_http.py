@@ -85,7 +85,7 @@ def make_handler(srv):
                 self.send_header("Connection", "close")
                 self.close_connection = True
             self.end_headers()
-            self.wfile.write(data)
+            self._timed_write(data)
 
         def _body_length(self):
             """(the request body's length, or "chunked", None), or (None, (status, message)) when it is not acceptable:
@@ -196,7 +196,7 @@ def make_handler(srv):
             for k, v in headers:
                 self.send_header(k, v)
             self.end_headers()
-            self.wfile.write(data)
+            self._timed_write(data)
 
         def do_GET(self):
             path, _, query = self.path.partition("?")
@@ -444,22 +444,26 @@ def make_handler(srv):
                 self.send_header("Transfer-Encoding", "chunked")
             self.end_headers()
 
-        STREAM_PIECE = 1 << 16  # (a stream's data goes out this much at a time: each piece has STREAM_WRITE_S)
+        WRITE_PIECE = 1 << 16  # (a reply's body goes out this much at a time: each piece has STREAM_WRITE_S)
 
-        def _stream_send(self, data, last=False):
-            """one piece of an event stream's body (_stream_head's framing); last: then the end of the body. A write that
-            makes no progress for mk_limits.STREAM_WRITE_S times out (TimeoutError: the client is gone, as after a
-            reset), whatever MK_TIMEOUT_S is: that stays the limit of the connection's other reads and writes"""
-            if self.request_version != "HTTP/1.0":
-                data = b"%x\r\n" % len(data) + data + (b"\r\n0\r\n\r\n" if last else b"\r\n")
+        def _timed_write(self, data):
+            """a reply's body (streamed or not: either is written while its request holds the engine). A write that makes
+            no progress for mk_limits.STREAM_WRITE_S times out (TimeoutError: the client is gone, as after a reset),
+            whatever MK_TIMEOUT_S is: that stays the limit of the connection's other reads and writes"""
             sock, view = self.connection, memoryview(data)
             idle = sock.gettimeout()
             sock.settimeout(mk_limits.STREAM_WRITE_S if idle is None else min(idle, mk_limits.STREAM_WRITE_S))
             try:  # (a write's timeout counts from its start: a large one goes out in pieces, each one timed)
-                for i in range(0, len(view), self.STREAM_PIECE):
-                    self.wfile.write(view[i:i + self.STREAM_PIECE])
+                for i in range(0, len(view), self.WRITE_PIECE):
+                    self.wfile.write(view[i:i + self.WRITE_PIECE])
             finally:
                 sock.settimeout(idle)
+
+        def _stream_send(self, data, last=False):
+            """one piece of an event stream's body (_stream_head's framing); last: then the end of the body"""
+            if self.request_version != "HTTP/1.0":
+                data = b"%x\r\n" % len(data) + data + (b"\r\n0\r\n\r\n" if last else b"\r\n")
+            self._timed_write(data)
             self.wfile.flush()
 
         def _anthropic_stream(self, chat, model):
@@ -771,8 +775,8 @@ def make_handler(srv):
             per_token = bool(body.get("timings_per_token"))  # (llama-server's: the timings so far in every chunk)
 
             def emit(kind, text):
-                head()
                 try:
+                    head()
                     chunk({"tool_calls": [text]} if kind == "tool_call" else
                           {"reasoning_content": text} if kind == "reasoning" else {"content": text},
                           timings=srv.timings_now() if per_token else None)

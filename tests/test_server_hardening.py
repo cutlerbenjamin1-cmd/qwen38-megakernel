@@ -436,6 +436,23 @@ class ConnectionTests(_GateCase):
             self.assertLess(eng.cycles, 150, "it generated the whole reply")
             self.assertEqual(http_.post({"messages": [{"role": "user", "content": "next"}], "max_tokens": 2})[0], 200)
 
+    def test_a_reply_its_client_stopped_reading_ends_after_the_write_timeout(self) -> None:
+        # (the non-streamed reply is written while the request holds the engine, as a stream is)
+        eng = base._ScriptEngine(["y" * (1 << 18)] * 40)  # (a 10 MB reply: the socket buffers fill)
+        srv, http_ = self.serve(eng, 1024)
+        body = {"messages": [{"role": "user", "content": "long"}]}
+        with mock.patch.object(self.mk, "STREAM_WRITE_S", 0.5):
+            s = socket.socket()
+            self.addCleanup(s.close)
+            s.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 4096)
+            s.connect(("127.0.0.1", http_.port))
+            s.sendall(base._request(body))  # (and nothing read)
+            t0 = time.monotonic()
+            while srv.counters()["requests_cancelled"] == 0:
+                self.assertLess(time.monotonic() - t0, 20, "the stalled reply still holds the engine")
+                time.sleep(0.05)
+            self.assertEqual(http_.post({"messages": [{"role": "user", "content": "next"}], "max_tokens": 2})[0], 200)
+
 
 class SurrogateTests(_GateCase):
     """a lone UTF-16 surrogate in a request body (json.loads takes a \\udcff escape and its raw UTF-8 bytes; JS clients
