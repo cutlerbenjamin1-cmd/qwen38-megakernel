@@ -2,7 +2,7 @@
 
 **Qwen3.8-27B on a single 24 GB GPU, decoding 1.8-2x faster than llama.cpp.**
 
-A CUDA engine and server built for one model. On an RTX 3090 it decodes 166 tok/s on short prompts and 116 tok/s with
+A CUDA engine and server built for one model. On an RTX 3090 it decodes 169 tok/s on short prompts and 118 tok/s with
 100k tokens of context, and fits the model's full 262k context on the card: older K / V drop to 5-6 bits (K
 Hadamard-rotated in preset F) while the newest 2,048 positions stay in a q8_0 ring, where attention puts most of its
 weight. It speaks the OpenAI, Anthropic and OpenAI Responses APIs, so coding agents and chat UIs connect to it
@@ -21,25 +21,26 @@ Built on the megakernel from [open-jet](https://github.com/L-Forster/open-jet) b
 ## Speed
 
 Against llama.cpp's `llama-server` (b12024, tuned, q8_0 KV cache, at 4 MTP drafts, its fastest setting), same session,
-same client, prompts and model file. RTX 3090, unsloth's UD-Q4_K_XL, 120k context, release v2026.11.05 at its default 7
+same client, prompts and model file. RTX 3090, unsloth's UD-Q4_K_XL, 120k context, release v2026.11.11 at its default 7
 drafts, with the q8_0 KV cache and with [preset F](#the-full-262k-context-on-24-gb).
 
 | | llama.cpp | qwen38-megakernel, q8_0 | qwen38-megakernel, preset F |
 |---|---|---|---|
-| greedy decode, short prompts | 87.7 tok/s | **166.5 tok/s** (1.9x) | **160.7 tok/s** (1.8x) |
-| sampled decode, thinking on | 73.2 tok/s | **146.9 tok/s** (2.0x) | **147.4 tok/s** (2.0x) |
-| decode at 38k context | 66.2 tok/s | **127.8 tok/s** (1.9x) | **111.3 tok/s** (1.7x) |
-| decode at 101.6k context | 55.2 tok/s | **116.4 tok/s** (2.1x) | **123.2 tok/s** (2.2x) |
-| read a 101.6k-token prompt | 95.6 s | **68.5 s** (1.4x) | **70.7 s** (1.4x) |
-| first token, short prompt | 117 ms | **61 ms** (1.9x) | **61 ms** (1.9x) |
-| edit an earlier message in an 11.7k-token chat | 302 ms | **69 ms** (4.4x) | **71 ms** (4.3x) |
-| 282 benchmark questions (GSM8K, MMLU-Pro, ARC-C, MATH-500, HumanEval, NIAH, LongBench v2) | 229 right, 2,534 s | **230 right, 1,563 s** (1.6x) | **229 right, 1,596 s** (1.6x) |
-| VRAM, idle at 120k context | 22.9 GiB | **21.2 GiB** | **19.8 GiB** |
+| greedy decode, short prompts | 87.2 tok/s | **168.7 tok/s** (1.9x) | **162.9 tok/s** (1.9x) |
+| sampled decode, thinking on | 73.2 tok/s | **148.8 tok/s** (2.0x) | **149.1 tok/s** (2.0x) |
+| decode at 38k context | 66.1 tok/s | **129.3 tok/s** (2.0x) | **112.8 tok/s** (1.7x) |
+| decode at 101.6k context | 55.2 tok/s | **117.5 tok/s** (2.1x) | **124.8 tok/s** (2.3x) |
+| read a 101.6k-token prompt | 95.6 s | **67.4 s** (1.4x) | **69.8 s** (1.4x) |
+| first token, short prompt | 140 ms | **61 ms** (2.3x) | **61 ms** (2.3x) |
+| edit an earlier message in an 11.7k-token chat | 303 ms | **69 ms** (4.4x) | **72 ms** (4.2x) |
+| 282 benchmark questions (GSM8K, MMLU-Pro, ARC-C, MATH-500, HumanEval, NIAH, LongBench v2) | 229 right, 2,537 s | **230 right, 1,544 s** (1.6x) | **229 right, 1,580 s** (1.6x) |
+| VRAM, idle at 120k context | 23.1 GiB | **21.4 GiB** | **20.1 GiB** |
 
 With drafting off on both sides it's still 11% faster on short prompts and 45% faster at 101.6k context, so the gain
 isn't only speculation. Preset F's replies differ from q8_0's, so its decode rows aren't like-for-like. llama.cpp's
-message-edit time moves between sessions (247 ms on 2026-11-03). Token-weighted rates, the no-draft table and the
-method are in [docs/BENCHMARKS.md](docs/BENCHMARKS.md). Every row is one session.
+first-token time moves between sessions (117 ms on 2026-11-06, the same build). VRAM is the whole card, with the
+desktop's 0.9 GiB. Token-weighted rates, the no-draft table and the method are in
+[docs/BENCHMARKS.md](docs/BENCHMARKS.md). Every row is one session.
 
 ## What you get
 
@@ -52,7 +53,7 @@ method are in [docs/BENCHMARKS.md](docs/BENCHMARKS.md). Every row is one session
   switching between conversations.
 - **[OpenAI, Anthropic and Responses APIs](#works-with-your-coding-agent)**, tested with 11 coding agents and chat UIs.
 - **Images and video**, encoded on the CPU, so the encoder takes no VRAM.
-- **Several agents at once:** `--agents 4` serves 424 tok/s in total on short prompts (Q4_K_M), 360 with ~23k tokens
+- **Several agents at once:** `--agents 4` serves 425 tok/s in total on short prompts (Q4_K_M), 355 with ~23k tokens
   of context each, against 137 and 97 for llama.cpp's `llama-server --parallel 4` measured on 2026-11-02, sampled
   ([parallel agents](docs/BENCHMARKS.md#parallel-agents)).
 - **Prebuilt packages** for Windows and Linux.
@@ -157,13 +158,13 @@ attention puts most of its weight and where low-bit storage costs accuracy.
 | | q8_0 (default) | preset D | preset F |
 |---|---|---|---|
 | K / V bits (newest 2k positions at 8) | 8 / 8 | 6 / 5 | 5, rotated / 5 |
-| VRAM, idle server at 120k context | 21.2 GiB | 20.1 GiB | 19.8 GiB |
+| VRAM, idle server at 120k context (2026-11-06) | 21.2 GiB | 20.1 GiB | 19.8 GiB |
 | full 262,144-token context on 24 GB | no | yes | yes |
 | KL against llama.cpp at 32k / 100k context | 0.00219 / 0.00217 | 0.00236 / 0.00226 | 0.00242 / 0.00218 |
 | 282 benchmark questions | 230 right | 230 right | 229 right |
-| read a 101.6k-token prompt | 68.5 s | 71.1 s | 70.7 s |
+| read a 101.6k-token prompt (2026-11-06) | 68.5 s | 71.1 s | 70.7 s |
 
-At the full context, preset F reads a 260,896-token prompt in about 4.6 minutes and decodes at that depth at 78 tok/s,
+At the full context, preset F reads a 260,896-token prompt in about 4.6 minutes and decodes at that depth at 79 tok/s,
 and 4 of 4 needle-in-a-haystack questions came back right. A conversation shorter than the window never leaves 8 bits, so
 preset D's output there is q8_0's.
 
@@ -183,9 +184,9 @@ same request sent fresh would.
 
 | prompt time | llama.cpp | qwen38-megakernel |
 |---|---|---|
-| follow-up turn in an 11.8k-token chat | 248 ms | **169 ms** |
-| edit an earlier message in an 11.7k-token chat | 302 ms | **69 ms** |
-| edit the end of a 9.1k-token system prompt | 882 ms | **82 ms** |
+| follow-up turn in an 11.8k-token chat | 258 ms | **170 ms** |
+| edit an earlier message in an 11.7k-token chat | 303 ms | **69 ms** |
+| edit the end of a 9.1k-token system prompt | 879 ms | **82 ms** |
 
 - **Follow-ups and edits** resume from DeltaNet checkpoints, one at every message start and every 4,096 tokens. The
   follow-up turn re-reads the previous reply, which is what keeps it exact.

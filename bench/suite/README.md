@@ -1,7 +1,7 @@
 # Benchmark suite
 
 The clients, items and scoring behind the server tables in [docs/BENCHMARKS.md](../../docs/BENCHMARKS.md) (the full run
-of 2026-11-06, with preset F's 262,144-token run) and the README: the same prompts, request parameters, item
+of 2026-11-12, with preset F's 262,144-token run) and the README: the same prompts, request parameters, item
 selection, warm-up requests, timing fields and scoring rules. Point them at this engine's server or at llama.cpp's
 `llama-server` (the comparison column) and the numbers are comparable with the published ones, within the
 session-to-session spread described there.
@@ -85,7 +85,7 @@ context). The VRAM rows are for the whole card, so nothing else should run on it
 The from-scratch step needs side requests and parking off: with them on, the short request the client sends to clear
 the cache runs beside the cached conversation and keeps it, and the long prompt is then served from the cache.
 
-The llama.cpp columns were measured with llama.cpp b12024's `llama-server` (2026-11-06), tuned (q8_0 KV cache, 4 MTP
+The llama.cpp columns were measured with llama.cpp b12024's `llama-server` (2026-11-12), tuned (q8_0 KV cache, 4 MTP
 drafts; no `--spec-type` without drafts), on the same model file:
 
 ```sh
@@ -107,7 +107,7 @@ server driving this engine. llama-server: `--parallel 4`, with the context it ne
 ## 3. Run the steps
 
 All clients take `--url` (default `http://127.0.0.1:8080`), `--label` (a name for the configuration, written into every
-record) and `--out` (a JSON-lines file; records are appended). Times are for an RTX 3090 on 2026-11-06.
+record) and `--out` (a JSON-lines file; records are appended). Times are for an RTX 3090 on 2026-11-12.
 
 | Step | Server | Command | Time |
 |---|---|---|---|
@@ -150,7 +150,7 @@ the question totals and the full-context table, and writes them as JSON with `--
   you want.
 - **Re-runs.** `--sub LABEL:KEY[,KEY]=OTHER` takes some rows of a column from another label, e.g. a step re-run after
   something disturbed it. Keys: the row keys listed in `summarize.py`'s usage, `qa` (all question sets) or `qa.SET`.
-  The 2026-11-06 table needed none; the 2026-10-20 one was made with
+  The 2026-11-12 table needed none; the 2026-10-20 one was made with
   `--sub D:edit_msg,edit_sys,qa.gsm8k,qa.mmlu_pro=D_rerun` (a browser opened during the first pass) and its from-scratch
   rows came from separate labels (`--sub q8:pf101k=q8_scratch`).
 - **Question time** includes, on this engine, the side requests and parks the questions cause beside the cached long

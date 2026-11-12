@@ -168,7 +168,7 @@ that re-prefill is what exactness costs. An edit to an earlier message, or to th
 the last checkpoint before the edit.
 
 Prompt processing time of each request (WSL2 server, 120,000-token context, 7 drafts, exact reuse on; the
-[full run](BENCHMARKS.md#full-run-2026-11-06) in BENCHMARKS.md):
+[2026-11-06 full run](BENCHMARKS.md#2026-11-06-3ed5ce5) in BENCHMARKS.md):
 
 | request | q8_0 KV | preset D | preset F |
 |---|---|---|---|
@@ -477,14 +477,14 @@ MK_AGENTS=4 scripts/serve.sh 8080 0                                        # the
 
 ### Speed with several agents
 
-Four agents at once (Q4_K_M, `--agents 4 -d 7 --kv q8`, RTX 3090) decode 424 tok/s in total on short coding prompts and
-360 tok/s with a ~23k-token context each; one agent alone ran 194 and 195 tok/s on short prompts in two passes, which
+Four agents at once (Q4_K_M, `--agents 4 -d 7 --kv q8`, RTX 3090) decode 425 tok/s in total on short coding prompts and
+355 tok/s with a ~23k-token context each; one agent alone ran 208 and 198 tok/s on short prompts in two passes, which
 depends on how many sampled drafts it accepts. Exact mode (`MK_EXACT=1`, the `--agents` default) costs nothing measurable,
 and open-jet's own server running the same engine library measures the same within run-to-run noise. Numbers and method:
 [BENCHMARKS.md](BENCHMARKS.md#parallel-agents).
 
 A prompt that arrives while others decode is fed beside their cycles (`MK_PF_MIX`), so they keep going: a ~20k-token
-prompt got its first token after 13.1 s while the other request decoded at 14.1 tok/s. Feeding it whole instead
+prompt got its first token after 13.1 s while the other request decoded at 13.4 tok/s. Feeding it whole instead
 (`MK_PF_MIX=0 MK_PF_CHUNK=0`) gets the first token about 30% sooner, but the other request all but stops meanwhile
 (0.6 tok/s).
 
