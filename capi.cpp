@@ -35,6 +35,25 @@
 #define MK_STR(...) MK_STR2(__VA_ARGS__)
 
 namespace {
+// libllama's log during mk_new's vocabulary load: warnings and errors as they come; the rest (the GGUF's keys and token
+// lists, ~110 lines) with MK_VERBOSE only, or after a failed load
+struct VocabLog {
+    std::string held;
+    ggml_log_level last = GGML_LOG_LEVEL_INFO;
+};
+
+void vocab_log(ggml_log_level level, const char * text, void * ud) {
+    VocabLog & v = *static_cast<VocabLog *>(ud);
+    if (level == GGML_LOG_LEVEL_CONT) level = v.last;
+    else v.last = level;
+    if (level >= GGML_LOG_LEVEL_WARN || mk_verbose()) {
+        fputs(text, stderr);
+        fflush(stderr);
+    } else {
+        v.held += text;
+    }
+}
+
 // ---- keep-warm (MK_KEEP_WARM_S) ----
 // A few seconds without GPU work and the driver drops the clocks (P8); a reply that starts there runs its first ~2 s at
 // ramping clocks. mk_keep_warm(h, 1), which the server calls once ready
@@ -265,12 +284,19 @@ const char * mk_last_error() { return g_err.c_str(); }
 // mtp: the MTP layer's source (MKEngine's mtp): NULL / "" the model file (or MK_NO_MTP / MK_MTP), a GGUF path, "none"
 void * mk_new_mtp(const char * model, int ctx, int n_draft, const char * draft_vocab, int kv_mode, const char * mtp) {
     Handle * h = nullptr;
+    VocabLog vlog; // (outside the try: a load that throws shows what it logged too)
     try {
-        llama_backend_init();
-        llama_model_params mp = llama_model_default_params();
-        mp.vocab_only = true;
-        h = new Handle;
-        h->lm = llama_model_load_from_file(model, mp);
+        {
+            struct Restore {
+                ~Restore() { llama_log_set(nullptr, nullptr); } // (libllama's default logger after the load)
+            } restore;
+            llama_log_set(vocab_log, &vlog);
+            llama_backend_init();
+            llama_model_params mp = llama_model_default_params();
+            mp.vocab_only = true;
+            h = new Handle;
+            h->lm = llama_model_load_from_file(model, mp);
+        }
         if (!h->lm) throw std::runtime_error("failed to load the vocabulary");
         h->vocab = llama_model_get_vocab(h->lm);
         h->eng = new MKEngine(model, ctx, n_draft, draft_vocab ? draft_vocab : "", kv_mode, mtp ? mtp : "");
@@ -283,14 +309,16 @@ void * mk_new_mtp(const char * model, int ctx, int n_draft, const char * draft_v
                     getenv("MK_KEEP_WARM_LOAD"));
         if (sec > 0.0) {
             h->warm = new Warmer(sec, load);
-            fprintf(stderr, "[mk] keep-warm: %g s after each request (MK_KEEP_WARM_S; 0 = off), %d x %d threads, %g ms on / %g ms off%s\n",
-                    sec, load.blocks, load.threads, load.on_ms, load.off_ms, load.spin ? ", spinning" : "");
-        } else {
+            if (mk_verbose())
+                fprintf(stderr, "[mk] keep-warm: %g s after each request (MK_KEEP_WARM_S; 0 = off), %d x %d threads, %g ms on / %g ms off%s\n",
+                        sec, load.blocks, load.threads, load.on_ms, load.off_ms, load.spin ? ", spinning" : "");
+        } else if (mk_verbose()) {
             fprintf(stderr, "[mk] keep-warm: off (MK_KEEP_WARM_S=%s)\n", ks);
         }
         return h;
     } catch (const std::exception & e) {
         g_err = e.what();
+        if (!h || !h->lm) fputs(vlog.held.c_str(), stderr); // (the vocabulary load failed: its whole log)
         if (h) { // (what was made before the failure, in mk_free's order)
             delete h->warm;
             delete h->eng;
@@ -387,6 +415,20 @@ int mk_slots_step_mixed(void * hp, int pslot, int budget, const int * slots, int
 }
 
 int mk_slot_segment(void * hp, int slot) { return static_cast<Handle *>(hp)->eng->slot_segment(slot); }
+
+// the slot's decode cycles, drafted and accepted tokens since mk_slots_open2 (0, or -1 for no such slot)
+int mk_slot_stats(void * hp, int slot, long * cycles, long * drafted, long * accepted) {
+    try {
+        const MKStats s = static_cast<Handle *>(hp)->eng->slot_stats(slot); // (host counters: no GPU work)
+        *cycles = s.cycles;
+        *drafted = s.drafted;
+        *accepted = s.accepted;
+        return 0;
+    } catch (const std::exception & e) {
+        g_err = e.what();
+        return -1;
+    }
+}
 
 // (test) the slot's sequence -> out (up to cap); returns its length
 int mk_slot_sequence(void * hp, int slot, int * out, int cap) {

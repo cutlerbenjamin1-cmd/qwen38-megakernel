@@ -9,6 +9,10 @@ from mk_limits import DEF_MIN_P, DEF_TEMP, DEF_TOP_K, DEF_TOP_P, FLT_MAX, TOPK_M
 from mk_log import CON, log, plural, secs
 from mk_media import VideoBytes
 
+# prompt tokens below which the prompt line shows no rate: a few launches' latency (and with --agents the other slots'
+# cycles in between), not a throughput, which would read as a slow prefill
+RATE_MIN = 128
+
 
 class GenerateMixin:
     def sampling(self, body):
@@ -76,6 +80,10 @@ class GenerateMixin:
         """the engine's (decode cycles, drafted, accepted) counters, or None. They move in its decode cycles only and
         restart at a reset (a full re-prefill in load_prompt): read after the prompt, the difference is the reply's"""
         return self.eng.stats() if getattr(self.eng, "stats", None) is not None else None
+
+    def stats_base(self):
+        """eng_stats as the reply's decode starts (SlotServer: zeros, its job counts from its own first cycle)"""
+        return self.eng_stats()
 
     def status(self, text):
         """the console's status line for the running request (SlotServer: none, its requests run at once)"""
@@ -158,19 +166,19 @@ class GenerateMixin:
             raise ClientGone()
         t1 = time.time()
         t0 += self.queued_s  # (--agents: the wait for a free slot is not prompt time)
-        st0 = self.eng_stats()
+        st0 = self.stats_base()
 
         def spent():
-            st1 = self.eng.stats() if st0 is not None else None
+            st1 = self.eng_stats() if st0 is not None else None
             d = tuple(b - a for a, b in zip(st0, st1)) if st0 and st1 else (0, 0, 0)
             self.count(decode_cycles=d[0], draft_tokens=d[1], draft_tokens_accepted=d[2])
             return d
         self.last_prompt = (len(toks), reused)  # (an Anthropic stream's message_start reports it)
         enc = [im.encode_s for (_, im), e in zip(images, enc0) if e is None and im.encode_s is not None]
         n_new, enc_s = len(toks) - reused, sum(enc)
-        pf_s = max(t1 - t0 - enc_s, 1e-9)
-        line = (f"#{rid} prompt: {reused:,} cached + {n_new:,} prefilled in {secs(pf_s)} ({n_new / pf_s:,.0f} tok/s)"
-                f" | {self.cache_note}")
+        pf_s = max(t1 - t0 - enc_s - self.cache_s, 1e-9)  # (image encodes, parks and restores: on the line, not prefill)
+        line = (f"#{rid} prompt: {reused:,} cached + {n_new:,} prefilled in {secs(pf_s)}"
+                + (f" = {n_new / pf_s:,.0f} tok/s" if n_new >= RATE_MIN else "") + f" | {self.cache_note}")
         if images:
             grids = sorted({f"{im.nx}x{im.ny}" for _, im in images})
             line += (f" | images: {len(images)} ({', '.join(grids[:3])}{', ...' if len(grids) > 3 else ''} tok grids), "
@@ -255,15 +263,15 @@ class GenerateMixin:
         dt = max(t2 - t1, 1e-9)
         # (one token is the prefill's: no decode rate)
         parts = [f"{n_gen:,} tok in {secs(dt)}" + (f" = {n_gen / dt:.1f} tok/s" if n_gen > 1 else "")]
-        ph = ", ".join(f"{k} {v:,}" for k, v in phase.items() if v)
-        if ph:
-            parts.append(ph)
         _, drafted, accepted = spent()
         if steps:  # (MTP: each engine cycle verifies the drafts and keeps the accepted ones plus one token)
             spec = f"{stepped / steps:.2f} tok/cycle"
             if drafted > 0:
                 spec += f", {100 * accepted / drafted:.0f}% of {drafted:,} drafts accepted"
             parts.append(spec)
+        ph = ", ".join(f"{k} {v:,}" for k, v in phase.items() if v)
+        if ph:
+            parts.append(ph)
         parts.append(f"finish {finish}" + (f" ({plural(len(calls), 'call')})" if calls else "")
                      + (f" (stop string; {dropped} tok of the cycle dropped)" if stopper.word is not None else "")
                      + (f" (t_max_predict_ms; {dropped} tok of the cycle dropped)" if timed_out else ""))

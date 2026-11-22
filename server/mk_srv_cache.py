@@ -1,7 +1,7 @@
 """Server's host cache: side requests and parked conversations."""
 import time
 
-from mk_log import log, mib
+from mk_log import log, mib, secs, vlog
 
 
 class Parked:
@@ -115,8 +115,8 @@ class CacheMixin:
                 # its later history edited (a client moving or dropping a block, clearing old tool results, a chat
                 # message edited); the request resumes from the engine's state either way, and the copy a park would
                 # keep is never continued
-                log(f"#{self.rid} not parked: the request continues the cached conversation with its history edited "
-                    f"(the prompt matches {live[0]:,} of the {len(seq):,} cached tok, past its first reply at {k:,})")
+                vlog(f"#{self.rid} not parked: the request continues the cached conversation with its history edited "
+                     f"(the prompt matches {live[0]:,} of the {len(seq):,} cached tok, past its first reply at {k:,})")
                 return
             # a request without tools that replaces a conversation whose last request had tools is how clients summarise
             # a conversation (compaction); the compacted conversation then replaces the summary's: both copies are
@@ -173,7 +173,10 @@ class CacheMixin:
         self.eng.park_drop(pid)
         self.count(park_evictions=1)
         self.store_update()
-        log(f"#{self.rid} evicted the parked conversation of {len(e.seq):,} tok ({mib(e.nbytes)}, {why}")
+        # (on the prompt line: a later request for it prefills in full, and this says why; after a side request's reply
+        # the text goes nowhere, the next request starts a new one)
+        self.cache_pre += f"evicted {len(e.seq):,} tok; "
+        vlog(f"#{self.rid} evicted the parked conversation of {len(e.seq):,} tok ({mib(e.nbytes)}, {why}")
 
     def park_live(self, seq, why, keep=None, low="", provisional=False):
         """a snapshot of the live conversation into the host store (the engine keeps it too); keep: a parked one that must
@@ -212,8 +215,10 @@ class CacheMixin:
         info = self.store_update()
         self.count(parks=1)
         why += f", low priority: {low}" if low else ""
-        log(f"#{self.rid} parked the cached conversation ({why}): {len(seq):,} tok, {mib(info['last_bytes'])} copied in "
-            f"{info['last_ms']:.0f} ms | {len(self.parked)} parked, {mib(info['used'])} of {a.park_mib:,} MiB")
+        self.cache_pre += f"parked {len(seq):,} tok in {secs(info['last_ms'] / 1e3)}; "
+        self.cache_s += info["last_ms"] / 1e3
+        vlog(f"#{self.rid} parked the cached conversation ({why}): {len(seq):,} tok, {mib(info['last_bytes'])} copied in "
+             f"{info['last_ms']:.0f} ms | {len(self.parked)} parked, {mib(info['used'])} of {a.park_mib:,} MiB")
         return e
 
     def unpark(self, e):
@@ -230,9 +235,10 @@ class CacheMixin:
         self.img_spans, self.live_gen, self.live_tools, self.live_low = e.img_spans, e.gen, e.tools, ""
         info = self.store_update()
         self.count(park_restores=1)
-        self.cache_pre = f"restored a parked conversation ({len(e.seq):,} tok); "
-        log(f"#{self.rid} restored the parked conversation of {len(e.seq):,} tok: {mib(info['last_bytes'])} copied in "
-            f"{info['last_ms']:.0f} ms | {len(self.parked)} parked, {mib(info['used'])} in use")
+        self.cache_pre += f"restored {len(e.seq):,} tok in {secs(info['last_ms'] / 1e3)}; "
+        self.cache_s += info["last_ms"] / 1e3
+        vlog(f"#{self.rid} restored the parked conversation of {len(e.seq):,} tok: {mib(info['last_bytes'])} copied in "
+             f"{info['last_ms']:.0f} ms | {len(self.parked)} parked, {mib(info['used'])} in use")
 
     def side_start(self, seq, n, max_tokens=-1, resume=None, after=""):
         """runs the request as a side request: the live sequence stays cached (Engine.side_begin; side_finish brings it
@@ -252,7 +258,7 @@ class CacheMixin:
         self.side = (len(seq), self.img_spans, self.live_gen, self.live_tools, self.live_low, after)
         self.side_ready = False
         self.count(side_requests=1)
-        self.cache_pre = f"side request: the cached {len(seq):,} tok are kept aside; "
+        self.cache_pre += f"side request: the cached {len(seq):,} tok are kept aside; "
         if resume is not None:
             if not eng.side_unpark(resume.id):
                 log(f"#{self.rid} side request: no room in the host store to continue its parked conversation of "
@@ -304,7 +310,9 @@ class CacheMixin:
         if ok:
             self.img_spans, self.live_gen, self.live_tools = spans, gen, tools
             self.live_low = after if after and self.answer_tokens >= SUMMARY_ANSWER_MIN else low
-            log(f"#{self.rid} side request done: the cached {n:,} tok are back ({mib(info['last_bytes'])}: kept in "
+            # (its own conversation not parked: a loss, its next turn prefills in full; else routine bookkeeping)
+            (log if own is not None and pid is None else vlog)(
+                f"#{self.rid} side request done: the cached {n:,} tok are back ({mib(info['last_bytes'])}: kept in "
                 f"{info['side_ms']:.0f} ms, back in {info['last_ms']:.0f} ms){kept}")
         elif own is not None and room:  # (side_end_park: the kept sequence was lost, the side request's conversation stays)
             self.count(side_dropped=1)
@@ -328,5 +336,5 @@ class CacheMixin:
             return
         e.low = False
         self.store_update()
-        log(f"#{self.rid} the parked conversation of {len(e.seq):,} tok keeps normal priority: the request answered in "
-            f"{self.answer_tokens:,} tok (< {SUMMARY_ANSWER_MIN}: not a summary)")
+        vlog(f"#{self.rid} the parked conversation of {len(e.seq):,} tok keeps normal priority: the request answered in "
+             f"{self.answer_tokens:,} tok (< {SUMMARY_ANSWER_MIN}: not a summary)")

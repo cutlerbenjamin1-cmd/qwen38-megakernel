@@ -190,8 +190,8 @@ noise floor of the 32k test set; at 1,024 they were still near-lossless, but mea
   the 32k set in the emulator.
 - **The window is rounded up to steps of 640 positions**, the attention kernel's tile partition (which also keeps
   greedy output independent of the draft depth): `MK_KV_WIN=2048` keeps the last 2,561 to 3,200 positions at 8 bits,
-  and any value from 1,921 to 2,560 gives the same ring. The startup line `[mk] KV recent window: ...` prints the range
-  and the ring's size.
+  and any value from 1,921 to 2,560 gives the same ring. The startup line `[mk] KV recent window: ...` (the server's
+  `-v`; the CLI prints it by default) prints the range and the ring's size.
 - **Rotation (`r`)** spreads each block's outliers over the block before rounding, so the one scale per 32 values fits
   the rest of the block better. Without a window it halved 6-bit K's extra KL, and it helped V on short prompts but not
   at 32k. Under the 2,048 window it made no measurable difference, so preset D stores K and V unrotated (no rotation of
@@ -291,6 +291,7 @@ limits in [SERVER.md](SERVER.md#limits).
 | `--video-max-tokens` | `MK_VIDEO_MAX_TOKENS` (launchers) | `0`: `--image-max-tokens` | most tokens per frame pair (0 or at least 8; the cpu backend only); fewer fit longer clips | changes (video rows) |
 | `--video-cache` | - | `2` | videos kept decoded / encoded for the next requests of a conversation | - |
 | `--ffmpeg` | `MK_FFMPEG` | `ffmpeg` on PATH, else the imageio-ffmpeg package's | the ffmpeg executable (or its folder) for video input; without one, video requests get a 400 | - |
+| `-v`, `--verbose` | `MK_VERBOSE` | off | the console's details too: the engine's load steps and libllama's vocabulary log, the host cache's parks, restores, evictions and side-request ends; without it the console has a startup summary, each request's three lines, warnings and errors ([SERVER.md](SERVER.md#the-console)) | - |
 
 "Same with exact reuse": with `--exact-reuse` these options decide only how much is re-read, never the output;
 without it, a reused prompt appends to the rows the previous reply decoded, which is not bit-identical to a fresh
@@ -321,7 +322,8 @@ Read by the server only (there is no option for them):
 `MK_IMAGE_MAX_PIXELS` must be positive integers, the three `MK_PF_*` integers >= 0: anything else ends the server at
 startup with a message. `MK_SIDE_MAX`, `MK_PARK_MIB`, `MK_AGENTS`, `MK_TIMEOUT_S` and `MK_REQUEST_TIMEOUT_S` accept `0`
 (off). The server sets `MK_EXACT=1` for the engine when `--exact-reuse` is given, and with `--agents` sets `MK_EXACT=1`,
-`MK_PF_CAP=1024` and `MK_CK_SLOTS=1` unless they are set; it reports `MK_CK_SLOTS` in `/props`.
+`MK_PF_CAP=1024` and `MK_CK_SLOTS=1` unless they are set, and `MK_AGENTS` to the slot count (the engine's load lines then
+leave out its own warm-up sequence's KV cache); `-v` sets `MK_VERBOSE=1`. It reports `MK_CK_SLOTS` in `/props`.
 llama-server's `LLAMA_ARG_*` variables are not read.
 
 ## Engine environment variables
@@ -451,6 +453,7 @@ them). With them the CLI loads in 11.9 s cold / 7.4-8.3 s warm (59.7 / 32.4 s wi
 | `MK_REENC3` | `0` | `1`: Q3_K and IQ3_S re-encoded to Q6_K at load (the path before the native kernels, which are bit-identical) | same | earlier path |
 | `MK_AB_F32` | unset | set: the Q8_0 DeltaNet alpha / beta weights folded into fp32 rows at load (+66 MiB) instead of int8 rows formed on the fly | same | earlier path |
 | `MK_VOCAB_SERIAL` | `0` | CLI: `1` loads the tokenizer before the engine instead of next to it | - | debug |
+| `MK_VERBOSE` | unset (the CLI: on) | set, and not `0`: the load's details on stderr (its steps and times, the weight layouts, the KV fit, libllama's vocabulary log) and the other engine notes; otherwise its warnings, errors, the KV cache line and a load summary (`[mk] loaded in 5.3 s: weights 16.82 GB on the GPU, 82 SMs`). The server's `-v` sets it | - | option |
 | `MK_STATE_WARM_MS` | `1000` | CLI `--state-dir`: GPU warm-up in ms before decoding from a restored state file (`0`: off). Decode right after a 38k restore: 117 / 166 tok/s without, 168 / 168 with | same | served |
 
 ### Keep-warm and watchdog
@@ -619,8 +622,8 @@ the KV formats, the prompt, and every `MK_*` variable in the environment except 
 logging, timing or the load path: names starting with `MK_STATE`, `MK_POLICY`, `MK_PROFILE`, `MK_SPEC_LOG`,
 `MK_MEMLOG`, `MK_LOADLOG`, `MK_LOAD_`, `MK_WDIGEST`, `MK_WATCHDOG`, `MK_CK_SLOTS`, `MK_BENCH`, `MK_STACK_LIMIT`,
 `MK_RESERVE_EARLY`, `MK_VRAM_`, `MK_GSB`, `MK_PF_PROFILE`, `MK_PF_GAPS`, `MK_PF_SYNC`, `MK_CK_DEVICE`, `MK_STORE_`,
-`MK_SLOT_RESERVE`, `MK_CUDAMALLOC`, and `MK_K1`, `MK_K2`, `MK_K6`. Any other change saves a new file instead of restoring a
-stale one.
+`MK_SLOT_RESERVE`, `MK_CUDAMALLOC`, `MK_VERBOSE`, `MK_AGENTS`, and `MK_K1`, `MK_K2`, `MK_K6`. Any other change saves a
+new file instead of restoring a stale one.
 
 ## Tools and benchmarks
 

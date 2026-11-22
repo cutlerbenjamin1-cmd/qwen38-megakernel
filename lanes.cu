@@ -224,8 +224,9 @@ int MKEngine::Impl::slots_open(int n, int lctx) {
         std::string why = wide_why();
         if (getenv("MK_PAR_RMAX") && atoi(getenv("MK_PAR_RMAX")) <= MAXT) why = "MK_PAR_RMAX";
         par_wide = why.empty();
-        fprintf(stderr, "[mk] parallel slots: batched passes of %s\n", par_wide ? (std::to_string(RMAX) + " rows").c_str()
-                                                                           : (std::to_string(MAXT) + " rows (" + why + ")").c_str());
+        if (mk_verbose())
+            fprintf(stderr, "[mk] parallel slots: batched passes of %s\n", par_wide ? (std::to_string(RMAX) + " rows").c_str()
+                                                                               : (std::to_string(MAXT) + " rows (" + why + ")").c_str());
     }
 #endif
     CK(cudaDeviceSynchronize());
@@ -372,15 +373,14 @@ int MKEngine::Impl::slots_open(int n, int lctx) {
     dv_reset();
     dv_frozen = true;
     undo.done = true;
-    bool lowbit = false;
-    for (int w = 0; w < 2; w++)
-        for (int sl = 0; sl < kv_slots; sl++) lowbit |= hb.kvb[w][sl] != 8 || (w ? hb.kvrv[sl] : hb.kvr[sl]);
     int ck_rings = 0;
     for (const CkSlot & c : lanes[0].ck) ck_rings += c.ring != nullptr;
-    fprintf(stderr, "[mk] %d parallel slots of %d positions (%s KV%s: %.2f GB, %.2f GB each in all, %zu checkpoints each",
-            n, lctx, lowbit ? "MK_KV" : "q8", hb.kvwin > 0 ? " + MK_KV_WIN rings" : "", lane_kv_bytes(lctx) / 1e9,
-            lane_bytes(lctx) / 1e9, lanes[0].ck.size());
-    if (ring_bytes_ck > 0) fprintf(stderr, ", %d with the window rings, %.1f MiB pinned host each", ck_rings, ring_bytes_ck / 1048576.0);
+    fprintf(stderr, "[mk] KV cache %s, %.2f GB for each of %d parallel slots of %s positions (%.2f GB with its state",
+            kv_label().c_str(), lane_kv_bytes(lctx) / 1e9, n, grouped(lctx).c_str(), lane_bytes(lctx) / 1e9);
+    if (mk_verbose()) {
+        fprintf(stderr, "; %zu checkpoints each", lanes[0].ck.size());
+        if (ring_bytes_ck > 0) fprintf(stderr, ", %d with the window rings, %.1f MiB pinned host each", ck_rings, ring_bytes_ck / 1048576.0);
+    }
     fprintf(stderr, ")\n");
     return lctx;
 }
@@ -497,7 +497,11 @@ std::vector<std::vector<int>> MKEngine::Impl::lanes_step(const std::vector<int> 
             if (li[i] >= 0) k = i;
         lane_in(ks[k]);
         std::vector<int> o;
-        step_live(o);
+        const int T = step_live(o);
+        MKStats & st = lanes[ks[k]].stats;
+        st.cycles++;
+        st.drafted += T - 1;
+        st.accepted += hctl.n_acc;
         out[k] = o;
         lane_out();
         return out;
@@ -554,6 +558,9 @@ std::vector<std::vector<int>> MKEngine::Impl::lanes_step(const std::vector<int> 
         l.dv_n = -1;
         l.all_acc = c.n_acc == Ti[i] - 1;
         l.last_acc = c.n_acc;
+        l.stats.cycles++;
+        l.stats.drafted += Ti[i] - 1;
+        l.stats.accepted += c.n_acc;
     }
     return out;
 }
@@ -685,7 +692,13 @@ std::vector<std::vector<int>> MKEngine::slots_step(const std::vector<int> & slot
             I.lane_in(ks[0]);
             std::vector<int> o;
             const Ctl & c = I.hctl;
-            if (c.n + MAXD + 2 < I.ctx) step(o); // (else full: no tokens)
+            if (c.n + MAXD + 2 < I.ctx) { // (else full: no tokens)
+                step(o);
+                MKStats & st = I.lanes[ks[0]].stats;
+                st.cycles++;
+                st.drafted += stats.last_T - 1;
+                st.accepted += stats.last_acc;
+            }
             out[at[0]] = o;
         } else if (ks.size() >= 2) {
             const auto r = I.lanes_step(ks); // (a failure there: every lane in ks, the batched launch wrote them all)
@@ -709,6 +722,11 @@ std::vector<int> MKEngine::slot_sequence(int slot) {
     MK_LANE_OUT();
     p_->lane_in(slot);
     return p_->seq;
+}
+
+MKStats MKEngine::slot_stats(int slot) const {
+    if (slot < 0 || slot >= (int) p_->lanes.size()) throw std::runtime_error("no slot " + std::to_string(slot));
+    return p_->lanes[slot].stats;
 }
 
 std::vector<float> MKEngine::slot_h(int slot) {

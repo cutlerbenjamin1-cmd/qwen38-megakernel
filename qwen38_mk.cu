@@ -7001,7 +7001,7 @@ cudaError_t wv_deal_init(int nsm) {
         fprintf(stderr, "[mk] MK_FFNA: %d of %d blocks' dealing table entries differ from the device formulas\n", bad, nsm);
         return cudaErrorInvalidValue;
     }
-    fprintf(stderr, "[mk] MK_FFNA: wv phase-top dealing table, %d blocks (checked)\n", nsm);
+    if (mk_verbose()) fprintf(stderr, "[mk] MK_FFNA: wv phase-top dealing table, %d blocks (checked)\n", nsm);
     return cudaSuccess;
 #else
     (void) nsm;

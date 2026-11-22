@@ -19,6 +19,7 @@ THINK = base.TEMPLATE.replace("assistant\n{% endif %}",  # (enable_thinking: the
 class SideRuleTests(base._HttpCase):
     """with parking on, a request without tools and without an earlier assistant reply is a side request whatever
     its max_tokens; one with tools still needs 0 < max_tokens <= SIDE_REPLY_MAX"""
+    VERBOSE = True
 
     LONG = base.HostCacheTests.LONG
     chat, metrics, quiet = base.HostCacheTests.chat, base.HostCacheTests.metrics, base.HostCacheTests.quiet
@@ -142,6 +143,7 @@ class SideRuleTests(base._HttpCase):
 class EditedHistoryTests(base._HttpCase):
     """a request that repeats the cached conversation up to its first reply and diverges later continues that
     conversation with edited history: nothing is parked; a new conversation (another first message) is parked"""
+    VERBOSE = True
 
     chat, quiet = base.HostCacheTests.chat, base.HostCacheTests.quiet
     SYS = {"role": "system", "content": "You are an agent. " * 3}
@@ -226,6 +228,7 @@ class DebrisTests(base._HttpCase):
     """a summary request (no tools) that replaces a conversation with tools parks it with low priority, and the
     summary's own conversation is low too when the compacted conversation replaces it; low entries go before real
     parked conversations"""
+    VERBOSE = True
 
     chat, quiet = base.HostCacheTests.chat, base.HostCacheTests.quiet
     LONG = base.HostCacheTests.LONG

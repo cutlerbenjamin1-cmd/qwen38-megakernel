@@ -451,9 +451,12 @@ def _sse(raw):
 
 
 class _HttpCase(unittest.TestCase):
+    VERBOSE = False  # the server's -v (the host cache's bookkeeping lines, which some classes check)
+
     @classmethod
     def setUpClass(cls) -> None:
         cls.mk = _load_mk_server()
+        cls.mk.VERBOSE = cls.VERBOSE
 
     def serve(self, eng, ctx=4096):
         srv = _chat_server(self.mk, eng, ctx)
@@ -1563,6 +1566,19 @@ class ChatTemplateOptionTests(_HttpCase):
             with mock.patch.dict(os.environ, {**clean, **({"MK_CK_SLOTS": preset} if preset else {})}, clear=True):
                 code, err, _ = self._main(*argv)
                 self.assertEqual((code, os.environ.get("MK_CK_SLOTS")), (None, want), (argv, preset, err))
+                # (MK_AGENTS: the engine's load lines leave out its own warm-up sequence's KV cache)
+                self.assertEqual(os.environ.get("MK_AGENTS"), "2" if argv else None, argv)
+        with mock.patch.dict(os.environ, {**clean, "MK_AGENTS": "4"}, clear=True):  # (a shell's, overruled by the option)
+            self.assertIsNone(self._main("--agents", "0")[0])
+            self.assertNotIn("MK_AGENTS", os.environ)
+
+    def test_v_turns_the_details_on_for_the_server_and_the_engine(self) -> None:
+        clean = {k: v for k, v in os.environ.items() if k not in ("MK_VERBOSE", "MK_AGENTS")}
+        for argv, env, want in (((), {}, (None, False)), (("-v",), {}, ("1", True)), (("--verbose",), {}, ("1", True)),
+                                ((), {"MK_VERBOSE": "1"}, ("1", True)), ((), {"MK_VERBOSE": "0"}, ("0", False))):
+            with mock.patch.dict(os.environ, {**clean, **env}, clear=True), mock.patch.object(self.mk, "VERBOSE", False):
+                code, err, _ = self._main(*argv)
+                self.assertEqual((code, os.environ.get("MK_VERBOSE"), self.mk.VERBOSE), (None, *want), (argv, env, err))
 
 
 # === con: the console (log lines with request numbers, the live status line) ===
@@ -1648,7 +1664,14 @@ class ConsoleTests(unittest.TestCase):
         srv.load_prompt([IM, 5, 5, IM, 9])
         srv.eng.dn_c += 3
         srv.load_prompt([IM, 6, 6, IM, 9])
-        self.assertEqual(srv.cache_note, "CACHE MISS: the prompt matches 1 of the 6 cached tok, no checkpoint before that")
+        # (a template's opening in common: not a miss)
+        self.assertEqual(srv.cache_note, "nothing reused: the prompt matches 1 of the 6 cached tok")
+        srv = self._server(0)
+        srv.load_prompt([IM] + [5] * 300 + [IM, 9])
+        srv.eng.dn_c += 3
+        srv.load_prompt([IM] + [5] * 280 + [6] * 20 + [IM, 9])
+        # (MISS_MIN tokens or more in common, none reused: the miss is named)
+        self.assertEqual(srv.cache_note, "CACHE MISS: the prompt matches 281 of the 304 cached tok, no checkpoint before that")
 
     def test_progress_texts(self) -> None:
         srv = object.__new__(self.mk.Server)
@@ -1711,8 +1734,8 @@ class ConsoleHttpTests(_HttpCase):
         n = int(lines[0].split()[0][1:])
         samp = "temp 1 top_p 0.95 top_k 20 min_p 0"
         want = [rf"#{n} chat 'm1': \d+ tok, 1 message \| no thinking, max_tokens 8 \| {samp}",
-                rf"#{n} prompt: 0 cached \+ \d+ prefilled in [\d.]+ s \([\d,]+ tok/s\) \| nothing cached",
-                rf"#{n} reply: 3 tok in [\d.]+ s = [\d.]+ tok/s \| answer 2 \| 2.00 tok/cycle \| finish stop \| request [\d.]+ s",
+                rf"#{n} prompt: 0 cached \+ \d+ prefilled in [\d.]+ s( = [\d,]+ tok/s)? \| nothing cached",
+                rf"#{n} reply: 3 tok in [\d.]+ s = [\d.]+ tok/s \| 2.00 tok/cycle \| answer 2 \| finish stop \| request [\d.]+ s",
                 rf"#{n + 1} chat stream: \d+ tok, 3 messages \| no thinking \| {samp}",
                 rf"#{n + 1} prompt: (\d+) cached \+ \d+ prefilled .* \| the prompt matches \1 of the \d+ cached tok: "
                 r"continued from there",
@@ -1748,7 +1771,7 @@ class ConsoleHttpTests(_HttpCase):
         self.assertEqual(len(replies), 2, out)
         for ln in replies:
             self.assertIn("| 2.00 tok/cycle, 33% of 9 drafts accepted |", ln)
-        self.assertIn("CACHE MISS", out)
+        self.assertIn("nothing reused", out)
         c = http.client.HTTPConnection("127.0.0.1", http_.port, timeout=10)
         c.request("GET", "/metrics")
         vals = dict(ln.split(" ", 1) for ln in c.getresponse().read().decode().splitlines() if ln and not ln.startswith("#"))
@@ -1844,6 +1867,7 @@ class _StoreEngine(_ScriptEngine):
 
 class HostCacheTests(_HttpCase):
     """side requests (--side-max) and parked conversations (--park-mib) over the store's semantics"""
+    VERBOSE = True  # (they check the bookkeeping lines)
 
     LONG = "a long document. " * 40  # (~690 prompt tokens with the test tokenizer: one per character)
 
@@ -1950,7 +1974,8 @@ class HostCacheTests(_HttpCase):
         self.assertEqual(out["a2"]["usage"]["prompt_tokens_details"]["cached_tokens"], len(kept_a) - 1, log)
         self.assertIn("parked the cached conversation (a new conversation)", log)
         self.assertIn("restored the parked conversation of", log)
-        self.assertRegex(log, r"prompt: [\d,]+ cached \+ \d+ prefilled .* \| restored a parked conversation")
+        self.assertRegex(log, r"prompt: [\d,]+ cached \+ \d+ prefilled .* \| parked [\d,]+ tok in [\d.]+ s; restored "
+                              r"[\d,]+ tok in [\d.]+ s; the prompt matches")
         m = self.metrics(http_)
         self.assertEqual([m[f"megakernel:{k}"] for k in ("parks_total", "park_restores_total", "parked_conversations")],
                          ["2", "1", "1"])
@@ -2024,6 +2049,38 @@ class HostCacheTests(_HttpCase):
             th.join(5)
         self.assertEqual(order, list(range(6)))
         self.assertFalse(lock.locked())
+
+
+class QuietHostCacheTests(_HttpCase):
+    """without -v the host cache's bookkeeping lines stay off the console: what it did for a request, and what that
+    took, is on the request's prompt line"""
+    LONG = HostCacheTests.LONG
+    serve_store, chat, quiet = HostCacheTests.serve_store, HostCacheTests.chat, HostCacheTests.quiet
+
+    def test_parks_and_restores_show_on_the_prompt_line_only(self) -> None:
+        eng = _StoreEngine(["a", "b"])
+        srv, http_ = self.serve_store(eng, side_max=0, park_mib=4)
+        a1 = [{"role": "user", "content": self.LONG}]
+
+        def run():
+            ra = self.chat(http_, a1)
+            self.chat(http_, [{"role": "user", "content": self.LONG.upper()}])
+            self.chat(http_, a1 + [{"role": "assistant", "content": ra["choices"][0]["message"]["content"]},
+                                   {"role": "user", "content": "more"}])
+        log = self.quiet(run)
+        self.assertEqual([o[0] for o in eng.ops], ["park", "park", "unpark"], log)
+        for line in ("parked the cached conversation", "restored the parked conversation"):
+            self.assertNotIn(line, log)
+        self.assertRegex(log, r"prompt: 0 cached \+ \d+ prefilled .* \| parked [\d,]+ tok in [\d.]+ s; nothing reused")
+        self.assertRegex(log, r"\| parked [\d,]+ tok in [\d.]+ s; restored [\d,]+ tok in [\d.]+ s; the prompt matches")
+
+    def test_an_eviction_shows_on_the_prompt_line_of_the_request_that_needed_the_room(self) -> None:
+        eng = _StoreEngine(["a", "b"])
+        srv, http_ = self.serve_store(eng, side_max=0, park_mib=1)  # (one ~0.7 MB entry fits)
+        log = self.quiet(lambda: [self.chat(http_, [{"role": "user", "content": c + self.LONG}]) for c in "ABC"])
+        self.assertEqual([o[:2] for o in eng.ops], [("park", 1), ("drop", 1), ("park", 2)], log)
+        self.assertNotIn("evicted the parked conversation", log)
+        self.assertRegex(log, r"#\d+ prompt: .* \| evicted [\d,]+ tok; parked [\d,]+ tok in [\d.]+ s; nothing reused")
 
 
 if __name__ == "__main__":

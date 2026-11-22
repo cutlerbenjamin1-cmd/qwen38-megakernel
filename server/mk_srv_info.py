@@ -122,8 +122,8 @@ class InfoMixin:
             meta["n_vocab"] = self.n_vocab()
         caps = ["completion"] + (["multimodal"] if self.vision is not None else [])
         return {"object": "list",
-                "data": [{"id": self.model_id, "object": "model", "created": int(self.t_start), "owned_by": "openjet",
-                          "meta": meta}],
+                "data": [{"id": self.model_id, "object": "model", "created": int(self.t_start),
+                          "owned_by": "megakernel", "meta": meta}],
                 "models": [{"name": self.model_id, "model": self.model_id, "type": "model", "capabilities": caps,
                             "details": {"format": "gguf"}}]}
 

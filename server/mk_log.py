@@ -67,10 +67,16 @@ class Console:
 
 
 CON = Console()
+VERBOSE = False  # -v / MK_VERBOSE: vlog's lines too (the cache's bookkeeping, the load's details)
 
 
 def log(*a):
     CON.line(" ".join(["[mk-server]", time.strftime("%H:%M:%S"), *map(str, a)]))
+
+
+def vlog(*a):
+    if VERBOSE:
+        log(*a)
 
 
 def secs(s):

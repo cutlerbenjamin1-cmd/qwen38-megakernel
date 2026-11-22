@@ -64,9 +64,11 @@ void MKEngine::Impl::ck_alloc() {
         ring_grp[N_ATT_SLOTS - 1] = CK_NG - 1; // MTP block: after the trunk
         for (auto & e : rs_ev) CK(cudaEventCreateWithFlags(&e, cudaEventDisableTiming));
         for (cudaEvent_t * e : {&rs_ev_pf, &rs_ev_done}) CK(cudaEventCreateWithFlags(e, cudaEventDisableTiming));
-        fprintf(stderr, "[mk] MK_EXACT: checkpoints keep the KV window rings (%.1f MiB each, pinned host)\n", ring_bytes_ck / 1048576.0);
+        if (mk_verbose())
+            fprintf(stderr, "[mk] MK_EXACT: checkpoints keep the KV window rings (%.1f MiB each, pinned host)\n", ring_bytes_ck / 1048576.0);
     }
-    if (exact) fprintf(stderr, "[mk] MK_EXACT=1: prefill rows independent of the chunking (attention unsplit, per-tile window, grid checkpoints)\n");
+    if (exact && mk_verbose())
+        fprintf(stderr, "[mk] MK_EXACT=1: prefill rows independent of the chunking (attention unsplit, per-tile window, grid checkpoints)\n");
     mem_mark(ck_dev ? "DeltaNet checkpoint" : "DeltaNet checkpoints (host)");
 }
 

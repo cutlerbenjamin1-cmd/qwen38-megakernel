@@ -123,6 +123,11 @@ class Engine:
                                ("mk_slot_prefill", [vp, ci, ci]), ("mk_slots_step", [vp, ip, ci, ip, ci, ip])):
                 f = getattr(L, name)
                 f.restype, f.argtypes = ci, args
+        # each slot's decode cycles and drafts (the reply lines' draft acceptance; libraries before it: none)
+        self.slot_stats_ok = self.slots and hasattr(L, "mk_slot_stats")
+        if self.slot_stats_ok:
+            lp = ctypes.POINTER(ctypes.c_long)
+            L.mk_slot_stats.restype, L.mk_slot_stats.argtypes = ctypes.c_int, [vp, ctypes.c_int, lp, lp, lp]
         self.n_vocab = 0  # (libraries before mk_n_vocab: unknown)
         if hasattr(L, "mk_n_vocab"):
             L.mk_n_vocab.restype, L.mk_n_vocab.argtypes = ctypes.c_int, [vp]
@@ -449,6 +454,13 @@ class Engine:
 
     def _slot_tokens(self, n, out, cnt):
         return [list(out[i * self.SLOT_PER:i * self.SLOT_PER + cnt[i]]) for i in range(n)]
+
+    def slot_stats(self, slot):
+        """(decode cycles, drafted tokens, accepted drafts) of the slot since slots_open"""
+        c, d, a = ctypes.c_long(), ctypes.c_long(), ctypes.c_long()
+        if self.L.mk_slot_stats(self.h, slot, ctypes.byref(c), ctypes.byref(d), ctypes.byref(a)) < 0:
+            raise self._err("slot stats")
+        return c.value, d.value, a.value
 
     def slots_step(self, slots):
         """one engine cycle of the slots (one batched launch; a lone slot: the solo megakernel): the tokens each one

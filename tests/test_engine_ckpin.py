@@ -104,6 +104,7 @@ SYS = "You are a coding agent. Tools: read, write, run. " * 23  # (1,127 tokens 
 
 
 class PinnedCheckpointTests(base._HttpCase):
+    VERBOSE = True
     chat, metrics, quiet = base.HostCacheTests.chat, base.HostCacheTests.metrics, base.HostCacheTests.quiet
     follow_up = staticmethod(side.SideConversationTests.follow_up)
 

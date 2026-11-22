@@ -923,6 +923,7 @@ struct MKEngine::Impl {
         int first = -1;          // the first token of the finished prefill: emitted by the next slots_step
         bool dead = false;       // a slot call on it failed (MKCudaError): state undefined until slot_begin resets it
         std::string dead_why;    // (that error, in the refusals)
+        MKStats stats;           // its decode cycles, drafted and accepted tokens (slot_stats; not swapped by lane_in)
     };
     std::vector<Lane> lanes;
     int live = -1;          // the lane whose state the Impl's members hold (-1: the engine's own sequence)
@@ -969,6 +970,9 @@ struct MKEngine::Impl {
     // device bytes of one lane's KV cache of lctx positions in the engine's format (MK_KV bits per slot and side, fp16 scales,
     // the MK_KV_WIN q8 rings of the sides that have one)
     size_t lane_kv_bytes(int lctx) const;
+    // the q8 KV cache's format for the console: "q8_0", or MK_KV's bits per side over the slots ("MK_KV K 5r V 5",
+    // r: rotated; several widths: "6/8"), "+ q8_0 window" with MK_KV_WIN
+    std::string kv_label() const;
     // device bytes of one lane of ctx positions (KV cache; state, rings, partials, ctl)
     size_t lane_bytes(int lctx) const;
     // MKEngine::slots_open: n lanes of lctx positions each (0: the most that fit, leaving MK_SLOT_RESERVE_MIB, default
@@ -991,6 +995,13 @@ struct MKEngine::Impl {
 
     void reset();
 };
+
+// n as the server's console writes numbers (120,000); printf has no portable grouping flag
+inline std::string grouped(long long n) {
+    std::string s = std::to_string(n < 0 ? -n : n);
+    for (int i = (int) s.size() - 3; i > 0; i -= 3) s.insert((size_t) i, 1, ',');
+    return n < 0 ? "-" + s : s;
+}
 
 // token ids outside the vocabulary would index host arrays and embedding rows: refused before anything changes
 inline void check_ids(const std::vector<int> & toks, size_t pos0) {

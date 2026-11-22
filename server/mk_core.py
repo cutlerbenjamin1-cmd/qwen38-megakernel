@@ -3,19 +3,20 @@ import collections
 import contextlib
 import itertools
 import os
+import re
 import threading
 import time
 
 import mk_limits
 from mk_engine import Engine
 from mk_errors import BadRequest
-from mk_log import log, mib, plural, secs
+from mk_log import log, mib, plural, secs, vlog
 from mk_media import VIDEO_PARTS, VideoDecoder, Vision, find_ffmpeg
 from mk_slots import FifoLock, SLOT_OWN_CTX, SlotScheduler
 from mk_srv_cache import CacheMixin, SIDE_STORE_MIB
 from mk_srv_gen import GenerateMixin
 from mk_srv_info import InfoMixin
-from mk_srv_prompt import PromptMixin
+from mk_srv_prompt import MISS_MIN, PromptMixin
 from mk_template import CHATML_TEMPLATE, LiteralTemplate, make_template
 
 
@@ -54,6 +55,7 @@ class Server(CacheMixin, InfoMixin, PromptMixin, GenerateMixin):
     # priority): /metrics and /props read it
     store_gauge = (0, 0, 0, (), 0, 0)
     cache_pre = ""  # what the host cache did for the running request (before cache_note on the prompt line)
+    cache_s = 0.0  # the seconds its parks and restores took (not prefill time: the prompt line's rate leaves them out)
     tick = (0, 0.0, 0.0, 0)  # the running reply's (prompt tokens, prompt ms, its start, generated tokens): timings_now
     # --agents (SlotServer): the slot scheduler (None: one request at a time on the engine's own sequence); the running
     # request's return_progress callback (its handler sets it), slot job, slot sampling and wait for a free slot (seconds)
@@ -68,8 +70,6 @@ class Server(CacheMixin, InfoMixin, PromptMixin, GenerateMixin):
         t0 = time.time()
         self.eng = Engine(args.lib, args.model, self.engine_ctx(args), args.draft, args.draft_vocab,
                           {"f16": 0, "q8": 1, "auto": -1}[args.kv], "none" if args.no_mtp else args.mtp)
-        if not self.eng.has_mtp:
-            log("no MTP layer: plain decoding (depth 0)")
         # --chat-template-file / --chat-template (read and checked in main) replace the GGUF's template everywhere it is
         # used: chat and Anthropic requests, /apply-template, token counts, /props; a GGUF without one gets ChatML
         src = getattr(args, "chat_template_src", None)
@@ -105,10 +105,10 @@ class Server(CacheMixin, InfoMixin, PromptMixin, GenerateMixin):
         self.lock = FifoLock()
         self.warned = set()
         self.setup_slots(args)
-        vis = (f", vision on the CPU ({os.path.basename(args.mmproj)}, {self.vision.backend}, {self.vision.n_threads} threads)"
-               if self.vision else "")
+        drafts = f"{args.draft} drafts" if self.eng.has_mtp else "no drafts (no MTP layer)"
+        exact = ", exact reuse" if self.eng.exact else ""
         self.t_start = time.time()
-        log(f"ready in {time.time() - t0:.1f} s: {self.model_id}, ctx {args.ctx}, {args.draft} drafts{vis}")
+        log(f"ready in {time.time() - t0:.1f} s: {self.model_id}, {self.ctx_text()}, {drafts}{exact}{self.ready_media()}")
         self.warm_s = self.eng.keep_warm()  # (MK_KEEP_WARM_S: the first reply starts at full clocks too)
 
     def setup_specials(self, args):
@@ -146,6 +146,17 @@ class Server(CacheMixin, InfoMixin, PromptMixin, GenerateMixin):
         """the positions of the engine's own sequence (SlotServer: the slots have their own)"""
         return args.ctx
 
+    def ctx_text(self):
+        """the context on the console's ready line"""
+        return f"ctx {self.args.ctx:,}"
+
+    def ready_media(self):
+        """what the ready line says of the inputs beside text"""
+        if not self.vision:
+            return ""
+        return (f", images{' and video' if self.video_ok else ''} on the CPU ({os.path.basename(self.args.mmproj)}, "
+                f"{self.vision.backend}, {self.vision.n_threads} threads)")
+
     def setup_slots(self, args):
         """(SlotServer: opens the engine's parallel slots and starts their scheduler)"""
 
@@ -161,10 +172,10 @@ class Server(CacheMixin, InfoMixin, PromptMixin, GenerateMixin):
         self.store_mib = max(park, SIDE_STORE_MIB if side > 0 else 0)
         self.eng.store_budget(self.store_mib << 20)
         pt, rings, state, ck = self.eng.kv_sizes()
-        log(f"host cache (allocated on first use, at most {self.store_mib:,} MiB): side requests "
-            f"{f'up to {side:,} tok' if side > 0 else 'off'}, parked conversations "
-            f"{f'up to {park:,} MiB, {args.park_cks} checkpoints each' if park > 0 else 'off'} ({pt:,} B per token, "
-            f"{mib(state)} recurrent state, {mib(ck)} per checkpoint)")
+        log(f"host cache: side requests {f'up to {side:,} tok' if side > 0 else 'off'}, parked conversations "
+            f"{f'up to {park:,} MiB' if park > 0 else 'off'}")
+        vlog(f"host cache: at most {self.store_mib:,} MiB of host memory, allocated on first use; {args.park_cks} "
+             f"checkpoints per parked conversation; {pt:,} B per token, {mib(state)} recurrent state, {mib(ck)} per checkpoint")
         if side > 0 and park > 0 and not self.side_keep():
             log(f"a side request's own conversation is not kept: {os.path.basename(args.lib)} has no mk_side_end_park "
                 f"(rebuild it): its next turn is prefilled in full")
@@ -190,8 +201,11 @@ class Server(CacheMixin, InfoMixin, PromptMixin, GenerateMixin):
             log(f"video input off: {e}")
             return
         self.decoder, self.video_ok = dec, True
-        log(f"video input: {exe} ({dec.version}), {args.video_fps:g} fps, frames of at most "
-            f"{args.video_max_tokens or args.image_max_tokens or 'the default'} tokens, {mk_limits.MAX_VIDEO_FRAMES} frames per request")
+        ver = re.match(r"ffmpeg version (\S+)", dec.version)
+        most = args.video_max_tokens or args.image_max_tokens
+        vlog(f"video input: ffmpeg {ver.group(1) if ver else dec.version} ({exe}), {args.video_fps:g} fps, "
+             f"{f'frames of at most {most:,} tokens' if most else 'frames at the image token limit'}, "
+             f"{mk_limits.MAX_VIDEO_FRAMES} frames per request")
 
 
 class PerRequest:
@@ -270,9 +284,15 @@ class SlotServer(Server):
             feed = "a waiting prompt is fed whole between two decode cycles (the other slots wait meanwhile)"
         if s.solo:
             feed += f", {s.solo} tokens at a time while no slot decodes"
-        log(f"--agents {args.agents}: {plural(args.agents, 'slot')} of {args.ctx:,} positions each (q8_0 KV{', ' + kv if kv else ''}"
-            f"{', MK_EXACT: prefill rows independent of the chunking' if self.eng.exact else ''}); {feed}; side requests, "
-            f"parked conversations, pinned checkpoints and images are off; presence / frequency penalties are refused")
+        vlog(f"--agents {args.agents}: {plural(args.agents, 'slot')} of {args.ctx:,} positions each (q8_0 KV{', ' + kv if kv else ''}"
+             f"{', MK_EXACT: prefill rows independent of the chunking' if self.eng.exact else ''}); {feed}; side requests, "
+             f"parked conversations, pinned checkpoints and images are off; presence / frequency penalties are refused")
+
+    def ctx_text(self):
+        return f"{plural(self.args.agents, 'slot')} of {self.args.ctx:,} positions"
+
+    def ready_media(self):
+        return ", text only (no images, parking, side requests or presence / frequency penalties)"
 
     def status(self, text):
         pass
@@ -289,11 +309,19 @@ class SlotServer(Server):
     def counters(self):
         m = super().counters()
         m["deferred"] = self.sched.counts()[0]  # (requests waiting for a free slot)
-        m["decode_cycles"] = self.sched.cycles  # (engine cycles of all slots together; drafts are not counted per slot)
+        m["decode_cycles"] = self.sched.cycles  # (engine cycles of all slots together; the draft counts add each slot's)
         return m
 
     def eng_stats(self):
-        return None  # (the engine counts the cycles of every slot together)
+        """the running request's own (decode cycles, drafted, accepted) over the cycles it took, from its first on
+        (SlotScheduler, from the engine's counters of its slot), or None (a library without them)"""
+        job = self.job
+        if job is None or job.spent is None:
+            return None
+        return job.seen or (0, 0, 0)
+
+    def stats_base(self):
+        return None if self.eng_stats() is None else (0, 0, 0)
 
     def props(self):
         p = super().props()
@@ -335,5 +363,16 @@ class SlotServer(Server):
         job = self.job = self.sched.submit(toks, self.slot_sp, max_new, self.rid)
         tok, reused = job.prompt(gone, self.on_progress)
         self.queued_s = job.t_begin - job.t_submit
-        self.cache_note = f"slot {job.slot}" + (f" (after {secs(self.queued_s)} in the queue)" if self.queued_s >= 0.01 else "")
+        # (Server.load_prompt's note, in the slot the scheduler chose: the engine's slot_begin truncates to the common
+        # prefix when it can, else goes back to a checkpoint before it, else starts over)
+        had = f"the prompt matches {job.match:,} of the {job.held:,} cached tok in slot {job.slot}"
+        if not job.held:
+            note = f"nothing cached in slot {job.slot}"
+        elif not reused:
+            note = f"CACHE MISS: {had}, no checkpoint before that" if job.match >= MISS_MIN else f"nothing reused: {had}"
+        elif reused >= min(job.match, len(toks) - 1):
+            note = f"{had}: continued from there"
+        else:
+            note = f"{had}: resumed at the checkpoint at {reused:,}"
+        self.cache_note = note + (f", after {secs(self.queued_s)} in the queue" if self.queued_s >= 0.01 else "")
         return tok, reused, job.step

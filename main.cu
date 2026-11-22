@@ -179,6 +179,8 @@ static int run(int argc, char ** argv);
 // engine errors (bad arguments, a prompt over the context, non-sticky CUDA errors) end the run with a message and
 // exit code 1; sticky CUDA errors exit inside the engine with code 4, a watchdog timeout with code 3
 int main(int argc, char ** argv) {
+    const char * verbose = getenv("MK_VERBOSE");
+    if (!verbose || !*verbose) mk_set_verbose(true); // (a measuring tool: the engine's load details by default)
     try {
         return run(argc, argv);
     } catch (const std::exception & e) {

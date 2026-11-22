@@ -3,6 +3,20 @@
 
 #include "engine_impl.h"
 
+static std::atomic<int> g_verbose{-1}; // -1: MK_VERBOSE decides, at the first call
+
+bool mk_verbose() {
+    int v = g_verbose.load();
+    if (v < 0) {
+        const char * e = getenv("MK_VERBOSE");
+        v = e && *e && strcmp(e, "0") != 0;
+        g_verbose.store(v);
+    }
+    return v == 1;
+}
+
+void mk_set_verbose(bool on) { g_verbose.store(on ? 1 : 0); }
+
 #if MK_SPEC_LOG
 void MKEngine::Impl::slog_drafts() {
     if (!slog) return;
@@ -887,7 +901,7 @@ int MKEngine::position() const { return p_->hctl.n; }
 void MKEngine::set_n_draft(int n) {
     if (!p_->has_mtp && n > 0) { // (no MTP block: depth 0, a notice once)
         static bool told = false;
-        if (!told) fprintf(stderr, "[mk] n_draft %d -> 0 (no MTP layer)\n", n);
+        if (!told && mk_verbose()) fprintf(stderr, "[mk] n_draft %d -> 0 (no MTP layer)\n", n);
         told = true;
         n = 0;
     }

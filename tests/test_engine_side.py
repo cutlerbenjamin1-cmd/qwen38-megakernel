@@ -51,6 +51,7 @@ class _SideEngine(base._StoreEngine):
 
 
 class SideConversationTests(base._HttpCase):
+    VERBOSE = True
     LONG = base.HostCacheTests.LONG
     chat, metrics, quiet = base.HostCacheTests.chat, base.HostCacheTests.metrics, base.HostCacheTests.quiet
 

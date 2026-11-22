@@ -50,6 +50,7 @@
 #   MK_TIMEOUT_S        seconds a connection may make no progress before it closes (default 600, 0 = never)
 #   MK_REQUEST_TIMEOUT_S seconds a request may take to arrive before its connection closes (default 300, 0 = no limit)
 #   MK_PYTHON           Python with jinja2 (default python3)
+#   MK_VERBOSE=1        the console's details too: the engine's load steps, the host cache's parks and evictions (-v)
 set -euo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 PORT="${1:-8080}"

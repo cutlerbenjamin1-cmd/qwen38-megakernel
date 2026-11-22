@@ -67,6 +67,11 @@ class SlotJob:
         self.sched, self.toks, self.sp, self.max_new, self.rid = sched, toks, sp, max_new, rid
         self.q = queue.Queue()
         self.state, self.slot, self.reused, self.left, self.n = "queued", None, 0, len(toks), 0
+        self.match = self.held = 0  # the prompt's common prefix with its slot's sequence, that sequence's length
+        # the slot's (cycles, drafted, accepted) when the job began decoding, the job's own since (None: unknown), and
+        # those as of the last cycle the request took from q (they travel with each cycle's tokens: the scheduler may
+        # have run further cycles by the time the request stops)
+        self.st0 = self.spent = self.seen = None
         self.closed = False
         self.t_submit, self.t_begin = time.time(), None
         self.gone, self.rest = (lambda: False), []
@@ -92,6 +97,8 @@ class SlotJob:
                 continue
             if isinstance(item, BaseException):
                 raise item
+            if isinstance(item, tuple):  # (a cycle's tokens and the job's counts after it)
+                item, self.seen = item
             return item
 
     def prompt(self, gone, progress=None):
@@ -171,6 +178,7 @@ class SlotScheduler:
         self.last = [None] * n  # each slot's latest job (GET /slots)
         self.warm = False  # the keep-warm load is armed
         self.cycles = 0
+        self.stats = eng.slot_stats if getattr(eng, "slot_stats_ok", False) else None  # (a slot's draft counters)
         threading.Thread(target=self.run, name="mk-slots", daemon=True).start()
 
     def submit(self, toks, sp, max_new, rid=0):
@@ -230,6 +238,9 @@ class SlotScheduler:
             self._end(job)
         else:
             job.state = "decode"
+            if self.stats is not None:
+                job.st0 = self.stats(slot)
+                job.spent = (0, 0, 0)
             self.active[slot] = job
 
     def run(self):
@@ -272,6 +283,7 @@ class SlotScheduler:
             self.warm = False
             eng.keep_warm(False)
         for slot, job in admit:
+            job.match, job.held = common_prefix(self.seq[slot], job.toks), len(self.seq[slot])
             try:
                 p = self.held[slot]
                 if self.exact and p and common_prefix(self.seq[slot], job.toks) >= p:  # (exact reuse: see the class)
@@ -326,6 +338,8 @@ class SlotScheduler:
                 continue
             self.seq[s] += toks
             job.n += len(toks)
-            job.q.put(toks)
+            if job.st0 is not None:
+                job.spent = tuple(b - a for a, b in zip(job.st0, self.stats(s)))
+            job.q.put((toks, job.spent))
             if job.n >= job.max_new or any(eng.is_eog(t) for t in toks):
                 self._finish(s)

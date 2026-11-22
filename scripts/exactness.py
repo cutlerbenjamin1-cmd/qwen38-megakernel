@@ -165,7 +165,7 @@ class Server:
         if port_open(a.port):
             raise LegFailed(f"{self.name}: port {a.port} is in use (--port)")
         cmd = [a.python, os.path.join(HERE, "server", "mk_server.py"), "-m", a.model, "--port", str(a.port), "-c", str(self.ctx),
-               "--kv", "q8", "-d", str(max(a.depths)), "--exact-reuse"] + self.args
+               "--kv", "q8", "-d", str(max(a.depths)), "--exact-reuse", "-v"] + self.args  # (-v: logged() greps its lines)
         if a.draft_vocab:
             cmd += ["--draft-vocab", a.draft_vocab]
         env = {k: v for k, v in os.environ.items() if k != "MK_API_KEY"}  # (its own server: the requests carry no key)
@@ -285,8 +285,9 @@ class Check:
         cmd = [a.bin, "-m", a.model, "--kv", "q8"] + (["--draft-vocab", a.draft_vocab] if a.draft_vocab else []) + args
         with open(self.path(name, "out"), "wb") as o, open(self.path(name, "err"), "wb") as e:
             try:
+                # (MK_VERBOSE=1: err_has() greps the load's detail lines, which a caller's MK_VERBOSE=0 would hide)
                 rc = subprocess.run(cmd, stdin=subprocess.DEVNULL, stdout=o, stderr=e, timeout=a.timeout,
-                                    env=dict(os.environ, **(env or {}))).returncode
+                                    env={**os.environ, "MK_VERBOSE": "1", **(env or {})}).returncode
             except subprocess.TimeoutExpired:
                 rc = "a timeout"
         if rc != 0:

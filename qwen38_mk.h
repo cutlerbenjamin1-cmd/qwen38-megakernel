@@ -34,6 +34,11 @@ struct MKStats {
     int last_T = 0, last_nd = 0, last_acc = 0; // the last step: tokens verified, drafts produced, accepted
 };
 
+// MK_VERBOSE (set, and not 0): the load's details and the engine's other notes on stderr; otherwise its warnings, errors
+// and a load summary only. mk_set_verbose overrides the environment (the CLI's default is on).
+bool mk_verbose();
+void mk_set_verbose(bool on);
+
 class MKEngine {
   public:
     // n_draft: MTP draft tokens per cycle (0 .. MAXD - 1: 7 in the served build). ctx: KV-cache capacity in tokens.
@@ -236,6 +241,7 @@ class MKEngine {
     std::vector<std::vector<int>> slots_step_mixed(int pslot, int budget, const std::vector<int> & slots, int & remain);
     int slot_segment(int) const { return 0; } // (no shared segments)
     std::vector<int> slot_sequence(int slot);
+    MKStats slot_stats(int slot) const; // the slot's decode cycles, drafted and accepted tokens since slots_open
     std::vector<float> slot_h(int slot);
     // Teacher-forced greedy predictions: pred[i] = argmax of the next-token distribution after
     // tokens[0..i] (resets the sequence).

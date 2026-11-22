@@ -37,6 +37,7 @@ REM                       request bodies in memory at once (default 256 MB), ope
 REM   MK_TIMEOUT_S        seconds a connection may make no progress before it closes (default 600, 0 = never)
 REM   MK_REQUEST_TIMEOUT_S seconds a request may take to arrive before its connection closes (default 300, 0 = no limit)
 REM   MK_PYTHON           Python with jinja2 (default python)
+REM   MK_VERBOSE=1        the console's details too: the engine's load steps, the host cache's parks and evictions (-v)
 setlocal
 set "HERE=%~dp0.."
 set "PORT=%~1"
@@ -92,5 +93,8 @@ if defined MK_CHAT_TEMPLATE_FILE set CT=--chat-template-file "%MK_CHAT_TEMPLATE_
 if defined MK_CHAT_TEMPLATE_FILE set "CTS=, chat template %MK_CHAT_TEMPLATE_FILE%"
 set "DQ="
 if "%MK_DRAFT_Q4%"=="0" set "DQ=, draft head on lm_head"
-echo megakernel: %MK_MODEL%, ctx %CTX%, KV q8_0 %MK_KV%%KVS%, %MK_DRAFT% MTP drafts%DQ%, prefill chunk %PFC%, exact reuse %XS%, images %VS%%CTS%, http://%MK_HOST%:%PORT%
+set "KVT=q8_0"
+if defined MK_KV set "KVT=q8_0 + MK_KV=%MK_KV%"
+if defined MK_KV if defined MK_KV_WIN set "KVT=%KVT% (window %MK_KV_WIN%)"
+echo megakernel: %MK_MODEL%, ctx %CTX%, KV %KVT%%KVS%, %MK_DRAFT% MTP drafts%DQ%, prefill chunk %PFC%, exact reuse %XS%, images %VS%%CTS%, http://%MK_HOST%:%PORT%
 "%MK_PYTHON%" "%HERE%\server\mk_server.py" -m "%MK_MODEL%" --host %MK_HOST% --port %PORT% -c %CTX% --kv q8 -d %MK_DRAFT% %XR% %VA% %CT%

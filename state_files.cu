@@ -79,7 +79,8 @@ void MKEngine::Impl::st_name(const std::vector<int> & head, std::string & path, 
                                         "MK_K1=", "MK_K2=", "MK_GSB", // (K1 / K2 / gsync bench: decode only)
                                         "MK_K6=",                     // (K6: decode only; MK_K8 = prefill: kept)
                                         "MK_PF_PROFILE", "MK_PF_GAPS", "MK_PF_SYNC", // (prefill timing / launch flow)
-                                        "MK_CK_DEVICE", "MK_STORE_", "MK_SLOT_RESERVE", "MK_CUDAMALLOC"}; // (placement)
+                                        "MK_CK_DEVICE", "MK_STORE_", "MK_SLOT_RESERVE", "MK_CUDAMALLOC", // (placement)
+                                        "MK_VERBOSE", "MK_AGENTS"}; // (console output)
     std::vector<std::string> env;
     for (char ** e = environ; *e; e++) {
         if (strncmp(*e, "MK_", 3)) continue;

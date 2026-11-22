@@ -43,6 +43,7 @@ import threading
 import traceback
 
 import mk_limits
+import mk_log
 from mk_chat import REASONING_FORMATS, TEMPLATE_KWARGS
 from mk_core import Server, SlotServer
 from mk_gate import Gate, GatedHandler, exposure_warning
@@ -217,13 +218,25 @@ def main():
     ap.add_argument("--ffmpeg", default=None,
                     help="ffmpeg executable (or its directory) for video input (env MK_FFMPEG; default: ffmpeg on PATH, "
                          "else the imageio-ffmpeg package's)")
+    ap.add_argument("-v", "--verbose", action="store_true", default=os.environ.get("MK_VERBOSE", "0") not in ("", "0"),
+                    help="the console's details too: the engine's load steps and libllama's vocabulary log, the host "
+                         "cache's parks, restores and evictions (env MK_VERBOSE=1)")
     args = ap.parse_args()
+    if args.verbose:
+        os.environ["MK_VERBOSE"] = "1"  # (the engine reads it at its load)
+        mk_log.VERBOSE = True
     if args.parallel < 0 or args.agents < 0:
         ap.error("--agents / --parallel: expected a number of slots >= 0")
     if args.ctx is None:  # (--agents: the most that fits in each slot; --parallel, as open-jet's: 32768 each)
         args.ctx = 0 if args.agents > 0 and not args.parallel else 32768
     if args.parallel:
         args.agents = args.parallel
+    # (the engine's load lines: with slots its own sequence is the warm-up's only; a shell's MK_AGENTS under --agents 0
+    # must not hide the KV line of the one sequence)
+    if args.agents > 0:
+        os.environ["MK_AGENTS"] = str(args.agents)
+    else:
+        os.environ.pop("MK_AGENTS", None)
     if args.agents > 0:
         if args.kv == "f16":
             ap.error("--agents: the parallel slots need the q8_0 KV cache (--kv q8 or auto)")
@@ -311,8 +324,6 @@ def main():
     def load():
         try:
             srv = (SlotServer if args.agents > 0 else Server)(args)
-            if srv.eng.exact and not args.agents:
-                log("exact reuse: on (MK_EXACT)")
             box["srv"] = srv
             httpd.RequestHandlerClass = make_handler(srv)
         except BaseException as e:  # (the server exits: serve_forever returns)

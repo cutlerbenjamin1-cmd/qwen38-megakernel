@@ -804,7 +804,7 @@ MKEngine::Impl::Impl(const std::string & path, int ctx_, int ndraft_, const std:
         if (!has_mtp) {
             mtp_desc = "none";
             kv_slots = N_ATT_SLOTS - 1;
-            if (ndraft > 0) fprintf(stderr, "[mk] n_draft %d -> 0 (no MTP layer)\n", ndraft);
+            if (ndraft > 0 && mk_verbose()) fprintf(stderr, "[mk] n_draft %d -> 0 (no MTP layer)\n", ndraft);
             ndraft = nd_avail = n_draft_max = n_draft_cap = 0;
         }
     }
@@ -855,8 +855,9 @@ MKEngine::Impl::Impl(const std::string & path, int ctx_, int ndraft_, const std:
         const char * sl = getenv("MK_STACK_LIMIT");
         stack_res = std::max((size_t) fa.localSizeBytes, sl ? (size_t) atol(sl) : (size_t) 0);
         CK(cudaDeviceSetLimit(cudaLimitStackSize, stack_res));
-        fprintf(stderr, "[mk] MK_RESERVE_EARLY: stack limit %zu B per thread (mk_cycle's frame %zu B), kernel loads before the KV cache\n",
-                stack_res, (size_t) fa.localSizeBytes);
+        if (mk_verbose())
+            fprintf(stderr, "[mk] MK_RESERVE_EARLY: stack limit %zu B per thread (mk_cycle's frame %zu B), kernel loads before the KV cache\n",
+                    stack_res, (size_t) fa.localSizeBytes);
     }
     upl.start(!(getenv("MK_LOAD_ASYNC") && atoi(getenv("MK_LOAD_ASYNC")) == 0));
     // token_embd's mapped pinned table (0.7 GB: ~0.8 s under WSL2) allocated by a helper thread while the weights load
@@ -1021,8 +1022,9 @@ MKEngine::Impl::Impl(const std::string & path, int ctx_, int ndraft_, const std:
     }
     mem_mark("weights: 64 layers + MTP");
     wv_lay = false;
-    fprintf(stderr, "[mk] wv: %d main-pass matrices in the wv layout (%d on the device, the others re-laid-out on the host in %.1f s; "
-                    "Q6_K everywhere (FM), ffn_down every type; elsewhere Q3_K / IQ3_S stay on dp4a), MAXT %d\n", wv_n, wv_dev_n, wv_s, MAXT);
+    if (mk_verbose())
+        fprintf(stderr, "[mk] wv: %d main-pass matrices in the wv layout (%d on the device, the others re-laid-out on the host in %.1f s; "
+                        "Q6_K everywhere (FM), ffn_down every type; elsewhere Q3_K / IQ3_S stay on dp4a), MAXT %d\n", wv_n, wv_dev_n, wv_s, MAXT);
     if (has_mtp) {
         req_q4 = true;
         hw.eh = up_mat(blk(NL, "nextn.eh_proj.weight"), 2 * D, D);
@@ -1100,7 +1102,7 @@ MKEngine::Impl::Impl(const std::string & path, int ctx_, int ndraft_, const std:
         }
         dv_in.assign(VOCAB, 0);
         for (int t : ids) dv_in[t] = 1;
-        fprintf(stderr, "[mk] MTP draft head restricted to %d tokens (%s)\n", m.N, draft_vocab.c_str());
+        if (mk_verbose()) fprintf(stderr, "[mk] MTP draft head restricted to %d tokens (%s)\n", m.N, draft_vocab.c_str());
         if (draft_q4) { // MK_DRAFT_Q4: the rows' Q4_K copy (row r = lm_head row ids[r], from the file's Q6_K or Q8_0)
             auto _ = lc.scope("draft head Q4_K copy (MK_DRAFT_Q4)");
             const auto t0 = lclk::now();
@@ -1118,8 +1120,9 @@ MKEngine::Impl::Impl(const std::string & path, int ctx_, int ndraft_, const std:
             hw.dq4 = dput<uint8_t>(q.data(), q.size());
             own_keep.push_back(std::move(q)); // (until its upload is done)
             hw.dq4_n = dq4_rows = (int) ids.size();
-            fprintf(stderr, "[mk] draft head: %d rows re-quantised to Q4_K in %.2f s (%.1f MiB; drafts only, MK_DRAFT_Q4=0: off)\n",
-                    dq4_rows, lsec(t0), (double) rs_to * dq4_rows / 1048576.0);
+            if (mk_verbose())
+                fprintf(stderr, "[mk] draft head: %d rows re-quantised to Q4_K in %.2f s (%.1f MiB; drafts only, MK_DRAFT_Q4=0: off)\n",
+                        dq4_rows, lsec(t0), (double) rs_to * dq4_rows / 1048576.0);
         }
     } else if (draft_q4 && draft_q4_env) {
         fprintf(stderr, "[mk] MK_DRAFT_Q4 ignored: it needs a draft vocabulary (--draft-vocab)\n");
@@ -1149,7 +1152,7 @@ MKEngine::Impl::Impl(const std::string & path, int ctx_, int ndraft_, const std:
             void * d = nullptr;
             CK(cudaHostGetDevicePointer(&d, embd_host, 0));
             hw.embd = (const uint8_t *) d;
-            fprintf(stderr, "[mk] token_embd in mapped host memory (%.2f GB, pinned in %.2f s)\n", t.nbytes / 1e9, embd_pin_s);
+            if (mk_verbose()) fprintf(stderr, "[mk] token_embd in mapped host memory (%.2f GB, pinned in %.2f s)\n", t.nbytes / 1e9, embd_pin_s);
         } else {
             cudaGetLastError();
             embd_host = nullptr;
@@ -1162,12 +1165,12 @@ MKEngine::Impl::Impl(const std::string & path, int ctx_, int ndraft_, const std:
     wv_dev_done();
     CK(mkl::set_cW(&hw, sizeof(ModelW)));
     mem_mark("cW symbol (module load)");
-    if (n_conv)
+    if (n_conv && mk_verbose())
         fprintf(stderr, "[mk] %d tensors re-encoded in %.1f s (exact: Q3_K / IQ3_S -> Q6_K with MK_REENC3, IQ4_NL -> Q8_0 with MK_IQ4NL_Q8; ssm_alpha / beta -> F32)\n",
                 n_conv, conv_s);
-    if (n_nat)
+    if (n_nat && mk_verbose())
         fprintf(stderr, "[mk] %d Q3_K / IQ3_S tensors repacked to their native layouts in %.1f s (exact, checked per row)\n", n_nat, nat_s);
-    if (n_req)
+    if (n_req && mk_verbose())
         fprintf(stderr, "[mk] MTP block: %d matrices re-quantised to Q4_K in %.1f s (drafts only)\n", n_req, req_s);
 
     hb.x = dalloc<float>(RMAX * D);
@@ -1189,7 +1192,7 @@ MKEngine::Impl::Impl(const std::string & path, int ctx_, int ndraft_, const std:
     // stockfix switches (bit-exact): K1 MK_K1, K2 MK_K2 (both default on)
     hb.k1 = !(getenv("MK_K1") && atoi(getenv("MK_K1")) == 0);
     hb.k2 = !(getenv("MK_K2") && atoi(getenv("MK_K2")) == 0);
-    fprintf(stderr, "[mk] stockfix: K1 ab dealing %d, K2 combine %d (tb %d)\n", hb.k1, hb.k2, MK_K2_TB);
+    if (mk_verbose()) fprintf(stderr, "[mk] stockfix: K1 ab dealing %d, K2 combine %d (tb %d)\n", hb.k1, hb.k2, MK_K2_TB);
     // stock2 switches: K6 MK_K6 (bits: 2 dealing across blocks, exact; 4 8-row halves of the Q8_0
     // k / v tiles, exact), K8 MK_K8 (bits, prefill, exact: 1 pk_ab on a second stream, 2 pk_norm_quant reads x once,
     // 4 pk_dn_prep MK_K8_NT tokens per block); compile-time K7 (state layout), K6_LD (Q8_0 tile loads)
@@ -1198,7 +1201,7 @@ MKEngine::Impl::Impl(const std::string & path, int ctx_, int ndraft_, const std:
         throw std::runtime_error("MK_K6=" + std::to_string(hb.k6) + ": bit 1 (the K-split of the Q8_0 k / v tiles) was removed; bits 2 and 4 remain (default 6)");
     k8 = getenv("MK_K8") ? atoi(getenv("MK_K8")) : MK_K8_DEF;
     if (const char * e = getenv("MK_K8_NT")) k8_nt = atoi(e) == 8 ? 8 : 4;
-    fprintf(stderr, "[mk] stock2: K6 %d, K8 %d (nt %d)\n", hb.k6, k8, k8_nt);
+    if (mk_verbose()) fprintf(stderr, "[mk] stock2: K6 %d, K8 %d (nt %d)\n", hb.k6, k8, k8_nt);
     {
         // [name, default, largest]: past what a matrix holds the loops stop at its end, so the largest values mean "all"
         struct L2Env { const char * name; int * v; int def, hi; };
@@ -1233,8 +1236,10 @@ MKEngine::Impl::Impl(const std::string & path, int ctx_, int ndraft_, const std:
             if (getenv(e.name)) fprintf(stderr, "[mk] %s ignored: the L2 budgets are constants in this build (-DMK_L2_TUNE=1: make MKFLAGS=..., build.ps1 -MkFlags ...)\n", e.name);
 #endif
     }
-    fprintf(stderr, "[mk] K5: split dn_proj -> dn_core barrier, delta-net heads in dn_proj arrival order\n");
-    fprintf(stderr, "[mk] C1: ffn_gu -> ffn_down per-chunk waits instead of a grid barrier\n");
+    if (mk_verbose()) {
+        fprintf(stderr, "[mk] K5: split dn_proj -> dn_core barrier, delta-net heads in dn_proj arrival order\n");
+        fprintf(stderr, "[mk] C1: ffn_gu -> ffn_down per-chunk waits instead of a grid barrier\n");
+    }
     CK(mkl::wv_deal_init(nsm)); // (MK_FFNA builds; every mk_cycle launch that runs a wv phase has nsm blocks)
     hb.ctx = ctx + KV_PAD; // rows per kv head (KV_PAD: the MTP draft rows written past the last admitted position)
     // the device buffers after the KV cache (MK_RESERVE_EARLY: before it, so that its fit check sees them)
@@ -1293,6 +1298,7 @@ MKEngine::Impl::Impl(const std::string & path, int ctx_, int ndraft_, const std:
         mem_mark("kernel loads (early)");
         dev_bufs();
     }
+    std::string kv_line; // (the KV cache's line: printed after the load summary, as slots_open's is; MK_VERBOSE: here)
     {
         const size_t rows = (size_t) kv_slots * NKV * hb.ctx; // (no MTP block: no slot N_ATT_SLOTS - 1)
         size_t free_b = 0, total_b = 0;
@@ -1416,9 +1422,10 @@ MKEngine::Impl::Impl(const std::string & path, int ctx_, int ndraft_, const std:
             const long long margin = (long long) ((mg ? std::max(0.0, atof(mg)) : 384.0) * MiB);
             const long long avail = (long long) fr + (long long) (res > used ? res - used : 0);
             const long long left = avail - (long long) (fit_b + post);
-            fprintf(stderr, "[mk] KV fit (MK_RESERVE_EARLY): %.1f MiB free (+ %.1f in the pool), the cache %.1f MiB (rings %.1f), after it "
-                            "%.1f (prefill scratch %.1f): %.1f MiB left, margin %.1f (MK_VRAM_MARGIN)\n",
-                    fr / MiB, (avail - (long long) fr) / MiB, fit_b / MiB, ring_b / MiB, post / MiB, scr / MiB, left / MiB, margin / MiB);
+            if (mk_verbose())
+                fprintf(stderr, "[mk] KV fit (MK_RESERVE_EARLY): %.1f MiB free (+ %.1f in the pool), the cache %.1f MiB (rings %.1f), after it "
+                                "%.1f (prefill scratch %.1f): %.1f MiB left, margin %.1f (MK_VRAM_MARGIN)\n",
+                        fr / MiB, (avail - (long long) fr) / MiB, fit_b / MiB, ring_b / MiB, post / MiB, scr / MiB, left / MiB, margin / MiB);
             if (left < margin) {
                 // the -c whose cache and RoPE table leave the margin (the table is allocated already, at this -c)
                 const long long room = avail + (long long) ((size_t) hb.ctx * 32 * sizeof(float2)) - (long long) (ring_b + post + 64) - margin;
@@ -1501,14 +1508,23 @@ MKEngine::Impl::Impl(const std::string & path, int ctx_, int ndraft_, const std:
                         ring_bytes += (size_t) NKV * hb.kvrc * (HD + HD / 16);
                         nr++;
                     }
-            fprintf(stderr, "[mk] KV recent window: the last %d..%d positions of %d low-bit sides stay q8 (MK_KV_WIN=%d; rings of %d rows per head, %.1f MiB)\n",
-                    kvwr - ATT_BUCKET + 1, kvwr, nr, hb.kvwin, hb.kvrc, ring_bytes / 1048576.0);
+            if (mk_verbose())
+                fprintf(stderr, "[mk] KV recent window: the last %d..%d positions of %d low-bit sides stay q8 (MK_KV_WIN=%d; rings of %d rows per head, %.1f MiB)\n",
+                        kvwr - ATT_BUCKET + 1, kvwr, nr, hb.kvwin, hb.kvrc, ring_bytes / 1048576.0);
         }
         const double gb = q8 ? (vbytes[0] + vbytes[1] + 2.0 * rows * (HD / 32) * 2 + ring_bytes) / 1e9 : rows * HD * 4.0 / 1e9;
         if (reserve_early && alloc_bytes - ab0 != fit_b)
             fprintf(stderr, "[mk] warning: MK_RESERVE_EARLY's fit check counted %zu bytes for the KV cache, it took %zu: update the check\n",
                     fit_b, alloc_bytes - ab0);
-        fprintf(stderr, "[mk] KV cache %s, %.2f GB for %d positions\n", q8 ? (n4 ? "q8_0 + q4 (MK_KV)" : "q8_0") : "fp16", gb, ctx);
+        // (--agents, MK_AGENTS: this is the engine's own sequence, for the warm-up; slots_open reports the slots' caches)
+        const char * agents = getenv("MK_AGENTS");
+        if (mk_verbose() || !(agents && atoi(agents) > 0)) {
+            char t[160];
+            snprintf(t, sizeof t, "[mk] KV cache %s, %.2f GB for %s positions", q8 ? kv_label().c_str() : "fp16", gb,
+                     grouped(ctx).c_str());
+            if (mk_verbose()) fprintf(stderr, "%s\n", t);
+            else kv_line = t;
+        }
         // a sysmem-fallback driver puts a cache past the free memory in system memory instead of failing
         if (alloc_bytes - ab0 > free_b)
             fprintf(stderr,
@@ -1516,7 +1532,7 @@ MKEngine::Impl::Impl(const std::string & path, int ctx_, int ndraft_, const std:
                     "sysmem fallback (Windows, WSL2) the rest sits in system memory, read over PCIe (much slower; "
                     "a smaller context fits)\n",
                     (alloc_bytes - ab0) / 1e9, free_b / 1e9);
-        if (n4) {
+        if (n4 && mk_verbose()) {
             std::string k, v, kr, vr;
             for (int s = 0; s < N_ATT_SLOTS; s++) {
                 k += (char) ('0' + hb.kvb[0][s]);
@@ -1601,7 +1617,27 @@ MKEngine::Impl::Impl(const std::string & path, int ctx_, int ndraft_, const std:
     load_report(pf_wait, pf_bytes);
     if (getenv("MK_WDIGEST")) weights_digest();
     if (reserve_early) vram_check("load end");
-    fprintf(stderr, "[mk] weights %.2f GB on device, %d SMs, ctx %d, n_draft %d\n", wbytes / 1e9, nsm, ctx, ndraft);
+    if (mk_verbose()) {
+        fprintf(stderr, "[mk] weights %.2f GB on device, %d SMs, ctx %d, n_draft %d\n", wbytes / 1e9, nsm, ctx, ndraft);
+    } else {
+        fprintf(stderr, "[mk] loaded in %.1f s: weights %.2f GB on the GPU, %d SMs\n", lsec(t_load), wbytes / 1e9, nsm);
+        if (!kv_line.empty()) fprintf(stderr, "%s\n", kv_line.c_str());
+    }
+}
+
+std::string MKEngine::Impl::kv_label() const {
+    std::string k, v;
+    const auto add = [](std::string & s, const std::string & b) {
+        if (("/" + s + "/").find("/" + b + "/") == std::string::npos) s += (s.empty() ? "" : "/") + b;
+    };
+    bool low = false;
+    for (int sl = 0; sl < kv_slots; sl++) {
+        add(k, std::to_string(hb.kvb[0][sl]) + (hb.kvr[sl] ? "r" : ""));
+        add(v, std::to_string(hb.kvb[1][sl]) + (hb.kvrv[sl] ? "r" : ""));
+        low |= hb.kvb[0][sl] != 8 || hb.kvb[1][sl] != 8 || hb.kvr[sl] || hb.kvrv[sl];
+    }
+    if (!low) return "q8_0";
+    return "MK_KV K " + k + " V " + v + (hb.kvwin > 0 ? " + q8_0 window" : "");
 }
 
 void MKEngine::Impl::load_report(double pf_wait, size_t pf_bytes) {
@@ -1615,12 +1651,13 @@ void MKEngine::Impl::load_report(double pf_wait, size_t pf_bytes) {
         if (p.first.compare(0, 6, "repack") == 0) rep += p.second;
     }
     auto g = [&](const char * k) { return lc.get(k); };
-    fprintf(stderr, "[mk] load %.2f s: context %.2f, read-ahead wait %.2f (%.1f GB read), repack %.2f, wv re-layout %.2f, "
-                    "MTP requant wait %.2f (background %.2f), token_embd %.2f, ckpt pool %.2f, prefill scratch %.2f, upload tail %.2f, "
-                    "other %.2f (device allocs %.2f of it), upload stalls %.2f | uploads %.2f GB, %.2f s in copies (%s)\n",
-            tot, g("CUDA context"), pf_wait, pf_bytes / 1e9, rep, g("wv re-layout"), g("MTP Q4_K requant (wait for the background thread)"),
-            rq_s, g("token_embd (pinned table)"), g("checkpoint pool (pinned host)"), g("prefill scratch"), g("upload tail (wait)"),
-            tot - known, dalloc_s, g("upload stall (host buffer set busy)"), upl.bytes / 1e9, upl.busy_s, getenv("MK_LOAD_ASYNC") && atoi(getenv("MK_LOAD_ASYNC")) == 0 ? "synchronous" : "worker thread");
+    if (mk_verbose())
+        fprintf(stderr, "[mk] load %.2f s: context %.2f, read-ahead wait %.2f (%.1f GB read), repack %.2f, wv re-layout %.2f, "
+                        "MTP requant wait %.2f (background %.2f), token_embd %.2f, ckpt pool %.2f, prefill scratch %.2f, upload tail %.2f, "
+                        "other %.2f (device allocs %.2f of it), upload stalls %.2f | uploads %.2f GB, %.2f s in copies (%s)\n",
+                tot, g("CUDA context"), pf_wait, pf_bytes / 1e9, rep, g("wv re-layout"), g("MTP Q4_K requant (wait for the background thread)"),
+                rq_s, g("token_embd (pinned table)"), g("checkpoint pool (pinned host)"), g("prefill scratch"), g("upload tail (wait)"),
+                tot - known, dalloc_s, g("upload stall (host buffer set busy)"), upl.bytes / 1e9, upl.busy_s, getenv("MK_LOAD_ASYNC") && atoi(getenv("MK_LOAD_ASYNC")) == 0 ? "synchronous" : "worker thread");
     if (getenv("MK_LOADLOG"))
         for (const auto & p : lc.ph) fprintf(stderr, "[mk-load] %-52s %7.3f s\n", p.first.c_str(), p.second);
 }

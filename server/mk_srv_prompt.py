@@ -13,6 +13,9 @@ from mk_log import CON, secs
 from mk_media import VideoBytes
 
 PIN_MIN = 1024  # a shared prefix shorter than this is not pinned (Server.ck_pins: it is prefilled again in under ~0.5 s)
+# a prompt whose shared prefix with the cached sequence is at least this long but reuses none of it: "CACHE MISS" on its
+# prompt line (shorter ones share a chat template's opening, not work: "nothing reused")
+MISS_MIN = 256
 
 
 class PromptMixin:
@@ -270,7 +273,7 @@ class PromptMixin:
         earlier assistant reply; max_tokens: the request's (-1: none); tools: the request has tools (not tool_choice
         "none"); all three for cache_switch's side request rule"""
         eng = self.eng
-        self.cache_pre = ""
+        self.cache_pre, self.cache_s = "", 0.0
         if self.parked is not None:  # (the host cache: --side-max / --park-mib)
             self.cache_switch(toks, [(p, im.n, im.key) for p, im in images], first_turn, max_tokens, tools)
         seq = eng.sequence()
@@ -343,7 +346,8 @@ class PromptMixin:
                 r = feed(ck)
             else:
                 eng.reset()
-                self.cache_note = f"CACHE MISS: {had}, no checkpoint before that" if seq else "nothing cached"
+                self.cache_note = ("nothing cached" if not seq else f"CACHE MISS: {had}, no checkpoint before that"
+                                   if match >= MISS_MIN else f"nothing reused: {had}")
                 r = feed(0)
         self.img_spans = spans
         self.live_gen, self.live_tools, self.live_low = gen, tools, self.next_low

@@ -2,8 +2,10 @@
 slot API whose replies depend on the prompt and its sampling only, as the real engine's do (a slot decodes as it does
 alone), while how many tokens each cycle emits depends on how many slots decode together (as the real depth policy)."""
 import http.client
+import io
 import json
 import socket
+import sys
 import threading
 import time
 import types
@@ -149,6 +151,27 @@ class _SlotEngine:
             self._busy.release()
 
 
+class _StatsSlotEngine(_SlotEngine):
+    """with mk_slot_stats: each slot's decode cycles, drafted tokens (3 per cycle) and accepted ones (its tokens but one)"""
+    slot_stats_ok = True
+
+    def __init__(self, *a, **kw):
+        super().__init__(*a, **kw)
+        self.st = {}
+
+    def _step(self, slots):
+        firsts = {s for s in slots if self.first[s] is not None}  # (a prefill's token: no cycle of its own)
+        out = super()._step(slots)
+        for s, toks in zip(slots, out):
+            if s not in firsts and toks:
+                c, d, a = self.st.get(s, (0, 0, 0))
+                self.st[s] = (c + 1, d + 3, a + len(toks) - 1)
+        return out
+
+    def slot_stats(self, slot):
+        return self.st.get(slot, (0, 0, 0))
+
+
 def _slot_server(mk, eng, n=4, ctx=4096):
     srv = object.__new__(mk.SlotServer)
     srv.local = threading.local()
@@ -279,6 +302,34 @@ class AgentsTests(unittest.TestCase):
         self.assertGreaterEqual(eng.max_batch, 2)
         self.assertEqual(eng.threads, {"mk-slots"})  # (the engine runs on the scheduler's thread only)
         self.assertFalse(eng.overlap)
+        self.idle(srv)
+
+    def test_the_console_lines_have_the_shape_of_one_request_at_a_time(self) -> None:
+        """each request's prompt line names its slot and what that slot shared with the prompt, as the server without
+        --agents names what its one sequence shared; the reply line has the draft acceptance of the request's own
+        cycles, counted by the engine per slot"""
+        eng = _StatsSlotEngine()
+        srv, http_ = self.serve(eng)
+        first = _chat("first question")
+        again = dict(first, messages=first["messages"] + [{"role": "assistant", "content": "ok"},
+                                                          {"role": "user", "content": "more"}])
+        err = io.StringIO()
+        with unittest.mock.patch.object(sys, "stderr", err), unittest.mock.patch.object(self.mk, "CON", self.mk.Console()):
+            for body in (first, again):
+                self.assertEqual(http_.post(body)[0], 200)
+        lines = [ln.split(" ", 2)[2] for ln in err.getvalue().splitlines() if ln.startswith("[mk-server] ")]
+        prompts = [ln for ln in lines if " prompt: " in ln]
+        replies = [ln for ln in lines if " reply: " in ln]
+        self.assertEqual((len(prompts), len(replies)), (2, 2), lines)
+        queue = r"(, after [\d.]+ s in the queue)?"
+        self.assertRegex(prompts[0], r"^#\d+ prompt: 0 cached \+ \d+ prefilled in [\d.]+ s( = [\d,]+ tok/s)? \| "
+                                     r"nothing cached in slot \d" + queue + "$")
+        self.assertRegex(prompts[1], r"^#\d+ prompt: [1-9][\d,]* cached \+ \d+ prefilled .* \| the prompt matches [\d,]+ of "
+                                     r"the [\d,]+ cached tok in slot \d: (continued from there|resumed at the checkpoint at "
+                                     r"[\d,]+)" + queue + "$")
+        for ln in replies:
+            self.assertRegex(ln, r"^#\d+ reply: \d+ tok in [\d.]+ s = [\d.]+ tok/s \| [\d.]+ tok/cycle, \d+% of [\d,]+ drafts "
+                                 r"accepted \| answer \d+ \| finish stop \| request [\d.]+ s$")
         self.idle(srv)
 
     def test_anthropic_and_tools_concurrent(self) -> None:

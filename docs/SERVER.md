@@ -153,8 +153,8 @@ a request arrives, the server:
    [side request](#one-shot-requests-side-requests) beside the cached conversation.
 4. Parks the cached conversation first when the request would throw away at least `--park-min` tokens of it without
    continuing it.
-5. Prefills from position 0 when nothing matches (`CACHE MISS` on the console, with how much of the cached sequence the
-   prompt matched).
+5. Prefills from position 0 when nothing matches (`nothing reused` on the console, or `CACHE MISS` when the prompt
+   shared 256 tokens or more with the cached sequence, with how much of it the prompt matched).
 
 Requests run one at a time, in arrival order, and the server switches conversations only between replies (a reply in
 progress is never paused). An image counts as part of the match: the reused prefix ends at the first image that is not
@@ -240,17 +240,18 @@ continue its last turn, and differs from it before its first reply. A request th
 its first assistant message and differs only later is that same conversation with its history edited (a client moving
 or dropping a block, clearing old tool results, a chat message edited): it is served from the engine's state, and no
 copy is parked that would never be continued (`not parked: the request continues the cached conversation with its
-history edited` on the console).
+history edited` on the console with `-v`).
 
 Parked conversations share a host-memory budget, `--park-mib` [8192 MiB]. Memory is allocated on first use and kept
 for reuse until the server exits. When the budget is full, the least recently parked conversation is evicted (it is
 prefilled again if it comes back), but two kinds go first, least recently parked first among them:
 - side conversations (below), at most 4 of which are kept;
 - conversations a client is unlikely to continue: one it has just summarised to compact it, and the conversation of the
-  summary request itself (`low priority: <why>` on the park line). A request without tools that replaces a conversation
-  with tools is taken for such a summary unless it answers in fewer than 256 tokens (thinking aside): after such a short
-  answer (a client's title or tags request that quotes the whole chat), the replaced conversation keeps normal priority
-  (`keeps normal priority` on the console). One that comes back anyway is a normal conversation again.
+  summary request itself (`low priority: <why>` on the park line, `-v`). A request without tools that replaces a
+  conversation with tools is taken for such a summary unless it answers in fewer than 256 tokens (thinking aside): after
+  such a short answer (a client's title or tags request that quotes the whole chat), the replaced conversation keeps
+  normal priority (`keeps normal priority` on the console with `-v`). One that comes back anyway is a normal
+  conversation again.
 
 A conversation parked with low priority would be the first to go, so it only takes the room that side conversations and
 other low-priority ones leave: when that is not enough it is not parked (`not parked: ... have low priority` on the
@@ -354,16 +355,17 @@ cache misses and 15% more tokens prefilled).
 ### What the console shows
 
 Each generation request logs three lines: what it asks for, its prompt, and its reply. The prompt line says how the
-cache was used, and each park, restore, eviction and side request logs a line of its own with tokens, bytes and copy
-time. From a run with several clients (native Windows, preset D):
+cache was used, with the parks, restores and evictions it needed and the time they took; with `-v` each also logs a line
+of its own, as does each side request, with tokens, bytes and copy time. From a run with several clients (native
+Windows, preset D; the first two and the fifth lines only with `-v`):
 
 ```text
 #24 parked the cached conversation (another conversation came back): 12,022 tok, 1,165 MiB copied in 118 ms
 #24 restored the parked conversation of 14,031 tok: 1,215 MiB copied in 39 ms | 4 parked, 5,504 MiB in use
-#24 prompt: 13,888 cached + 158 prefilled in 0.34 s | restored a parked conversation (14,031 tok); the prompt matches 14,029 of the 14,031 cached tok: resumed at the checkpoint at 13,888
-#26 prompt: 9,056 cached + 2,765 prefilled in 1.88 s | the prompt matches 9,126 of the 12,053 cached tok: resumed at the checkpoint at 9,056
+#24 prompt: 13,888 cached + 158 prefilled in 0.18 s = 863 tok/s | parked 12,022 tok in 0.12 s; restored 14,031 tok in 0.04 s; the prompt matches 14,029 of the 14,031 cached tok: resumed at the checkpoint at 13,888
+#26 prompt: 9,056 cached + 2,765 prefilled in 1.88 s = 1,471 tok/s | the prompt matches 9,126 of the 12,053 cached tok: resumed at the checkpoint at 9,056
 #11 side request done: the cached 12,987 tok are back (236 MiB: kept in 90 ms, back in 12 ms)
-#20 prompt: 0 cached + 11,894 prefilled in 6.83 s | CACHE MISS: the prompt matches 8,355 of the 40,669 cached tok, no checkpoint before that
+#20 prompt: 0 cached + 11,894 prefilled in 6.83 s = 1,741 tok/s | CACHE MISS: the prompt matches 8,355 of the 40,669 cached tok, no checkpoint before that
 ```
 
 (Each line starts with `[mk-server] HH:MM:SS`.) `/props` (`engine.host_cache`) lists the parked conversations and their
@@ -468,12 +470,14 @@ MK_AGENTS=4 scripts/serve.sh 8080 0                                        # the
   The single-conversation cache features are off: side requests, parked conversations, pinned checkpoints and the
   `--ck-*` checkpoints (each slot keeps `MK_SLOT_CK` [2] checkpoints of its own). The keep-warm window starts when every
   slot is idle. Prefill chunks are 1,024 tokens (`MK_PF_CAP`, unless set): more context for the slots.
-- **Monitoring:** each request's prompt line names its slot (`slot 2 (after 1.30 s in the queue)`); there is no status
-  line. `GET /slots` lists every slot with its state (`idle`, `prefill`, `decode`), its request, prompt, cached and
-  decoded tokens and the prompt tokens left (`?fail_on_no_slot=1`: 503 when a new request would wait). `/props` has
-  `total_slots` N and an `agents` block in `engine`; in `/metrics`, `requests_processing` counts the requests in slots,
-  `requests_deferred` those waiting for one, and `decode_cycles` the engine cycles of all slots together (drafts are not
-  counted per slot).
+- **Monitoring:** each request logs the three lines of a request without `--agents`; its prompt line names its slot and
+  what that slot shared with the prompt (`the prompt matches 9,126 of the 12,053 cached tok in slot 2: resumed at the
+  checkpoint at 9,056, after 1.30 s in the queue`), its reply line the draft acceptance of its own cycles (an engine
+  library before `mk_slot_stats`: tok/cycle only). There is no status line. `GET /slots` lists every slot with its state
+  (`idle`, `prefill`, `decode`), its request, prompt, cached and decoded tokens and the prompt tokens left
+  (`?fail_on_no_slot=1`: 503 when a new request would wait). `/props` has `total_slots` N and an `agents` block in
+  `engine`; in `/metrics`, `requests_processing` counts the requests in slots, `requests_deferred` those waiting for
+  one, `decode_cycles` the engine cycles of all slots together, and the draft counters each slot's drafts.
 
 ### Speed with several agents
 
@@ -839,24 +843,30 @@ warm until the prefill's first launch. `MK_KEEP_WARM_LOAD` changes the load (for
 
 ### The console
 
-Every line on stderr is `[mk-server] HH:MM:SS ...`. A generation request is numbered (`#12`) and logs three lines:
+Every server line on stderr is `[mk-server] HH:MM:SS ...`; the engine's own lines start with `[mk]`. At startup the
+console shows the port, the engine's load summary and KV cache, the host cache's limits and a last `ready` line (model,
+context or slots, drafts, exact reuse, vision; with `--agents`, text only and what is off); `-v` (`MK_VERBOSE=1`) adds
+the load's details. A generation request is numbered (`#12`) and logs three lines, the same with `--agents`:
 
 - **request:** route, stream, the `model` field, prompt tokens, messages, tools, images / videos, thinking,
   `max_tokens`, the sampling used;
-- **prompt:** `N cached + M prefilled in s (prefill tok/s)` and how the cache was used (continued, resumed at a
-  checkpoint, or `CACHE MISS` with how much of the cached sequence the prompt matched; after a side request or a
-  restored conversation when one was used); images and their CPU encode time;
-- **reply:** `tok in s = tok/s` over the decode (from the first token to the end of the reply), the tokens of the
-  thinking / answer / tool calls, `tok/cycle` (tokens per engine cycle: 1 plus the accepted MTP drafts), the share of
-  drafts accepted, the finish reason and the whole request's time. A one-token reply, made by the prefill, shows no
+- **prompt:** `N cached + M prefilled in s = tok/s` (the prefill alone: image encodes, parks and restores are left out;
+  no rate under 128 prefilled tokens: that is launch latency, not throughput) and how the cache was used: continued,
+  resumed at a checkpoint, `nothing reused`, or `CACHE MISS` when the prompt shared 256 tokens or more with the cached
+  sequence and none of it could be reused; the parks, restores and evictions it needed, with their time, or a side
+  request; with `--agents` the slot and what it shared with the prompt; images and their CPU encode time;
+- **reply:** `tok in s = tok/s` over the decode (from the first token to the end of the reply), `tok/cycle` (tokens
+  per engine cycle: 1 plus the accepted MTP drafts) and the share of drafts accepted, the tokens of the thinking /
+  answer / tool calls, the finish reason and the whole request's time. A one-token reply, made by the prefill, shows no
   rate.
 
-Each park, restore, eviction and side request logs a line of its own ([examples](#what-the-console-shows)). A request
-that waits for the engine, 4xx answers and disconnects are logged with the request number; each token count logs a line
-without one. On a terminal, one status line under the log is rewritten in place (a carriage return, no escape sequences)
-while a request runs: image encodes, the prefill's progress with its rate and the time left, then the decode's tokens,
-tok/s and tok/cycle. Written to a file, only the log lines appear. A client resetting an idle keep-alive connection is
-not logged.
+With `-v` each park, restore, eviction and side request also logs a line of its own
+([examples](#what-the-console-shows)); without it, only the ones that could not keep a conversation (not parked for lack
+of room, a side request whose kept sequence or own conversation was dropped). A request that waits for the engine, 4xx
+answers and disconnects are logged with the request number; each token count logs a line without one. On a terminal, one
+status line under the log is rewritten in place (a carriage return, no escape sequences) while a request runs: image
+encodes, the prefill's progress with its rate and the time left, then the decode's tokens, tok/s and tok/cycle. Written
+to a file, only the log lines appear. A client resetting an idle keep-alive connection is not logged.
 
 ### `/props`, `/slots`, `/v1/models`
 
