@@ -147,8 +147,9 @@ def main():
                          "time; env MK_AGENTS)")
     ap.add_argument("--parallel", "-np", type=int, default=0, metavar="N",
                     help="--agents N with -c the context of each slot, default 32768 (llama-server's and open-jet's option)")
-    ap.add_argument("--ck-every", type=int, default=4096,
-                    help="DeltaNet checkpoint every N prompt tokens (0: off); see MK_CK_SLOTS for the pool size")
+    ap.add_argument("--ck-every", type=int, default=env_int("MK_CK_EVERY", 4096, 0),
+                    help="DeltaNet checkpoint every N prompt tokens (0: off; env MK_CK_EVERY); see MK_CK_SLOTS for the "
+                         "pool size")
     ap.add_argument("--ck-msgs", type=int, default=1, help="DeltaNet checkpoint at each message start (1/0)")
     ap.add_argument("--ck-pin", type=int, default=1,
                     help="pin the DeltaNet checkpoint at the end of a prompt's system message (and where a new session "

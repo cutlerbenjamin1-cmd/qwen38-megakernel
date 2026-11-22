@@ -28,6 +28,8 @@
 #                       continues beside the cached one)
 #   MK_PARK_MIB         host memory for parked conversations (default 8192 MiB, allocated on first use; 0 = off): a request
 #                       for another conversation parks the cached one, and it comes back bit for bit with its next request
+#   MK_CK_EVERY         a DeltaNet checkpoint every N prompt tokens (default 4096; 0 = off): denser ones re-read less
+#                       after an edit of a long prompt (the pool holds MK_CK_SLOTS of them, default 8)
 #   MK_PF_CAP           prefill chunk tokens (default 2048; 1024 above 96k context: 0.34 GB less VRAM, prefill ~0.2-0.45% slower)
 #   MK_KV, MK_KV_WIN    low-bit KV cache (opt-in), preset D': MK_KV='K*=6,V*=5,*16=8' MK_KV_WIN=2048 (6-bit K, 5-bit V,
 #                       8-bit MTP layer and recent window: ~1.0 GB less VRAM at 120k, ~162k context in the same VRAM,

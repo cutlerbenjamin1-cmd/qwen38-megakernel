@@ -17,6 +17,7 @@ REM   MK_DRAFT            MTP drafts per cycle (default 7)
 REM   MK_EXACT_REUSE=0    turn exact reuse off (see scripts/serve.sh)
 REM   MK_SIDE_MAX         side requests up to this many prompt tokens (default 8192; 0 = off; see scripts/serve.sh)
 REM   MK_PARK_MIB         host memory for parked conversations (default 8192 MiB; 0 = off; see scripts/serve.sh)
+REM   MK_CK_EVERY         a DeltaNet checkpoint every N prompt tokens (default 4096; 0 = off; see scripts/serve.sh)
 REM   MK_PF_CAP           prefill chunk tokens (default 2048; 1024 above 96k context; 512 above 240k with your own MK_KV)
 REM   MK_KV, MK_KV_WIN    low-bit KV cache, preset D': set MK_KV=K*=6,V*=5,*16=8 and MK_KV_WIN=2048; above 240k
 REM                       context, unless set: preset F (MK_KV=K*=5r,V*=5, MK_KV_WIN=2048)

@@ -267,7 +267,7 @@ limits in [SERVER.md](SERVER.md#limits).
 | `--kv` | - | `auto` (launchers `q8`) | KV cache format: `f16`, `q8` (q8_0), `auto` (q8_0 when fp16 does not fit next to ~1.5 GB of working memory, or when `MK_KV` is set; with `--agents` q8_0, which the slots need) | changes (f16 vs q8_0) |
 | `--agents N` | `MK_AGENTS` | `0`: one request at a time | up to N requests (1-4) at once, each in a parallel slot of the engine with its own context (`-c`, at most the model's context length, 262,144), decoded together in one batched launch per cycle; images, video and the presence / frequency penalties get a 400, side requests, parking and pinned checkpoints are off ([SERVER.md](SERVER.md#several-agents-at-once---agents)) | greedy: the reply alone, bit for bit (a prompt fed in chunks beside other slots: see `MK_PF_MIX`; beside a sampled request, rarely not: two logits one float step apart can tie after the norm scale, [SERVER.md](SERVER.md#several-agents-at-once---agents)); sampled: the same distribution, not the same tokens beside other requests |
 | `--parallel N`, `-np N` | - | `0` | `--agents N` with `-c` defaulting to 32,768 per slot (llama-server's and open-jet's option) | as `--agents` |
-| `--ck-every N` | - | `4096` | a DeltaNet checkpoint every N prompt tokens (0: off); the pool has `MK_CK_SLOTS` slots | same with exact reuse |
+| `--ck-every N` | `MK_CK_EVERY` | `4096` | a DeltaNet checkpoint every N prompt tokens (0: off); the pool has `MK_CK_SLOTS` slots | same with exact reuse |
 | `--ck-msgs` | - | `1` | a checkpoint at each message start (1 / 0) | same with exact reuse |
 | `--ck-pin` | - | `1` | pin the checkpoint at the end of the system message (and where new sessions left the cached one) against eviction, and park it with the conversation: a client's new session resumes after its system prompt and tools | same with exact reuse |
 | `--exact-reuse` | `MK_EXACT=1` (engine) | off (launchers on) | reused requests answer exactly as fresh ones: restore a checkpoint and prefill, instead of appending to decoded rows ([MK_EXACT](#exact-reuse-and-checkpoints)) | makes reuse bit-exact |
@@ -320,10 +320,11 @@ Read by the server only (there is no option for them):
 
 `MK_MAX_BODY_MB`, `MK_MAX_INFLIGHT_MB`, `MK_MAX_CONNECTIONS`, `MK_MAX_IMAGES`, `MK_MAX_VIDEO_FRAMES` and
 `MK_IMAGE_MAX_PIXELS` must be positive integers, the three `MK_PF_*` integers >= 0: anything else ends the server at
-startup with a message. `MK_SIDE_MAX`, `MK_PARK_MIB`, `MK_AGENTS`, `MK_TIMEOUT_S` and `MK_REQUEST_TIMEOUT_S` accept `0`
-(off). The server sets `MK_EXACT=1` for the engine when `--exact-reuse` is given, and with `--agents` sets `MK_EXACT=1`,
-`MK_PF_CAP=1024` and `MK_CK_SLOTS=1` unless they are set, and `MK_AGENTS` to the slot count (the engine's load lines then
-leave out its own warm-up sequence's KV cache); `-v` sets `MK_VERBOSE=1`. It reports `MK_CK_SLOTS` in `/props`.
+startup with a message. `MK_SIDE_MAX`, `MK_PARK_MIB`, `MK_AGENTS`, `MK_CK_EVERY`, `MK_TIMEOUT_S` and
+`MK_REQUEST_TIMEOUT_S` accept `0` (off). The server sets `MK_EXACT=1` for the engine when `--exact-reuse` is given, and
+with `--agents` sets `MK_EXACT=1`, `MK_PF_CAP=1024` and `MK_CK_SLOTS=1` unless they are set, and `MK_AGENTS` to the
+slot count (the engine's load lines then leave out its own warm-up sequence's KV cache); `-v` sets `MK_VERBOSE=1`. It
+reports `MK_CK_SLOTS` in `/props`.
 llama-server's `LLAMA_ARG_*` variables are not read.
 
 ## Engine environment variables
