@@ -196,6 +196,15 @@ def main():
                     help="defaults for every request's chat_template_kwargs (a JSON object of "
                          + ", ".join(TEMPLATE_KWARGS) + "; the request's own win), e.g. '{\"enable_thinking\": false}' "
                          "(env MK_CHAT_TEMPLATE_KWARGS)")
+    ap.add_argument("--temp", type=float, default=mk_limits.DEF_TEMP, metavar="T",
+                    help=f"sampling temperature of a request without one (0: greedy; default {mk_limits.DEF_TEMP:g})")
+    ap.add_argument("--top-p", type=float, default=mk_limits.DEF_TOP_P, metavar="P",
+                    help=f"top-p of a request without one (default {mk_limits.DEF_TOP_P:g})")
+    ap.add_argument("--top-k", type=int, default=mk_limits.DEF_TOP_K, metavar="K",
+                    help=f"top-k of a request without one (<= 0: off, the engine's maximum {mk_limits.TOPK_MAX}; "
+                         f"default {mk_limits.DEF_TOP_K})")
+    ap.add_argument("--min-p", type=float, default=mk_limits.DEF_MIN_P, metavar="P",
+                    help=f"min-p of a request without one (default {mk_limits.DEF_MIN_P:g})")
     ap.add_argument("--mmproj", default=None,
                     help="vision projector GGUF (e.g. mmproj-*.gguf): image_url inputs, encoded on the CPU (no VRAM)")
     ap.add_argument("--vision-lib", default=os.path.join(os.path.dirname(HERE), LIB_VISION))
@@ -277,6 +286,19 @@ def main():
         log(f"chat template kwargs: {json.dumps(kw)} (under each request's)")
     if args.reasoning_format != "auto":
         log(f"reasoning format: {args.reasoning_format}")
+    if not 0 <= args.temp <= mk_limits.FLT_MAX:  # (NaN and inf too: every request without a temperature would be a 400)
+        ap.error("--temp: expected a temperature >= 0 (0: greedy)")
+    if not 0 < args.top_p <= 1:
+        ap.error("--top-p: expected a value in (0, 1]")
+    if args.top_k > mk_limits.TOPK_MAX:
+        ap.error(f"--top-k: the engine samples from at most {mk_limits.TOPK_MAX} candidates (<= 0: off)")
+    if not 0 <= args.min_p <= 1:
+        ap.error("--min-p: expected a value in [0, 1]")
+    sampling = (args.temp, args.top_p, args.top_k, args.min_p)
+    if sampling != (mk_limits.DEF_TEMP, mk_limits.DEF_TOP_P, mk_limits.DEF_TOP_K, mk_limits.DEF_MIN_P):
+        mk_limits.DEF_TEMP, mk_limits.DEF_TOP_P, mk_limits.DEF_TOP_K, mk_limits.DEF_MIN_P = sampling
+        log(f"sampling defaults: temp {args.temp:g} top_p {args.top_p:g} top_k {args.top_k} min_p {args.min_p:g} "
+            "(under each request's)")
     args.chat_template_src = None  # (before the port opens: a bad template fails at once, not after the model load)
     if args.chat_template:
         try:

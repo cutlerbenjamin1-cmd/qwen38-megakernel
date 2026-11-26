@@ -28,6 +28,8 @@ REM   MK_MTP              the MTP draft layer from a separate GGUF of the same m
 REM   MK_NO_MTP=1         no MTP layer: plain decoding, depth 0 (also automatic for a model file without one)
 REM   MK_CHAT_TEMPLATE_FILE  a Jinja chat template file used instead of the GGUF's (--chat-template-file, as llama-server)
 REM   MK_CHAT_TEMPLATE_KWARGS  defaults under every request's chat_template_kwargs: set "MK_CHAT_TEMPLATE_KWARGS={"enable_thinking": false}"
+REM   MK_TEMP, MK_TOP_P, MK_TOP_K, MK_MIN_P  sampling of a request that sends none (--temp / --top-p / --top-k / --min-p;
+REM                       defaults 1.0 / 0.95 / 20 / 0); values a request sends win
 REM   MK_CONTENT_SPECIALS special-token text inside messages: text (default) or parse (as llama-server; see scripts/serve.sh)
 REM   MK_REASONING_FORMAT auto (default: the thinking as reasoning_content), none (left in the content), deepseek-legacy
 REM   MK_MAX_BODY_MB, MK_MAX_IMAGES, MK_IMAGE_MAX_PIXELS, MK_MAX_VIDEO_FRAMES
@@ -92,10 +94,15 @@ set "CT="
 set "CTS="
 if defined MK_CHAT_TEMPLATE_FILE set CT=--chat-template-file "%MK_CHAT_TEMPLATE_FILE%"
 if defined MK_CHAT_TEMPLATE_FILE set "CTS=, chat template %MK_CHAT_TEMPLATE_FILE%"
+set "SA="
+if defined MK_TEMP set "SA=%SA% --temp %MK_TEMP%"
+if defined MK_TOP_P set "SA=%SA% --top-p %MK_TOP_P%"
+if defined MK_TOP_K set "SA=%SA% --top-k %MK_TOP_K%"
+if defined MK_MIN_P set "SA=%SA% --min-p %MK_MIN_P%"
 set "DQ="
 if "%MK_DRAFT_Q4%"=="0" set "DQ=, draft head on lm_head"
 set "KVT=q8_0"
 if defined MK_KV set "KVT=q8_0 + MK_KV=%MK_KV%"
 if defined MK_KV if defined MK_KV_WIN set "KVT=%KVT% (window %MK_KV_WIN%)"
 echo megakernel: %MK_MODEL%, ctx %CTX%, KV %KVT%%KVS%, %MK_DRAFT% MTP drafts%DQ%, prefill chunk %PFC%, exact reuse %XS%, images %VS%%CTS%, http://%MK_HOST%:%PORT%
-"%MK_PYTHON%" "%HERE%\server\mk_server.py" -m "%MK_MODEL%" --host %MK_HOST% --port %PORT% -c %CTX% --kv q8 -d %MK_DRAFT% %XR% %VA% %CT%
+"%MK_PYTHON%" "%HERE%\server\mk_server.py" -m "%MK_MODEL%" --host %MK_HOST% --port %PORT% -c %CTX% --kv q8 -d %MK_DRAFT% %XR% %VA% %CT%%SA%

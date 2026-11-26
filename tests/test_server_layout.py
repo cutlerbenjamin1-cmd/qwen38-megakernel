@@ -7,7 +7,7 @@ import unittest
 from server_modules import SERVER, load
 
 SET_BY_MAIN = ("MAX_BODY_MB", "MAX_INFLIGHT_MB", "MAX_CONNECTIONS", "REQUEST_TIMEOUT_S", "MAX_IMAGES", "MAX_VIDEO_FRAMES",
-               "IMAGE_MAX_PIXELS", "REASONING_MAX_BYTES")
+               "IMAGE_MAX_PIXELS", "REASONING_MAX_BYTES", "DEF_TEMP", "DEF_TOP_P", "DEF_TOP_K", "DEF_MIN_P")
 
 
 class ServerLayoutTests(unittest.TestCase):

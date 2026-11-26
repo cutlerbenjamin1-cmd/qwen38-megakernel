@@ -1,11 +1,12 @@
 """Request limits and defaults. main() rebinds MAX_BODY_MB, MAX_INFLIGHT_MB, MAX_CONNECTIONS, REQUEST_TIMEOUT_S,
-MAX_IMAGES, MAX_VIDEO_FRAMES, IMAGE_MAX_PIXELS and REASONING_MAX_BYTES, so those are read as mk_limits.NAME, never
-imported by name."""
+MAX_IMAGES, MAX_VIDEO_FRAMES, IMAGE_MAX_PIXELS, REASONING_MAX_BYTES and the sampling defaults (DEF_TEMP, DEF_TOP_P,
+DEF_TOP_K, DEF_MIN_P), so those are read as mk_limits.NAME, never imported by name."""
 import os
 import sys
 
 TOPK_MAX = 32
-# sampling defaults (a request's absent / null fields): Unsloth's thinking-mode preset for Qwen3.8
+# sampling defaults (a request's absent / null fields; --temp / --top-p / --top-k / --min-p): Unsloth's thinking-mode
+# preset for Qwen3.8
 DEF_TEMP, DEF_TOP_P, DEF_TOP_K, DEF_MIN_P = 1.0, 0.95, 20, 0.0
 # request limits; main() reads them from the environment
 MAX_BODY_MB = 128  # MK_MAX_BODY_MB: request body (several screenshots as base64 data: URLs fit)

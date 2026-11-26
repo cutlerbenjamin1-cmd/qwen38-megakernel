@@ -1580,6 +1580,41 @@ class ChatTemplateOptionTests(_HttpCase):
                 code, err, _ = self._main(*argv)
                 self.assertEqual((code, os.environ.get("MK_VERBOSE"), self.mk.VERBOSE), (None, *want), (argv, env, err))
 
+    def test_sampling_options_are_the_defaults_under_each_requests_own(self) -> None:
+        lim = self.mk.mk_limits
+        names = ("DEF_TEMP", "DEF_TOP_P", "DEF_TOP_K", "DEF_MIN_P")
+        preset = tuple(getattr(lim, k) for k in names)
+
+        def sampled(body):
+            srv = object.__new__(self.mk.Server)
+            srv.eng, srv.warned = _FakeSamplingEngine(), set()
+            srv.sampling({"seed": 1, **body})
+            return srv.eng.sampling[:4]
+        with mock.patch.multiple(lim, **dict(zip(names, preset))):  # (main() rebinds them: put back for the other tests)
+            for argv, want in ((("--temp", "-0.1"), "--temp"), (("--temp", "nan"), "--temp"), (("--temp", "inf"), "--temp"),
+                               (("--top-p", "0"), "--top-p"), (("--top-p", "1.5"), "--top-p"), (("--top-p", "nan"), "--top-p"),
+                               (("--top-k", str(self.mk.TOPK_MAX + 1)), "--top-k"), (("--min-p", "-0.1"), "--min-p"),
+                               (("--min-p", "1.5"), "--min-p"), (("--min-p", "nan"), "--min-p")):
+                code, err, _ = self._main(*argv)
+                self.assertEqual(code, 2, argv)
+                self.assertIn(want + ": ", err, argv)
+                self.assertEqual(tuple(getattr(lim, k) for k in names), preset, argv)
+            code, err, _ = self._main()
+            self.assertEqual((code, tuple(getattr(lim, k) for k in names)), (None, preset), err)
+            self.assertNotIn("sampling defaults", err)
+            code, err, _ = self._main("--temp", "0.6", "--top-p", "0.8", "--top-k", "0", "--min-p", "0.05")
+            self.assertIsNone(code, err)
+            self.assertIn("sampling defaults: temp 0.6 top_p 0.8 top_k 0 min_p 0.05", err)
+            self.assertEqual(sampled({}), (0.6, 0.8, self.mk.TOPK_MAX, 0.05))  # (top_k 0: off, the engine's maximum)
+            self.assertEqual(sampled({"temperature": 0.2, "top_k": 5}), (0.2, 0.8, 5, 0.05))
+            r = self.mk.response_object("r", 0, {}, "m", "completed", [])
+            self.assertEqual((r["temperature"], r["top_p"]), (0.6, 0.8))
+            code, err, _ = self._main("--temp", "0")
+            self.assertIsNone(code, err)
+            self.assertEqual(sampled({})[0], 0.0)  # (greedy unless the request sends a temperature)
+            self.assertEqual(sampled({"temperature": 0.7})[0], 0.7)
+        self.assertEqual(tuple(getattr(lim, k) for k in names), preset)
+
 
 # === con: the console (log lines with request numbers, the live status line) ===
 class _Tty(io.StringIO):

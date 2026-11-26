@@ -3,9 +3,10 @@ import codecs
 import random
 import time
 
+import mk_limits
 from mk_chat import OutputParser, StopMatcher, check_params, stop_strings
 from mk_errors import BadRequest, ClientGone, ContextOverflow, PrefillCancelled
-from mk_limits import DEF_MIN_P, DEF_TEMP, DEF_TOP_K, DEF_TOP_P, FLT_MAX, TOPK_MAX
+from mk_limits import FLT_MAX, TOPK_MAX
 from mk_log import CON, log, plural, secs
 from mk_media import VideoBytes
 
@@ -28,10 +29,10 @@ class GenerateMixin:
         top_k: absent -> DEF_TOP_K; <= 0 ("off" for llama.cpp / OpenAI-style clients) -> TOPK_MAX, the engine's
         maximum; above TOPK_MAX -> TOPK_MAX with a one-time warning"""
         try:
-            temp = float(body["temperature"] if body.get("temperature") is not None else DEF_TEMP)
-            top_p = float(body["top_p"] if body.get("top_p") is not None else DEF_TOP_P)
-            top_k = int(body["top_k"]) if body.get("top_k") is not None else DEF_TOP_K
-            min_p = float(body["min_p"] if body.get("min_p") is not None else DEF_MIN_P)
+            temp = float(body["temperature"] if body.get("temperature") is not None else mk_limits.DEF_TEMP)
+            top_p = float(body["top_p"] if body.get("top_p") is not None else mk_limits.DEF_TOP_P)
+            top_k = int(body["top_k"]) if body.get("top_k") is not None else mk_limits.DEF_TOP_K
+            min_p = float(body["min_p"] if body.get("min_p") is not None else mk_limits.DEF_MIN_P)
             seed = body.get("seed")
             seed = random.getrandbits(63) if seed is None or int(seed) < 0 else int(seed)
         except (TypeError, ValueError, OverflowError):

@@ -5,7 +5,7 @@ import time
 
 import mk_limits
 from mk_chat import MEDIA_MARKER
-from mk_limits import DEF_MIN_P, DEF_TEMP, DEF_TOP_K, DEF_TOP_P, MAX_STOP, WARN_KEYS, WARN_KEY_LEN, WARN_TEXT_LEN
+from mk_limits import MAX_STOP, WARN_KEYS, WARN_KEY_LEN, WARN_TEXT_LEN
 from mk_log import log
 
 
@@ -95,7 +95,8 @@ class InfoMixin:
     def props(self):
         """the fields of llama-server's GET /props that the server has, plus `engine` (engine_info)"""
         b = getattr(self.eng, "build", None) or {}
-        params = {"temperature": DEF_TEMP, "top_k": DEF_TOP_K, "top_p": DEF_TOP_P, "min_p": DEF_MIN_P, "seed": -1,
+        params = {"temperature": mk_limits.DEF_TEMP, "top_k": mk_limits.DEF_TOP_K, "top_p": mk_limits.DEF_TOP_P,
+                  "min_p": mk_limits.DEF_MIN_P, "seed": -1,
                   "presence_penalty": 0.0, "frequency_penalty": 0.0, "max_tokens": -1, "n_predict": -1, "stop": [],
                   "stream": False, "n_probs": 0}
         return {

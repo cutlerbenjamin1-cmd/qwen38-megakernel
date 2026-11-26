@@ -90,6 +90,7 @@ what they do.
 | network | `--host` [127.0.0.1], `--port` [18080], `--allow-host NAME` (`MK_ALLOW_HOSTS`), `--cors-origin ORIGIN` (`MK_CORS_ORIGINS`), `--api-key KEY` (`MK_API_KEY`): [Security](#security) |
 | conversation cache | `--exact-reuse` (`MK_EXACT=1`), `--ck-every` [4096], `--ck-msgs` [1], `--ck-pin` [1], `--side-max` [8192] (`MK_SIDE_MAX`), `--park-mib` [8192] (`MK_PARK_MIB`), `--park-min` [1024], `--park-cks` [2]: [the conversation cache](#the-conversation-cache) |
 | templates and output | `--chat-template-file PATH`, `--chat-template TEMPLATE`, `--chat-template-kwargs JSON` (`MK_CHAT_TEMPLATE_KWARGS`), `--reasoning-format` [auto] (`MK_REASONING_FORMAT`), `--content-specials` [text] (`MK_CONTENT_SPECIALS`) |
+| sampling defaults | `--temp` [1.0], `--top-p` [0.95], `--top-k` [20; <= 0: off], `--min-p` [0]: for requests that leave the field out; [sampling](#sampling) |
 | images and video | `--mmproj FILE`, `--vision-lib`, `--vision-backend` [auto], `--vision-threads` [0: every logical CPU but two], `--image-min-tokens` / `--image-max-tokens` [0: the mmproj's], `--image-cache` [8], `--video-fps` [4], `--video-max-tokens` [0: the image limit], `--video-cache` [2], `--ffmpeg` (`MK_FFMPEG`) |
 | engine environment | `MK_CK_SLOTS` [8; 1 with `--agents`], `MK_KEEP_WARM_S` [120], `MK_STORE_CHUNK_MIB` [32], `MK_TIMEOUT_S` [600], `MK_REQUEST_TIMEOUT_S` [300], `MK_MAX_BODY_MB` [128], `MK_MAX_INFLIGHT_MB` [256], `MK_MAX_CONNECTIONS` [256], `MK_MAX_IMAGES` [32], `MK_IMAGE_MAX_PIXELS` [100000000], `MK_MAX_VIDEO_FRAMES` [256] |
 
@@ -681,7 +682,9 @@ reuse finds the divergence, as after `max_tokens`).
 ### Sampling
 
 Absent values default to Unsloth's thinking-mode preset for Qwen3.8: `temperature` [1.0], `top_p` [0.95], `top_k` [20],
-`min_p` [0]. `top_k` runs 1..32 (<= 0 means 32, the engine's maximum; above 32 is clamped with a one-time warning).
+`min_p` [0]; `--temp`, `--top-p`, `--top-k` and `--min-p` change these defaults (a request's own values still win).
+`top_k` runs 1..32 (<= 0 means 32, the engine's maximum; above 32 is clamped with a one-time warning; `--top-k` above
+32 is refused at startup).
 `seed` (absent or negative: a random one per request), `presence_penalty` / `frequency_penalty` (-2..2, vLLM's
 semantics: over the tokens generated in this response). `repetition_penalty` is ignored, with a warning. Temperature 0
 is greedy, and greedy replies are the same at any draft depth; sampled replies keep the distribution of sampling

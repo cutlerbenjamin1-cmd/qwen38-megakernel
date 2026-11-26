@@ -7,7 +7,6 @@ import zlib
 
 import mk_limits
 from mk_errors import BadRequest
-from mk_limits import DEF_TEMP, DEF_TOP_P
 
 
 # ---------------------------------------------------------------------------------------------
@@ -326,9 +325,9 @@ def response_object(rid, created, body, model, status, output, usage=None, error
             "model": model, "output": output, "parallel_tool_calls": body.get("parallel_tool_calls") is not False,
             "previous_response_id": None, "reasoning": {"effort": r.get("effort"), "summary": r.get("summary")},
             "service_tier": "default", "store": False,
-            "temperature": body["temperature"] if body.get("temperature") is not None else DEF_TEMP,
+            "temperature": body["temperature"] if body.get("temperature") is not None else mk_limits.DEF_TEMP,
             "text": {"format": {"type": "text"}, "verbosity": text.get("verbosity") or "medium"},
             "tool_choice": body.get("tool_choice") or "auto", "tools": body.get("tools") or [],
-            "top_p": body["top_p"] if body.get("top_p") is not None else DEF_TOP_P,
+            "top_p": body["top_p"] if body.get("top_p") is not None else mk_limits.DEF_TOP_P,
             "truncation": body.get("truncation") or "disabled", "usage": usage, "user": body.get("user"),
             "metadata": body.get("metadata") or {}}

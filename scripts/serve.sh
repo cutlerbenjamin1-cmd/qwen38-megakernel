@@ -41,6 +41,9 @@
 #   MK_NO_MTP=1         no MTP layer: plain decoding, depth 0 (also automatic for a model file without one)
 #   MK_CHAT_TEMPLATE_FILE  a Jinja chat template file used instead of the GGUF's (--chat-template-file, as llama-server)
 #   MK_CHAT_TEMPLATE_KWARGS  defaults under every request's chat_template_kwargs, e.g. '{"enable_thinking": false}'
+#   MK_TEMP, MK_TOP_P, MK_TOP_K, MK_MIN_P
+#                       sampling of a request that sends none (the server's --temp / --top-p / --top-k / --min-p; defaults
+#                       1.0 / 0.95 / 20 / 0); values a request sends win
 #   MK_CONTENT_SPECIALS special-token text (<|im_end|>, ...) inside messages: text (default: tokenized as text, so content
 #                       cannot forge turns) or parse (as the special tokens, as llama-server does)
 #   MK_REASONING_FORMAT auto (default: the thinking as reasoning_content), none (left in the content), deepseek-legacy
@@ -66,6 +69,8 @@ XR=(--exact-reuse) XS=on
 [ "${MK_EXACT_REUSE:-1}" = 0 ] && XR=() XS=off
 CT=()
 [ -n "${MK_CHAT_TEMPLATE_FILE:-}" ] && CT=(--chat-template-file "$MK_CHAT_TEMPLATE_FILE")
+SA=(${MK_TEMP:+--temp "$MK_TEMP"} ${MK_TOP_P:+--top-p "$MK_TOP_P"} ${MK_TOP_K:+--top-k "$MK_TOP_K"}
+    ${MK_MIN_P:+--min-p "$MK_MIN_P"})
 if [ -n "${MK_MMPROJ+x}" ]; then MMPROJ="$MK_MMPROJ"
 else
     MMPROJ=
@@ -83,4 +88,4 @@ echo "megakernel: $MODEL, ctx $CTX, KV q8_0${MK_KV:+ + MK_KV=$MK_KV (window ${MK
      "prefill chunk ${MK_PF_CAP:-2048}, exact reuse $XS, images $VS${MK_CHAT_TEMPLATE_FILE:+, chat template $MK_CHAT_TEMPLATE_FILE}," \
      "http://${MK_HOST:-127.0.0.1}:$PORT"
 exec "$PY" "$HERE/server/mk_server.py" -m "$MODEL" --host "${MK_HOST:-127.0.0.1}" --port "$PORT" -c "$CTX" --kv q8 \
-    -d "${MK_DRAFT:-7}" "${XR[@]}" "${VA[@]}" "${CT[@]}"
+    -d "${MK_DRAFT:-7}" "${XR[@]}" "${VA[@]}" "${CT[@]}" "${SA[@]}"

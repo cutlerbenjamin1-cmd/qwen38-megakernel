@@ -208,6 +208,7 @@ engine library and the model file exist, print one line with the settings, and s
     --exact-reuse                                   (unless MK_EXACT_REUSE=0)
     --mmproj <file> [--image-max-tokens N] [--video-fps F] [--video-max-tokens N]   (when images are on)
     --chat-template-file <MK_CHAT_TEMPLATE_FILE>    (when set)
+    --temp / --top-p / --top-k / --min-p <MK_TEMP / MK_TOP_P / MK_TOP_K / MK_MIN_P>   (each when set)
 ```
 
 with the environment passed on unchanged. The defaults are port 8080 and 120,000 tokens of context; the KV cache is
@@ -226,6 +227,7 @@ These variables are read by the launchers themselves and turned into options:
 | `MK_VIDEO_FPS` | 4 | `--video-fps`, with images on |
 | `MK_VIDEO_MAX_TOKENS` | the image limit | `--video-max-tokens`, with images on |
 | `MK_CHAT_TEMPLATE_FILE` | the GGUF's template | `--chat-template-file` |
+| `MK_TEMP`, `MK_TOP_P`, `MK_TOP_K`, `MK_MIN_P` | the server's: 1.0, 0.95, 20, 0 | `--temp`, `--top-p`, `--top-k`, `--min-p`: the sampling of a request that sends none of its own (values a request sends win) |
 | `MK_PYTHON` | `python3`; Windows `python` | the Python that runs the server (needs jinja2) |
 | `MK_KV`, `MK_KV_WIN` | unset (q8_0): `serve.bat` sets preset F (`K*=5r,V*=5`, window `2048`) above 240,000 | read by the engine ([KV cache presets](#kv-cache-presets)) |
 | `MK_PF_CAP` | unset: the launchers set `1024` when the context is above 96,000; `serve.bat` sets `512` above 240,000 when `MK_KV` was set by you | read by the engine ([Prefill](#prefill)) |
@@ -280,6 +282,10 @@ limits in [SERVER.md](SERVER.md#limits).
 | `--chat-template TEMPLATE` | - | the GGUF's template | the template itself (`chatml`: llama.cpp's ChatML); the last of the two options wins | changes (prompt) |
 | `--reasoning-format` | `MK_REASONING_FORMAT` | `auto` | llama-server's: `auto` / `deepseek` (thinking as `reasoning_content`), `deepseek-legacy`, `none` (left in the content); a request's `reasoning_format` wins | - (formatting) |
 | `--chat-template-kwargs JSON` | `MK_CHAT_TEMPLATE_KWARGS` | none | defaults under every request's `chat_template_kwargs` (keys `enable_thinking`, `preserve_thinking`, `reasoning_effort`); the request's own win | changes (prompt) |
+| `--temp` | - | `1.0` | sampling temperature of a request that sends none (0: greedy) | - (sampling) |
+| `--top-p` | - | `0.95` | top_p of a request that sends none; (0, 1] | - (sampling) |
+| `--top-k` | - | `20` | top_k of a request that sends none; <= 0: off (32, the engine's maximum); above 32 refused | - (sampling) |
+| `--min-p` | - | `0` | min_p of a request that sends none; [0, 1] | - (sampling) |
 | `--mmproj` | `MK_MMPROJ` (launchers) | none: no images | the vision projector GGUF: image and video input, encoded on the CPU (no VRAM) | - |
 | `--vision-lib` | - | `libqwen38vision.so` / `qwen38vision.dll` in the repo root | the vision library | - |
 | `--vision-threads` | - | `0`: every logical CPU but two | CPU threads of the image encoder | same |
@@ -725,7 +731,8 @@ no keys.
 
 Fixed in the server: at most 64 stop strings per request of at most 1024 characters each; a video's ffmpeg decode
 stops after 300 s; the sampling defaults for fields a request leaves out are Unsloth's thinking-mode preset for Qwen3.8
-(temperature 1.0, top_p 0.95, top_k 20, min_p 0); top_k is at most 32 (0 or less means 32); one request runs at a
+(temperature 1.0, top_p 0.95, top_k 20, min_p 0; `--temp` / `--top-p` / `--top-k` / `--min-p` change them); top_k is
+at most 32 (0 or less means 32); one request runs at a
 time. Conversation cache: with parking on, a side request with tools must cap its reply at 1024 tokens; a side request
 that does not cap its reply reserves room for 8192 rows in the host store; a side request's conversation is parked
 with 1 checkpoint, and at most 4 of them are kept; a request without tools is taken for a summary by its answer, 256
